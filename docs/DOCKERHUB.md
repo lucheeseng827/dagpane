@@ -26,18 +26,18 @@ value it computes.
 Run these from the directory holding your app manifest and its data.
 
 ```sh
-docker pull mancube/dagpane:0.1.0
+docker pull mancube/dagpane:0.1.1
 
 # what version is in here
-docker run --rm mancube/dagpane:0.1.0 --version
+docker run --rm mancube/dagpane:0.1.1 --version
 
 # check an app without running it, and print the graph it would build
-docker run --rm -v "$PWD:/app:ro" mancube/dagpane:0.1.0 check /app/your-app.toml
-docker run --rm -v "$PWD:/app:ro" mancube/dagpane:0.1.0 graph /app/your-app.toml
+docker run --rm -v "$PWD:/app:ro" mancube/dagpane:0.1.1 check /app/your-app.toml
+docker run --rm -v "$PWD:/app:ro" mancube/dagpane:0.1.1 graph /app/your-app.toml
 
 # serve it
 docker run --rm -p 8787:8787 -v "$PWD:/app:ro" \
-  mancube/dagpane:0.1.0 run /app/your-app.toml --host 0.0.0.0
+  mancube/dagpane:0.1.1 run /app/your-app.toml --host 0.0.0.0
 ```
 
 The app is mounted rather than baked in. There is no shell in the image and no example inside
@@ -95,8 +95,11 @@ interaction, never aggregated into a headline.
 
 | Tag | What it is |
 | --- | --- |
-| `0.1.0` | The release. Immutable once published. |
+| `0.1.1` | The release. Immutable once published. |
 | `latest` | The most recent non-prerelease. Moves. Pin the version for anything that matters. |
+
+There is no `0.1.0` image. That release's build failed on a static-linking assertion that
+could not work on Alpine, and 0.1.1 is the fix; the source tag `v0.1.0` exists and is fine.
 
 **`linux/amd64` only.** The build pins the `x86_64-unknown-linux-musl` target, and publishing
 an `arm64` manifest whose binary is `x86_64` would advertise a container that cannot start.

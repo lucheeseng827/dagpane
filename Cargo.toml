@@ -45,7 +45,7 @@ resolver = "2"
 members = ["crates/core", "crates/app", "crates/serve", "crates/cli", "crates/frame-arrow"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/dagpane"
@@ -97,9 +97,9 @@ rust-version = "1.85"
 # step with the crates by review, not by cargo — plus `cargo add` ergonomics. If you change a
 # version here, change it in the crate that uses it too.
 [workspace.dependencies]
-dagpane-core = { path = "crates/core", version = "0.1.0" }
-dagpane-app = { path = "crates/app", version = "0.1.0" }
-dagpane-serve = { path = "crates/serve", version = "0.1.0" }
+dagpane-core = { path = "crates/core", version = "0.1.1" }
+dagpane-app = { path = "crates/app", version = "0.1.1" }
+dagpane-serve = { path = "crates/serve", version = "0.1.1" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -15,7 +15,9 @@
 # to. See SECURITY.md.
 
 FROM rust:1.94-alpine AS build
-RUN apk add --no-cache musl-dev
+# binutils for readelf, which is what actually answers the static question below.
+# `strip` happens to come from the same package.
+RUN apk add --no-cache musl-dev binutils
 WORKDIR /src
 
 # LICENSE and NOTICE are copied into the builder because the final stage copies them OUT of
@@ -33,8 +35,32 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-musl -p dagpane
 
 # Prove the static claim inside the builder, where a failure is a build failure rather than
 # a runtime surprise on somebody else's machine.
-RUN ldd target/x86_64-unknown-linux-musl/release/dagpane 2>&1 \
-      | grep -Eq "not a dynamic executable|statically linked"
+#
+# NOT `ldd`. This asked ldd for "not a dynamic executable" or "statically linked", which is
+# glibc's wording, and the builder is Alpine. musl's ldd prints the loader path for a
+# static binary and a dynamic one alike:
+#
+#     $ ldd ./static-binary
+#             /lib/ld-musl-x86_64.so.1 (0x7d02d07f4000)
+#     $ ldd ./dynamic-binary
+#             /lib/ld-musl-x86_64.so.1 (0x79e406f88000)
+#
+# So the check was not merely worded for the wrong libc, it was reading an answer that
+# carries no information here. It never ran until the first real image build, because the
+# CI that builds this Dockerfile lives on the public mirror and the mirror had never been
+# synced.
+#
+# A PT_INTERP program header is the thing that actually differs: a dynamically linked
+# executable names its interpreter, a static one has nothing to name. The output is printed
+# rather than swallowed by `grep -q`, so a future failure says what it saw.
+RUN BIN=target/x86_64-unknown-linux-musl/release/dagpane \
+ && readelf -l "$BIN" > /tmp/prog-headers.txt \
+ && if grep -q INTERP /tmp/prog-headers.txt; then \
+      echo "ERROR: the musl build is not static - it names an interpreter:"; \
+      grep -A1 INTERP /tmp/prog-headers.txt; \
+      exit 1; \
+    fi \
+ && echo "static: no PT_INTERP segment, nothing to load at run time"
 
 FROM scratch
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/dagpane /dagpane

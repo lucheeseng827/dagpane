@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "dagpane-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dagpane-core",
  "dagpane-frame-arrow",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "dagpane-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "dagpane-app",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "dagpane-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "dagpane-frame-arrow"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "dagpane-serve"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "dagpane-app",

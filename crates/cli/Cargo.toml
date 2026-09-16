@@ -1,7 +1,7 @@
 # Explicit fields, no `workspace = true` inheritance — same reason as the other crates.
 [package]
 name = "dagpane-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/dagpane"
@@ -21,9 +21,9 @@ default = ["arrow-sources"]
 arrow-sources = ["dagpane-app/arrow-sources", "dagpane-serve/arrow-sources"]
 
 [dependencies]
-dagpane-core = { path = "../core", version = "0.1.0" }
-dagpane-app = { path = "../app", version = "0.1.0", default-features = false }
-dagpane-serve = { path = "../serve", version = "0.1.0", default-features = false }
+dagpane-core = { path = "../core", version = "0.1.1" }
+dagpane-app = { path = "../app", version = "0.1.1", default-features = false }
+dagpane-serve = { path = "../serve", version = "0.1.1", default-features = false }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

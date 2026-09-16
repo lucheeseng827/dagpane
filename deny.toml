@@ -33,6 +33,12 @@ allow = [
     "Zlib",
     # `Apache-2.0 WITH LLVM-exception` reaches the tree through the compiler-builtins line.
     "Unicode-3.0",
+    # tiny-keccak, via const-random <- ahash <- arrow-array and arrow-select. CC0-1.0 is a
+    # public-domain dedication, not a copyleft licence: it imposes no condition on a binary
+    # that links the code, so it satisfies the rule stated above rather than bending it. It
+    # arrived with the Arrow backend and was not caught then, because this gate runs on the
+    # public mirror and the mirror had never been synced.
+    "CC0-1.0",
 ]
 # `unicode-ident` is `(MIT OR Apache-2.0) AND Unicode-3.0`; the Unicode-3.0 half is listed
 # above rather than granted as an exception, because it applies to data tables that ship in

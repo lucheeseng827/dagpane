@@ -81,12 +81,12 @@ border so you can see which three of seven moved.
 ## In a container
 
 ```sh
-docker pull mancube/dagpane:0.1.0
+docker pull mancube/dagpane:0.1.1
 
 # run these from the directory holding your app manifest and its data
-docker run --rm -v "$PWD:/app:ro" mancube/dagpane:0.1.0 check /app/your-app.toml
+docker run --rm -v "$PWD:/app:ro" mancube/dagpane:0.1.1 check /app/your-app.toml
 docker run --rm -p 8787:8787 -v "$PWD:/app:ro" \
-  mancube/dagpane:0.1.0 run /app/your-app.toml --host 0.0.0.0
+  mancube/dagpane:0.1.1 run /app/your-app.toml --host 0.0.0.0
 ```
 
 `scratch` plus one static musl binary: no shell, no package manager, no libc. The app is

@@ -17,6 +17,40 @@ and reported per interaction, never aggregated into a claim.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-09-17
+
+Two gates that had never run, and a container image that had never been built.
+
+All three were found within minutes of publishing 0.1.0, and they share one cause: the
+checks that would have caught them live on the public mirror, and the mirror had never
+been synced. The first real publish ran them for the first time. Nothing in the engine
+changed here — `fmt`, `clippy`, the full test suite, the architecture invariants and the
+job that re-measures every count the README prints all passed on 0.1.0 and still do.
+
+**0.1.0 has no container image.** Its build failed on the assertion below, so
+`mancube/dagpane` carries no `0.1.0` tag and never will. 0.1.1 is the first published
+image.
+
+### Fixed
+
+- **The Dockerfile could not build, and the check that was meant to catch that could not
+  work.** The final builder stage asserted static linking by asking `ldd` for "not a
+  dynamic executable" or "statically linked". That is glibc's wording and the builder is
+  Alpine. musl's `ldd` prints the loader path for a static binary and a dynamic one
+  alike, so the check was reading an answer that carries no information, and the `grep`
+  simply never matched. Replaced with the thing that actually differs: a dynamically
+  linked executable carries a `PT_INTERP` program header naming its interpreter, and a
+  static one has nothing to name. `readelf` now answers that question, `binutils` is
+  installed explicitly rather than relied on, and the output is printed instead of being
+  swallowed by `grep -q`, so the next failure says what it saw.
+
+- **The licence gate rejected a public-domain dedication.** `cargo-deny` refused
+  `tiny-keccak`, which reaches the tree as `arrow-array` and `arrow-select` -> `ahash` ->
+  `const-random` -> `const-random-macro`. Its licence is CC0-1.0, which is a dedication
+  rather than a copyleft licence: it puts no condition on a binary that links the code,
+  so allowing it satisfies the rule `deny.toml` already states rather than bending it. It
+  arrived with the Arrow backend and went unnoticed because this gate had never executed.
+
 ## [0.1.0] — 2026-09-17
 
 First public release, and the first publication of this source anywhere. The mirror

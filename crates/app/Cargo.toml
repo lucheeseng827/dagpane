@@ -1,7 +1,7 @@
 # Explicit fields, no `workspace = true` inheritance — same reason as `dagpane-core`.
 [package]
 name = "dagpane-app"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/dagpane"
@@ -20,8 +20,8 @@ arrow-sources = ["dep:dagpane-frame-arrow"]
 # BENCHMARKS.md. Behind a default-on feature so the lean binary stays reachable: the two
 # paths are observably identical (the cross-backend oracle asserts it), so this is a size
 # knob and never a behaviour one.
-dagpane-frame-arrow = { path = "../frame-arrow", version = "0.1.0", optional = true }
-dagpane-core = { path = "../core", version = "0.1.0" }
+dagpane-frame-arrow = { path = "../frame-arrow", version = "0.1.1", optional = true }
+dagpane-core = { path = "../core", version = "0.1.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
