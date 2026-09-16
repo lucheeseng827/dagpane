@@ -1,0 +1,32 @@
+# Explicit fields, no `workspace = true` inheritance — same reason as the other crates.
+[package]
+name = "dagpane-serve"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/dagpane"
+rust-version = "1.85"
+description = "The dagpane server: an axum WebSocket loop, one session per connection, and the single-file client."
+
+# The only crate in the workspace that owns a socket or a clock. Everything below it is
+# testable without either, and CI checks that the boundary held.
+# Passed straight through to `dagpane-app`, so `--no-default-features` on this crate
+# actually reaches the source representation rather than stopping here.
+[features]
+default = ["arrow-sources"]
+arrow-sources = ["dagpane-app/arrow-sources"]
+
+[dependencies]
+dagpane-app = { path = "../app", version = "0.1.0", default-features = false }
+dagpane-core = { path = "../core", version = "0.1.0" }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
+serde_json = "1"
+
+# A WebSocket *client*, for tests only. The protocol is the product's visible surface — the
+# patch is what a browser receives — so it is worth one dev-dependency to assert on the real
+# frames rather than on the function that would have produced them.
+[dev-dependencies]
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }

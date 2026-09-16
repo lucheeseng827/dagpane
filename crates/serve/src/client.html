@@ -1,0 +1,433 @@
+<!doctype html>
+<!--
+  The dagpane client. One file, no build step, no package manager, nothing fetched at run
+  time — the binary already contains this page.
+
+  The stats bar at the top is not decoration. It is the product claim, live: for every
+  interaction it prints how many of the app's cells the pass looked at, how many ran, how
+  many produced a new value, and how many panes actually went on the wire. Open the network
+  tab and check it against the frames.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dagpane</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfaf8; --panel: #ffffff; --ink: #17181a; --muted: #6b6f76;
+    --line: #e3e1dc; --accent: #2f6f4f; --warn: #a4432b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141517; --panel:#1c1e21; --ink:#e9e7e3; --muted:#9aa0a8;
+            --line:#2c2f34; --accent:#6fbf94; --warn:#e08a6d; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header { padding: 22px 26px 14px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0; font-size: 21px; font-weight: 620; letter-spacing: -0.01em; }
+  .subtitle { color: var(--muted); font-size: 14px; margin-top: 3px; }
+  #stats {
+    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--muted); padding: 9px 26px; border-bottom: 1px solid var(--line);
+    background: var(--panel); white-space: pre-wrap;
+  }
+  #stats b { color: var(--accent); font-weight: 600; }
+  main { display: grid; grid-template-columns: 260px 1fr; gap: 0; align-items: start; }
+  #controls { padding: 20px 22px; border-right: 1px solid var(--line); }
+  #controls label { display: block; margin-bottom: 18px; font-size: 13px; color: var(--muted); }
+  #controls .name { display: block; color: var(--ink); font-weight: 560; margin-bottom: 5px; }
+  #controls input[type=range] { width: 100%; }
+  #controls select, #controls input[type=text], #controls input[type=number] {
+    width: 100%; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--panel); color: var(--ink); font: inherit; font-size: 13px;
+  }
+  .readout { float: right; font: 12px ui-monospace, Menlo, monospace; color: var(--ink); }
+  #panes { padding: 20px 26px 60px; display: grid; gap: 18px;
+           grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .pane { background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
+          padding: 15px 17px; overflow: hidden; }
+  .pane.wide { grid-column: 1 / -1; }
+  .pane h2 { margin: 0 0 10px; font-size: 12px; font-weight: 600; letter-spacing: .05em;
+             text-transform: uppercase; color: var(--muted); }
+  .pane.flash { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .metric-value { font-size: 30px; font-weight: 640; letter-spacing: -0.02em; }
+  .metric-label { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid var(--line);
+           white-space: nowrap; }
+  th { color: var(--muted); font-weight: 560; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .truncated { color: var(--muted); font-size: 12px; padding-top: 7px; }
+  .err { color: var(--warn); font-size: 13px; }
+  .err code { font-family: ui-monospace, Menlo, monospace; }
+  .bar-row { display: grid; grid-template-columns: 90px 1fr 80px; gap: 9px;
+             align-items: center; margin-bottom: 5px; font-size: 13px; }
+  .bar-track { background: color-mix(in srgb, var(--accent) 16%, transparent);
+               border-radius: 3px; height: 15px; }
+  .bar-fill { background: var(--accent); height: 15px; border-radius: 3px; }
+  .bar-value { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  svg { width: 100%; height: 190px; display: block; }
+  #offline { display: none; padding: 9px 26px; background: var(--warn); color: #fff; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="offline">Disconnected. The page below is the last state the server sent.</div>
+<header><h1 id="title">dagpane</h1><div class="subtitle" id="subtitle"></div></header>
+<div id="stats">connecting…</div>
+<main><div id="controls"></div><div id="panes"></div></main>
+
+<script>
+"use strict";
+
+// The client keeps no derived state. It holds the pane list the server described once, and
+// replaces a pane's contents when — and only when — the server sends that pane. That is the
+// same discipline the engine runs on, and it is the reason this file is short.
+let socket = null;
+let seq = 0;
+let panes = new Map();     // pane id -> the <div> that holds its body
+let pending = null;        // values not yet sent, coalesced while a pass is in flight
+let inFlight = false;
+
+function connect() {
+  const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+  socket = new WebSocket(url);
+  socket.onmessage = (e) => handle(JSON.parse(e.data));
+  socket.onclose = () => { document.getElementById("offline").style.display = "block"; };
+  socket.onerror = () => { document.getElementById("offline").style.display = "block"; };
+}
+
+function handle(msg) {
+  if (msg.type === "init") {
+    document.getElementById("title").textContent = msg.title;
+    document.getElementById("subtitle").textContent = msg.subtitle || "";
+    document.title = msg.title;
+    buildControls(msg.widgets);
+    buildPanes(msg.panes);
+    for (const u of msg.views) paint(u, false);
+    showStats(msg.stats, msg.views.length, "first");
+  } else if (msg.type === "patch") {
+    for (const u of msg.panes) paint(u, true);
+    showStats(msg.stats, msg.panes.length, "patch");
+    inFlight = false;
+    flush();
+  } else if (msg.type === "refreshed") {
+    for (const u of msg.panes) paint(u, false);
+    showStats(msg.stats, msg.panes.length, "refresh");
+    inFlight = false;
+    flush();
+  } else if (msg.type === "rejected") {
+    const el = document.getElementById("stats");
+    el.textContent = "";
+    const what = document.createElement("b");
+    what.textContent = "rejected";
+    el.append(what, document.createTextNode(" — " + msg.message));
+    inFlight = false;
+    flush();
+  }
+}
+
+// One interaction is one message. A drag produces a stream of values; they are coalesced
+// into the next send rather than queued, so the server runs one pass per round trip instead
+// of one per pixel — the same "last write wins within a pass" rule the engine has.
+function set(name, value) {
+  if (pending === null) pending = {};
+  pending[name] = value;
+  flush();
+}
+
+function flush() {
+  if (inFlight || pending === null || !socket || socket.readyState !== 1) return;
+  const values = pending;
+  pending = null;
+  inFlight = true;
+  seq += 1;
+  socket.send(JSON.stringify({ type: "set", seq, values }));
+}
+
+function showStats(s, sent, kind) {
+  const el = document.getElementById("stats");
+  el.textContent = "";
+  if (!s) return;
+
+  // Built as nodes rather than as a markup string. That is not fastidiousness: it is what
+  // lets the Rust side assert that this file contains no `innerHTML` at all, which is a
+  // check that can actually fail when somebody adds one.
+  const put = (text) => el.appendChild(document.createTextNode(text));
+  const strong = (n) => {
+    const b = document.createElement("b");
+    b.textContent = String(n);
+    el.appendChild(b);
+  };
+
+  if (kind === "refresh") {
+    // A refresh runs no pass, so there are no counts to show. Saying "looked at 0" beside
+    // "panes sent 7" would read as though the engine had done nothing to produce them.
+    put("refresh · " + s.total_cells + " cells · resent ");
+    strong(sent);
+    put(" pane" + (sent === 1 ? "" : "s") + " from cache, recomputing nothing");
+    return;
+  }
+
+  put((kind === "first" ? "first render" : "interaction") + " · " + s.total_cells +
+      " cells · looked at ");
+  strong(s.visited);
+  put(" · ran ");
+  strong(s.evaluated);
+  put(" · changed ");
+  strong(s.changed);
+  put(" · never touched ");
+  strong(s.untouched);
+  put(" · panes sent ");
+  strong(sent);
+  if (s.micros !== undefined) put(" · " + (s.micros / 1000).toFixed(2) + " ms");
+}
+
+function buildControls(widgets) {
+  const root = document.getElementById("controls");
+  root.textContent = "";
+  for (const w of widgets) {
+    const label = document.createElement("label");
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = w.label;
+    label.appendChild(name);
+
+    if (w.widget === "slider") {
+      const out = document.createElement("span");
+      out.className = "readout";
+      out.textContent = valueOf(w.default);
+      name.appendChild(out);
+      const input = document.createElement("input");
+      input.type = "range";
+      input.min = w.min; input.max = w.max; input.step = w.step;
+      input.value = valueOf(w.default);
+      input.oninput = () => {
+        out.textContent = input.value;
+        set(w.cell, { kind: "float", v: parseFloat(input.value) });
+      };
+      label.appendChild(input);
+    } else if (w.widget === "select") {
+      const select = document.createElement("select");
+      for (const option of w.options) {
+        const o = document.createElement("option");
+        o.value = option; o.textContent = option;
+        select.appendChild(o);
+      }
+      select.value = valueOf(w.default);
+      select.onchange = () => set(w.cell, { kind: "text", v: select.value });
+      label.appendChild(select);
+    } else if (w.widget === "checkbox") {
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = w.default.v === true;
+      input.onchange = () => set(w.cell, { kind: "bool", v: input.checked });
+      label.appendChild(input);
+    } else if (w.widget === "number") {
+      const input = document.createElement("input");
+      input.type = "number";
+      if (w.min !== null && w.min !== undefined) input.min = w.min;
+      if (w.max !== null && w.max !== undefined) input.max = w.max;
+      input.value = valueOf(w.default);
+      input.onchange = () => set(w.cell, { kind: "float", v: parseFloat(input.value) });
+      label.appendChild(input);
+    } else {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.placeholder = w.placeholder || "";
+      input.value = valueOf(w.default);
+      input.oninput = () => set(w.cell, { kind: "text", v: input.value });
+      label.appendChild(input);
+    }
+    root.appendChild(label);
+  }
+}
+
+function buildPanes(specs) {
+  const root = document.getElementById("panes");
+  root.textContent = "";
+  panes = new Map();
+  for (const spec of specs) {
+    const card = document.createElement("div");
+    card.className = "pane" + (spec.pane === "table" || spec.pane === "line" ? " wide" : "");
+    if (spec.title) {
+      const h = document.createElement("h2");
+      h.textContent = spec.title;
+      card.appendChild(h);
+    }
+    const body = document.createElement("div");
+    card.appendChild(body);
+    root.appendChild(card);
+    panes.set(spec.id, { card, body });
+  }
+}
+
+// A repainted pane flashes its border for a moment. It is the cheapest possible way to see
+// that an interaction touched three panes and not seven.
+function paint(update, flash) {
+  const pane = panes.get(update.id);
+  if (!pane) return;
+  pane.body.textContent = "";
+  pane.body.appendChild(build(update.view));
+  if (flash) {
+    pane.card.classList.remove("flash");
+    void pane.card.offsetWidth;
+    pane.card.classList.add("flash");
+    setTimeout(() => pane.card.classList.remove("flash"), 420);
+  }
+}
+
+function build(view) {
+  switch (view.view) {
+    case "metric": {
+      const box = document.createElement("div");
+      const v = document.createElement("div");
+      v.className = "metric-value";
+      v.textContent = view.value;
+      const l = document.createElement("div");
+      l.className = "metric-label";
+      l.textContent = view.label;
+      box.append(v, l);
+      return box;
+    }
+    case "text": {
+      const p = document.createElement("div");
+      p.textContent = view.text;
+      return p;
+    }
+    case "table": return buildTable(view);
+    case "bar": return buildBars(view);
+    case "line": return buildLine(view);
+    case "error": {
+      const p = document.createElement("div");
+      p.className = "err";
+      const code = document.createElement("code");
+      code.textContent = view.cause;
+      p.append(code, document.createTextNode(": " + view.message));
+      return p;
+    }
+    default: {
+      const p = document.createElement("div");
+      p.className = "err";
+      p.textContent = "this client cannot draw a " + view.view + " pane";
+      return p;
+    }
+  }
+}
+
+function buildTable(view) {
+  const wrap = document.createElement("div");
+  wrap.className = "scroll";
+  const table = document.createElement("table");
+  const numeric = view.head.map((h) => h.type === "int" || h.type === "float");
+
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+  view.head.forEach((h, i) => {
+    const th = document.createElement("th");
+    th.textContent = h.name;
+    if (numeric[i]) th.className = "num";
+    hr.appendChild(th);
+  });
+  thead.appendChild(hr);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  for (const row of view.rows) {
+    const tr = document.createElement("tr");
+    row.forEach((cell, i) => {
+      const td = document.createElement("td");
+      td.textContent = valueOf(cell);
+      if (numeric[i]) td.className = "num";
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+
+  if (view.total_rows > view.rows.length) {
+    const note = document.createElement("div");
+    note.className = "truncated";
+    note.textContent =
+      "showing " + view.rows.length + " of " + view.total_rows + " rows";
+    wrap.appendChild(note);
+  }
+  return wrap;
+}
+
+function buildBars(view) {
+  const box = document.createElement("div");
+  const max = Math.max(1, ...view.values.map((v) => Math.abs(v)));
+  view.labels.forEach((label, i) => {
+    const row = document.createElement("div");
+    row.className = "bar-row";
+    const l = document.createElement("div");
+    l.textContent = label;
+    const track = document.createElement("div");
+    track.className = "bar-track";
+    const fill = document.createElement("div");
+    fill.className = "bar-fill";
+    fill.style.width = (100 * Math.abs(view.values[i]) / max).toFixed(2) + "%";
+    track.appendChild(fill);
+    const v = document.createElement("div");
+    v.className = "bar-value";
+    v.textContent = format(view.values[i]);
+    row.append(l, track, v);
+    box.appendChild(row);
+  });
+  return box;
+}
+
+// An SVG polyline, drawn by hand. A charting library would be a bigger dependency than the
+// engine it is drawing, and this file has exactly two chart shapes on purpose.
+function buildLine(view) {
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 640 190");
+  svg.setAttribute("preserveAspectRatio", "none");
+  const n = Math.min(view.x.length, view.y.length);
+  if (n === 0) return svg;
+
+  const xs = view.x.slice(0, n), ys = view.y.slice(0, n);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const sx = (v) => (x1 === x0 ? 320 : 8 + 624 * (v - x0) / (x1 - x0));
+  const sy = (v) => (y1 === y0 ? 95 : 180 - 170 * (v - y0) / (y1 - y0));
+
+  const path = document.createElementNS(NS, "polyline");
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "currentColor");
+  path.setAttribute("stroke-width", "1.8");
+  path.setAttribute("vector-effect", "non-scaling-stroke");
+  path.setAttribute("points", xs.map((x, i) => sx(x) + "," + sy(ys[i])).join(" "));
+  svg.appendChild(path);
+  svg.style.color = "var(--accent)";
+  return svg;
+}
+
+// The server sends values in the same tagged shape it uses everywhere else, so there is one
+// place that turns one into text and no per-pane special cases.
+function valueOf(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v !== "object") return String(v);
+  if (v.kind === "null") return "—";
+  if (v.kind === "float") return format(v.v);
+  if (v.kind === "bool") return v.v ? "yes" : "no";
+  return String(v.v);
+}
+
+function format(n) {
+  if (typeof n !== "number" || !isFinite(n)) return String(n);
+  return Number.isInteger(n) ? String(n) : n.toFixed(2);
+}
+
+connect();
+</script>
+</body>
+</html>

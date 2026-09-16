@@ -1,0 +1,36 @@
+# Explicit fields, no `workspace = true` inheritance — same reason as the other crates.
+[package]
+name = "dagpane-frame-arrow"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/dagpane"
+# 1.85 because arrow 58 requires it. Not the 1.82 `dagpane-core` holds to: core is the
+# crate that has to build on an old toolchain, and this one is a backend behind a
+# default-on feature that a lean build turns off.
+rust-version = "1.85"
+description = "An Arrow-backed dagpane Frame: contiguous buffers instead of Vec<Option<T>>, and dictionary encoding for low-cardinality text. Same logical content, same digest, a fraction of the memory."
+
+[lib]
+name = "dagpane_frame_arrow"
+path = "src/lib.rs"
+
+# Arrow lives HERE and not in `dagpane-core`, deliberately. Core is one dependency and
+# auditable line by line, and it is the only crate where the product's claim can be wrong;
+# a backend is a place where it can only be slow. Keeping the split this way is also what
+# makes a second backend cheap — Polars and DataFusion both build for wasm32 (see
+# BENCHMARKS.md) and either would be a sibling of this crate, not a change to core.
+#
+# Only the three sub-crates the seam actually needs. The `arrow` umbrella would pull csv,
+# json, ipc and ffi for nothing. The engine choice was made on 259 KiB gzipped, which
+# BENCHMARKS.md measured over FOUR crates — the probe there also carried `arrow-ord`, which
+# this crate turned out not to need — so the real cost here is that figure or a little under
+# it, and never the umbrella.
+[dependencies]
+dagpane-core = { path = "../core", version = "0.1.0" }
+arrow-array = "58"
+arrow-schema = "58"
+arrow-select = "58"
+
+[dev-dependencies]
+serde_json = "1"

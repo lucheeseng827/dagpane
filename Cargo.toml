@@ -1,0 +1,132 @@
+# dagpane — a reactive runtime for data apps: an interaction recomputes the cells that
+# depend on it, and nothing else.
+#
+# A STANDALONE workspace with its own Cargo.lock. The usual reason applies — it pins its
+# own axum 0.8 / tokio line, and pinning those in the repo's shared resolution would
+# perturb every crate that shares it — and one more that is specific to this module:
+#
+#   The product claim is a *count*. "An interaction over an N-cell app evaluates only the
+#   dirty closure" is asserted by tests and by a CI gate that reads the evaluation trace,
+#   and those numbers only mean something against a fixed dependency set. A floating
+#   resolution can change how much work a cell does; it must not be able to change how
+#   many cells run.
+#
+#   cargo build --release
+#   cargo test
+#
+# --- Why the crates split this way -------------------------------------------------
+# The product is one arrow — "an input changes -> a graph decides what is stale -> only
+# those cells recompute -> a patch goes out, not a page" — so the crate boundaries follow
+# that arrow rather than the feature list:
+#
+#   core   The reactive engine and the value model. Cells, declared edges, the build-time
+#          topological order, dirty propagation, the digest that short-circuits an
+#          equal recomputation, error-as-value, and the trace that says which cells ran.
+#          PURE: no I/O, no async, no network, no clock, no `unsafe`. This is the only
+#          surface where the product claim can be wrong — a missed invalidation shows a
+#          user a stale number, and a spurious one is the very tax this project exists to
+#          remove — so it stays auditable line-by-line and testable with plain values.
+#          `cargo test -p dagpane-core` is a complete test of the reactive semantics on a
+#          machine with no network and no browser.
+#   app    The app model on top of the engine: widgets, views, the pane tree, the patch
+#          diff, the wire types, and the TOML manifest compiler that turns a declarative
+#          app into a graph. Knows what a slider is; knows nothing about sockets.
+#   serve  The process: an axum server, the session registry and its eviction, the
+#          WebSocket loop, and the embedded single-file client. The only crate that owns
+#          a clock or a socket. Every wall-clock number in a trace is measured here,
+#          because `core` deliberately cannot read one.
+#   cli    The `dagpane` binary: run / graph / explain / check. Wiring and human output.
+#
+# DAG: cli -> serve -> app -> core (cli and serve also use app and core directly). core
+# never depends on app, serve or any async runtime, and CI greps for that — it is what
+# keeps the engine testable without a browser in the loop.
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/app", "crates/serve", "crates/cli", "crates/frame-arrow"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/dagpane"
+# Measured, not aspirational: `cargo +1.85.0 check --workspace --locked` is a CI job, and
+# this is the oldest toolchain it has actually passed on — 1.84.0 fails. An MSRV nobody
+# checks is a promise with a version number on it.
+#
+# 1.85 rather than the 1.82 this shipped with, and the reason is not dagpane's own code,
+# which needs nothing newer. Eight packages in `Cargo.lock` declare edition 2024, which
+# cargo refuses to *parse* before 1.85 — it fails during resolution, before compiling
+# anything. They reach the lock by four independent routes: the `clap` family, four crates
+# of it, under `cli`; `indexmap` and `hashbrown` under `toml`, which is what compiles a
+# manifest; and `getrandom` under `tempfile`, pulling `wit-bindgen` behind it for the wasi
+# backend. So pinning any one of them back does not buy the old number back — it would mean
+# holding `toml` and `tempfile` down as well, and the next update would undo it. Stating the
+# version the workspace actually builds on is the cheaper honesty.
+#
+# `dagpane-core` is the deliberate exception at 1.82 — see its own manifest, and the `msrv`
+# CI job, which checks both numbers.
+rust-version = "1.85"
+
+# Kept deliberately small, and what is NOT here is load-bearing for a project whose whole
+# subject is how little work an interaction should cause:
+#
+#   no `polars` / `duckdb` — and `arrow` only in `crates/frame-arrow`, never in core. The
+#     seam ARCHITECTURE.md §6 named now exists, and it shipped with two backends rather
+#     than one, because a trait with a single implementation is a design fitted to that
+#     implementation. What has NOT changed is where a dependency may live: `dagpane-core`
+#     is still serde and nothing else, so the crate where the product's claim can be wrong
+#     stays auditable line by line and a backend is only a place where it can be slow.
+#     Four arrow sub-crates, not the umbrella — 259 KiB gzipped, measured, against an
+#     umbrella that adds csv, json, ipc and ffi for nothing. BENCHMARKS.md has the figures
+#     the choice was made on, including the wasm32 build size of every candidate, so the
+#     wasm question was answered before the dependency was taken rather than after.
+#   no signal/reactivity crate (leptos-reactive, futures-signals) — those trace
+#     dependencies through a thread-local observer stack at run time. That is the right
+#     design for a UI framework and the wrong one here: this engine's edges are declared,
+#     so a cycle is a build error rather than a run-time surprise, and the graph can be
+#     built once and shared immutably across every session. See docs/adr/0002.
+#   no `tokio` anywhere below `serve` — an engine that needs an async runtime to be tested
+#     is an engine nobody tests.
+#   no HTTP client anywhere — a data app runtime that phones home is not one anybody
+#     self-hosts. CI asserts the absence.
+# NOT inherited by the member crates. Every crate spells out its own `version`/`edition`/
+# `license`/`repository`/`rust-version` and its own dependency versions, for the reason each
+# crate manifest's header gives: cargo resolves `workspace = true` against whichever workspace
+# root it finds ABOVE a vendored copy, not this one, so explicit fields build the same
+# everywhere. These tables are therefore the single place versions are WRITTEN DOWN — kept in
+# step with the crates by review, not by cargo — plus `cargo add` ergonomics. If you change a
+# version here, change it in the crate that uses it too.
+[workspace.dependencies]
+dagpane-core = { path = "crates/core", version = "0.1.0" }
+dagpane-app = { path = "crates/app", version = "0.1.0" }
+dagpane-serve = { path = "crates/serve", version = "0.1.0" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+# `serve` only. The `ws` feature is axum's own WebSocket upgrade; a separate
+# tokio-tungstenite dependency would be a second copy of the same code.
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal", "sync"] }
+tempfile = "3"
+
+# The single static binary is a tested artefact — `dagpane run` on a host with no Python,
+# no Node and no package manager is the deployment story — so the profile that produces it
+# lives with the workspace rather than in CI.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+# The published numbers are COUNTS — evaluations and reuses per interaction — and `cargo
+# test` is what measures them. There is deliberately no wall-clock gate anywhere in this
+# module: README.md, CHANGELOG.md, ARCHITECTURE.md §8 and POSITIONING.md all say there is no
+# timing claim, and this comment used to be the single line in the tree contradicting them.
+# The profile below exists so that the counts are measured against an engine doing real work
+# rather than against the allocator.
+[profile.dev.package.dagpane-core]
+opt-level = 2

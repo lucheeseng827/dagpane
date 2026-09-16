@@ -1,0 +1,69 @@
+# cargo-deny policy for dagpane.
+#
+# `.github/workflows/ci.yml` runs `cargo deny check advisories bans licenses sources` on every commit, and
+# NOTICE tells readers that it does. Without this file that check has no licence allowlist —
+# it would either fail outright or pass while asserting nothing, which is the worse of the
+# two because it looks like a control.
+#
+# The allowlist below was generated from the actual resolved tree (`cargo metadata`), not
+# copied from another project: every identifier here is one this workspace really pulls in.
+# Adding a dependency whose licence is not listed is meant to fail — that is the check.
+
+[graph]
+all-features = true
+
+[advisories]
+# A published advisory against something in the tree fails the build. There are deliberately
+# no ignores: an ignore here is a decision that should be visible in a diff, with a reason.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive only. This workspace is Apache-2.0 and every dependency must be compatible with
+# shipping inside a single static binary, including the copyleft question — a GPL dependency
+# would relicense the binary, which is why none is allowed rather than reviewed case by case.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unlicense",
+    "Zlib",
+    # `Apache-2.0 WITH LLVM-exception` reaches the tree through the compiler-builtins line.
+    "Unicode-3.0",
+]
+# `unicode-ident` is `(MIT OR Apache-2.0) AND Unicode-3.0`; the Unicode-3.0 half is listed
+# above rather than granted as an exception, because it applies to data tables that ship in
+# the binary and a reader should see it in the allowlist.
+exceptions = []
+confidence-threshold = 0.9
+
+[bans]
+# Two copies of one crate in a binary whose whole subject is how little work an interaction
+# should cause is worth a warning, not a failure: the axum/tokio line legitimately carries a
+# few. `deny` is for things that must never appear at all.
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # A data-app runtime that can phone home is not one anybody self-hosts. `.github/workflows/ci.yml` also
+    # greps for these, because a lockfile pin is not a policy; this is the policy.
+    { name = "reqwest" },
+    { name = "ureq" },
+    { name = "isahc" },
+    { name = "surf" },
+    # `openssl-sys` would put a C build and a system library into a binary that is meant to be
+    # a single static musl artefact. rustls is the answer if TLS is ever needed.
+    { name = "openssl-sys" },
+]
+# tokio-tungstenite is a dev-dependency of `dagpane-serve` only — it is the WebSocket *client*
+# the socket tests use. It must never become a normal dependency.
+skip = []
+
+[sources]
+# crates.io and nothing else. A git dependency in a workspace that ships a static binary is a
+# supply-chain question nobody can answer from the lockfile alone.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

@@ -1,0 +1,27 @@
+/target
+**/target
+
+# This module's Cargo.lock IS committed, and the reason is worth writing down even though
+# nothing here ignores it (there is no `!Cargo.lock` negation because there is no rule to
+# negate — the repository root stopped ignoring locks):
+#
+#   * CI runs every build with `--locked`, which is a no-op assertion without a committed
+#     lock and an outright failure with one missing;
+#   * this module's published numbers are COUNTS — "an interaction over an 11-cell app
+#     evaluates six cells" — and a count only means something against a fixed dependency
+#     set. A floating resolution can change how much work a cell does. It must not be able
+#     to change how many cells run.
+
+# Never commit a key. Nothing here generates one today; this is the belt to that braces.
+*.pem
+*.key
+*.pkcs8
+
+# The root ignores `*.txt` wholesale, and this module has no .txt source. If one is ever
+# added, re-include it here rather than loosening the root.
+
+# The wasm-engines probe is a nested cargo project; its lock and target are build
+# artefacts, and its lock in particular would pin candidate versions the probe exists to
+# re-resolve on each run.
+/benches/wasm-engines/target/
+/benches/wasm-engines/Cargo.lock

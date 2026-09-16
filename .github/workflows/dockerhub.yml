@@ -1,0 +1,131 @@
+# dagpane — publish docs/DOCKERHUB.md as the Docker Hub overview.
+#
+# MIRROR-NATIVE, like .github/workflows/ci.yml and .github/workflows/docker.yml.
+#
+# ── Why this is its own workflow ──────────────────────────────────────────────────────
+#
+# The words and the image move independently. The page should update when the text changes,
+# and re-describing an image must not require rebuilding it — so this is triggered by a
+# change to the overview itself rather than by a publish. Bolting it onto docker.yml would
+# mean a typo fix needs a release tag.
+#
+# The failure it prevents is drift. A repository page that is whatever somebody last pasted
+# by hand is a page nobody owns, and it goes stale the first time the words change anywhere
+# else. A sibling's page described a CLI image that no workflow published, while the image
+# that WAS published had no page at all.
+#
+# ── The write is verified by reading it back ──────────────────────────────────────────
+#
+# A description that arrives as mojibake still returns HTTP 200, so "the PATCH succeeded"
+# does not establish that the page is right. Only the read-back does. This overview carries
+# em dashes and box-drawing characters in its tables, which is exactly the content that gets
+# mangled when a body is interpolated into a shell string instead of JSON-encoded.
+#
+# ── What it does NOT manage ───────────────────────────────────────────────────────────
+#
+# The short blurb under the repository name is a separate field and is left alone: it was
+# set by hand to something deliberate, and silently overwriting a human's choice is the
+# behaviour this workflow exists to argue against.
+#
+# Required secrets, on this repository, same as docker.yml: DOCKER_USERNAME, DOCKER_PASSWORD.
+
+name: dockerhub overview
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/DOCKERHUB.md"
+      - ".github/workflows/dockerhub.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dagpane-dockerhub-overview
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: publish and verify
+    runs-on: ubuntu-24.04
+    environment: cicd
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Publish the overview and read it back
+        env:
+          # Passed as env, never interpolated into the script: a secret spliced into shell
+          # or Python source is one quoting bug away from a log line.
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          REPO: mancube/dagpane
+          OVERVIEW: docs/DOCKERHUB.md
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKER_USERNAME}" ] || [ -z "${DOCKER_PASSWORD}" ]; then
+            echo "::error::DOCKER_USERNAME or DOCKER_PASSWORD resolved EMPTY on this repository."
+            echo "Add both under Settings -> Environments -> cicd."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os, pathlib, sys, urllib.error, urllib.request
+
+          HUB = "https://hub.docker.com/v2"
+          repo = os.environ["REPO"]
+
+          def call(method, url, token=None, payload=None):
+              headers = {"Accept": "application/json"}
+              data = None
+              if payload is not None:
+                  # json.dumps plus an explicit charset. The em dashes and box-drawing
+                  # characters in the overview must survive; interpolating the body into a
+                  # shell string is how hand-pasted pages lose them.
+                  data = json.dumps(payload).encode("utf-8")
+                  headers["Content-Type"] = "application/json; charset=utf-8"
+              if token:
+                  headers["Authorization"] = f"JWT {token}"
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      return json.loads(r.read().decode("utf-8"))
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", "replace")[:300]
+                  sys.exit(f"::error::{method} {url} -> HTTP {e.code}: {body}")
+
+          def lf(text):
+              # A CRLF checkout must not publish CRLF, and the comparison below has to be
+              # against what was actually sent.
+              return text.replace("\r\n", "\n").replace("\r", "\n")
+
+          body = lf(pathlib.Path(os.environ["OVERVIEW"]).read_text(encoding="utf-8"))
+          # Docker Hub caps the overview at 25,000 characters and TRUNCATES rather than
+          # refusing, which would publish a page that ends mid-sentence.
+          if len(body) > 25000:
+              sys.exit(f"::error::overview is {len(body)} chars; Docker Hub caps it at 25000")
+
+          token = call("POST", f"{HUB}/users/login/", payload={
+              "username": os.environ["DOCKER_USERNAME"],
+              "password": os.environ["DOCKER_PASSWORD"],
+          })["token"]
+
+          page = call("GET", f"{HUB}/repositories/{repo}/", token)
+          live = lf(page.get("full_description") or "")
+          if live == body:
+              print(f"{repo}: already current ({len(body)} chars) - nothing to do")
+              sys.exit(0)
+
+          print(f"{repo}: overview live {len(live)} chars -> new {len(body)} chars")
+          call("PATCH", f"{HUB}/repositories/{repo}/", token,
+               payload={"full_description": body})
+
+          after = call("GET", f"{HUB}/repositories/{repo}/", token)
+          back = lf(after.get("full_description") or "")
+          if back != body:
+              sys.exit(f"::error::{repo}: the page is NOT what was sent - read back "
+                       f"{len(back)} chars, {back.count(chr(0xFFFD))} replacement chars")
+          print(f"{repo}: published and verified byte-for-byte ({len(body)} chars)")
+          PY

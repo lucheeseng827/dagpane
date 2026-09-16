@@ -1,0 +1,8 @@
+# wasm32-unknown-unknown has no OS entropy source, so getrandom 0.3 refuses to pick a
+# backend for it and fails to compile. The documented opt-in is this cfg plus the
+# `wasm_js` feature, which routes it through the browser's crypto.getRandomValues.
+#
+# Worth noting what that implies: it makes the artifact require a JS host. A pure wasm
+# runtime (wasmtime, WASI) would need a different backend.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

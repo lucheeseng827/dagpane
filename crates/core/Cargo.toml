@@ -1,0 +1,26 @@
+# Explicit fields, no `workspace = true` inheritance. This crate is the one a downstream
+# project embeds directly (the engine without the server), and cargo resolves inheritance
+# against whichever workspace root it finds ABOVE a vendored copy — not this module's.
+# Explicit fields build the same everywhere.
+[package]
+name = "dagpane-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/dagpane"
+# Deliberately below the workspace's 1.85, and checked on its own by the `msrv` CI job.
+# `serde` is this crate's only direct runtime dependency — `serde_json` is dev-only — and
+# none of the edition-2024 packages that hold the rest of the workspace to 1.85 appear
+# anywhere in what either pulls in. Cargo therefore never parses those manifests here, and
+# `cargo +1.82.0 check -p dagpane-core --locked` passes. That makes 1.82 a real promise to
+# a project embedding the engine, rather than a number rounded up to match its neighbours.
+rust-version = "1.82"
+description = "The reactive engine behind dagpane: declared cell edges, dirty-closure evaluation, and the trace that proves it."
+
+# serde is a value-model dependency, not an I/O one: `Value` and `Table` cross the wire and
+# appear in traces. Nothing in this crate opens a file, a socket or a clock.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

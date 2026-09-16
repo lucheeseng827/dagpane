@@ -1,0 +1,30 @@
+# Explicit fields, no `workspace = true` inheritance — same reason as `dagpane-core`.
+[package]
+name = "dagpane-app"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/dagpane"
+rust-version = "1.85"
+description = "The app model on top of the dagpane engine: widgets, views, the patch, and the manifest compiler."
+
+# No axum, no tokio, no hyper. This crate decides what a pane looks like and what goes on
+# the wire; it must be testable without a socket, and CI checks that it stayed that way.
+[features]
+default = ["arrow-sources"]
+arrow-sources = ["dep:dagpane-frame-arrow"]
+
+[dependencies]
+# A loaded CSV source becomes an Arrow frame rather than a `Vec<Option<T>>` table, which is
+# where the measured 4.1x on the bundled example's columns actually comes from — see
+# BENCHMARKS.md. Behind a default-on feature so the lean binary stays reachable: the two
+# paths are observably identical (the cross-backend oracle asserts it), so this is a size
+# knob and never a behaviour one.
+dagpane-frame-arrow = { path = "../frame-arrow", version = "0.1.0", optional = true }
+dagpane-core = { path = "../core", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

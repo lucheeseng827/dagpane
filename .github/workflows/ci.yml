@@ -1,0 +1,277 @@
+# dagpane CI — mirror-native.
+#
+# Published to the public mirror as .github/workflows/ci.yml, so every path here is relative
+# to the repository root rather than to a monorepo module.
+#
+# The `claim` job is the point of this file. fmt, clippy and the unit tests catch ordinary
+# mistakes; only that job catches the mistake that actually matters, which is a change that
+# makes the runtime do more work — or less — than it says. This project's entire claim is a
+# set of counts, so a build where the counts moved and nobody noticed is a build that
+# shipped a different product.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: install toolchain
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.94.0
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+
+      - run: cargo fmt --all -- --check
+
+      # --all-targets so tests and examples are linted too. A warning in a test is a warning
+      # somebody has to triage.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # --locked: the lockfile in the repository is the build, not a suggestion.
+      - run: cargo test --workspace --locked
+
+      # The MSRVs in Cargo.toml are promises. An unenforced promise is a lie with a version
+      # number on it — and there are two of them here, so both are checked. `dagpane-core`
+      # builds on an older toolchain than the workspace does because its only dependency is
+      # serde; checking only the workspace would leave core's lower number unverified, which
+      # is the failure this job exists to prevent.
+      - name: msrv
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          cargo +1.85.0 check --workspace --locked
+          rustup toolchain install 1.82.0 --profile minimal
+          cargo +1.82.0 check -p dagpane-core --locked
+
+  claim:
+    name: the counts the README prints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup toolchain install 1.94.0 --profile minimal && rustup default 1.94.0
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+
+      - name: build
+        run: cargo build --release --locked -p dagpane-cli
+
+      # Exit criterion 1 — the differential oracle. 200 random graphs, 2,400 interactions,
+      # each checked against a full recompute for correctness AND against the structural
+      # closure for economy. This is the test that can catch a scheduler that skips too
+      # much; a count assertion on a hand-drawn graph cannot.
+      - name: the oracle
+        run: cargo test --release --locked -p dagpane-core --test oracle -- --nocapture
+
+      # Exit criterion 2 — the published interaction still costs what the README says. The
+      # numbers are read out of `explain --json`, which is the same Trace the server sends a
+      # browser, so this asserts the product and not a test double.
+      - name: an interaction over the bundled app touches 8 of 11 cells and sends 3 of 7 panes
+        run: |
+          set -euo pipefail
+          ./target/release/dagpane explain examples/sales.toml --set min_amount=400 --json > /tmp/claim.json
+          cat /tmp/claim.json
+          python3 - <<'PY'
+          import json, sys
+          r = json.load(open("/tmp/claim.json"))
+          t = r["interaction"]["trace"]
+          steps = t["steps"]
+          got = {
+              "total_cells": t["total_cells"],
+              "visited": len(steps),
+              "evaluated": sum(1 for s in steps if s["outcome"] == "evaluated"),
+              "reused": sum(1 for s in steps if s["outcome"] == "reused"),
+              "changed": sum(1 for s in steps if s["outcome"] == "evaluated" and s["changed"]),
+              "untouched": len(r["interaction"]["untouched"]),
+              "panes_sent": len(r["interaction"]["panes_sent"]),
+              "panes_total": r["interaction"]["panes_total"],
+          }
+          want = {"total_cells": 11, "visited": 8, "evaluated": 6, "reused": 1,
+                  "changed": 4, "untouched": 3, "panes_sent": 3, "panes_total": 7}
+          if got != want:
+              print("::error::the published counts moved.")
+              for k in want:
+                  if got[k] != want[k]:
+                      print(f"::error::  {k}: README says {want[k]}, this build says {got[k]}")
+              print("Either the change is wrong, or README.md and ARCHITECTURE.md §3 are now")
+              print("wrong. Both are failures; neither is fixed by editing this file alone.")
+              sys.exit(1)
+          print("counts unchanged:", got)
+          PY
+
+      # Exit criterion 3 — the engine still compiles for the browser's target. This is the
+      # whole of the WASM claim and it is worth exactly what it costs: it holds `core` to no
+      # filesystem, no clock and no threads. Nothing runs in a browser and the README says so.
+      - name: the engine still builds for wasm32
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --locked -p dagpane-core --target wasm32-unknown-unknown
+
+      # Exit criterion 4 — the single-binary claim is a tested artefact, not a README
+      # sentence, and it includes the front end, which lives inside the executable.
+      - name: static musl build
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo build --release --locked --target x86_64-unknown-linux-musl -p dagpane-cli
+          BIN=target/x86_64-unknown-linux-musl/release/dagpane
+          file "$BIN"
+          # Accept either wording, positively. `ldd` says "not a dynamic executable" on musl
+          # and "statically linked" on some static-PIE glibc builds; the negative form
+          # reports a genuinely static binary as dynamic when it meets the second wording.
+          if ! ldd "$BIN" 2>&1 | grep -Eq "not a dynamic executable|statically linked"; then
+            echo "::error::the musl build is not static:"; ldd "$BIN"; exit 1
+          fi
+          "$BIN" --version
+          "$BIN" check examples/sales.toml
+
+  image:
+    name: the Dockerfile builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # The Dockerfile is the documented deployment path on the public mirror, and it was
+      # broken on this branch until review caught it: the final stage copied LICENSE and
+      # NOTICE out of a builder they had never been copied into. Nothing built the image, so
+      # nothing noticed. This step is that "nothing".
+      - name: docker build
+        run: docker build -t dagpane:ci .
+
+      - name: the image is the binary, and the binary works
+        run: |
+          set -euo pipefail
+          # The image is `scratch` + one static binary: no shell, and no examples inside it.
+          # The app is therefore mounted, which is also how anybody would really run this.
+          docker run --rm dagpane:ci --version
+          docker run --rm -v "$PWD/examples:/app:ro" dagpane:ci check /app/sales.toml
+
+  invariants:
+    name: architecture invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # These are properties of the dependency graph, not of the code, so `cargo test`
+      # cannot see them. The lock pins them; it does not defend them. A grep is cheap and
+      # catches the case where somebody adds the dependency before writing the code that
+      # would fail a test.
+      - name: core stays pure
+        run: |
+          set -e
+          for banned in tokio axum hyper reqwest ureq std-async futures; do
+            if grep -qE "^\s*${banned}\b" crates/core/Cargo.toml; then
+              echo "::error::crates/core must not depend on ${banned} — it is what makes"
+              echo "::error::\`cargo test -p dagpane-core\` a complete test of the reactive"
+              echo "::error::semantics on a machine with no browser and no network."
+              exit 1
+            fi
+          done
+          # No text scan for `unsafe` here. The obvious one — `grep -rq "unsafe" crates/core/src`
+          # — matches `#![forbid(unsafe_code)]` itself, so the job would fail on the very lint
+          # it is checking for. That is not hypothetical: this file is mirror-native and has
+          # never run in the monorepo, so the bug would have surfaced on the public mirror's
+          # first build. `forbid(unsafe_code)` is a compiler error, and `cargo build`/`cargo
+          # test` in the `check` job already enforce it — a grep adds nothing it can get right.
+          grep -q 'forbid(unsafe_code)' crates/core/src/lib.rs || {
+            echo "::error::crates/core no longer declares forbid(unsafe_code)"; exit 1; }
+
+      - name: app never depends on a server
+        run: |
+          set -e
+          for banned in tokio axum hyper; do
+            if grep -qE "^\s*${banned}\b" crates/app/Cargo.toml; then
+              echo "::error::crates/app must not depend on ${banned} — the patch protocol has"
+              echo "::error::to be testable with nothing listening on anything."
+              exit 1
+            fi
+          done
+
+      - name: no HTTP client anywhere in the build
+        run: |
+          # A data-app runtime that can phone home is not one anybody self-hosts, and the
+          # promise is only as good as the dependency tree.
+          #
+          # This used to be `grep ... | grep -v "dev-dependencies"`, which cannot work: grep
+          # filters the MATCHED line, and the matched line is `reqwest = "0.12"` — never the
+          # `[dev-dependencies]` header above it. The exemption was inert, so the first
+          # dev-dependency HTTP client would have failed the build with a misleading message.
+          # Parse the sections instead. `crates/serve` legitimately has a WebSocket *client*
+          # in dev-dependencies to test its own wire.
+          python3 - <<'PY'
+          import sys, tomllib
+          from pathlib import Path
+
+          BANNED = {"reqwest", "ureq", "isahc", "curl", "surf"}
+          SHIPPED = ("dependencies", "build-dependencies")
+          bad = []
+          for path in Path(".").rglob("Cargo.toml"):
+              if "target" in path.parts:
+                  continue
+              manifest = tomllib.loads(path.read_text())
+              tables = [manifest.get(s, {}) for s in SHIPPED]
+              tables += [t.get(s, {}) for t in manifest.get("target", {}).values() for s in SHIPPED]
+              ws = manifest.get("workspace", {})
+              tables += [ws.get("dependencies", {})]
+              for table in tables:
+                  bad += [(str(path), name) for name in table if name in BANNED]
+          if bad:
+              for path, name in bad:
+                  print(f"::error file={path}::{name} is an HTTP client in a shipped dependency table.")
+              print("::error::this runtime does not phone home, and the dependency tree is what makes that true.")
+              sys.exit(1)
+          print("no HTTP client in any shipped dependency table")
+          PY
+
+      - name: the bundled client fetches nothing
+        run: |
+          # Also asserted by a unit test; a grep here catches it before a compile.
+          if grep -qE 'script src=|@import|//cdn\.|insertAdjacentHTML|document\.write' \
+               crates/serve/src/client.html; then
+            echo "::error::the client must be one self-contained file that builds DOM nodes."
+            exit 1
+          fi
+
+  supplychain:
+    name: cargo-deny · audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup toolchain install 1.94.0 --profile minimal && rustup default 1.94.0
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+
+      # Run the binary rather than the action. Two reasons: this repository has no attested
+      # SHA for `cargo-deny-action`, and pinning by a tag in the file that is PUBLISHED to the
+      # mirror is exactly where a moved tag would matter most; and `cargo install` is already
+      # how the audit step below works, so this is one mechanism instead of two.
+      #
+      # `deny.toml` is committed and mirrored. Without it this check has no licence allowlist
+      # and would pass while asserting nothing — a control that looks like a control.
+      - name: cargo-deny
+        run: |
+          test -f deny.toml || { echo "::error::deny.toml is missing; the licence check would assert nothing"; exit 1; }
+          cargo install cargo-deny --locked
+          cargo deny check advisories bans licenses sources
+
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --deny warnings

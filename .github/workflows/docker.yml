@@ -1,0 +1,212 @@
+# dagpane — build the image and push it to Docker Hub.
+#
+# MIRROR-NATIVE, like .github/workflows/ci.yml.
+#
+# This file is not a workflow of the private monorepo. The sync manifest upstream maps it
+# onto this repository's own `.github/workflows/docker.yml`, and asserts both that it
+# arrived there and that it was not also staged at its monorepo path. The monorepo builds
+# no dagpane image at all — deliberately, and that is the whole point of this file.
+#
+# ── Why the build runs here rather than upstream ──────────────────────────────────────
+#
+# An image built in the private tree is built from bytes nobody outside it has seen. The
+# published artifact and the published source would then be two separate claims, and only
+# one of them would be checkable. Building here inverts that: this repository contains
+# exactly the cut that passed the allowlist, the rewrite pass and the forbidden-marker
+# scan, so the image can only contain what survived them. The gate is not a promise made
+# about the image, it is the image's build context.
+#
+# A sibling learned this the expensive way: its 0.2.0 image was built while the mirror
+# sync was blocked, so the published container was made from source the public could not
+# read.
+#
+# ── Triggers ──────────────────────────────────────────────────────────────────────────
+#
+#   push tag `v*`      -> build and push mancube/dagpane:<version> and :latest
+#   workflow_dispatch  -> build only; set push=true to publish
+#
+# The `v*` tag is created by the monorepo's sync when a `dagpane-oss-v*` tag is pushed
+# there. It uses a personal access token rather than GITHUB_TOKEN, so the tag genuinely
+# fires this workflow; a GITHUB_TOKEN-created tag would not.
+#
+# The sync pushes the tree BEFORE it creates the release, so by the time this runs the
+# checkout below is already the version being tagged.
+#
+# ── linux/amd64 only, and that is not an oversight ────────────────────────────────────
+#
+# The Dockerfile pins `--target x86_64-unknown-linux-musl`. Building that under QEMU for
+# linux/arm64 would emit an image whose manifest says arm64 and whose binary is x86_64 —
+# a container that cannot start, advertised as one that can. Publishing one honest
+# architecture beats publishing two where one is a lie.
+#
+# arm64 needs the Dockerfile to choose its triple from $TARGETARCH (aarch64-unknown-linux-musl)
+# and re-prove the static-linking assertion on that target. Until it does, this stays amd64.
+#
+# ── Required secrets, on this repository ──────────────────────────────────────────────
+#
+#   DOCKER_USERNAME   the Docker Hub account with write access to the image below
+#   DOCKER_PASSWORD   a Docker Hub access token, Read/Write on that repository
+#
+# Both live on the `cicd` environment here, NOT in the monorepo: nothing about publishing
+# this image should require a credential the private tree holds. The Docker Hub repository
+# must exist, or the account must allow push-to-create, or the first push 404s.
+
+name: docker
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (e.g. 0.1.0). Must match Cargo.toml."
+        required: true
+      push:
+        description: "Push to Docker Hub (false = build only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Never cancel a publish midway, and never let two tags race the same tags.
+concurrency:
+  group: dagpane-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: mancube/dagpane
+  PLATFORMS: linux/amd64
+
+jobs:
+  image:
+    name: build and push
+    runs-on: ubuntu-24.04
+    environment: cicd
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve the version and whether this publishes
+        id: cfg
+        env:
+          EVENT: ${{ github.event_name }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+          DISPATCH_PUSH: ${{ inputs.push }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            V="$DISPATCH_VERSION"; PUSH="$DISPATCH_PUSH"
+          else
+            V="${GITHUB_REF_NAME#v}"   # v0.1.0 -> 0.1.0
+            PUSH="true"
+          fi
+          # Shape-checked before it reaches $GITHUB_OUTPUT, and before it can reach a tag.
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+            echo "::error::invalid version: '$V'"; exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "push=$PUSH" >> "$GITHUB_OUTPUT"
+          echo "Version $V, push=$PUSH"
+
+      - name: Gate — the tag matches the workspace version
+        env:
+          V: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The same assertion the monorepo makes before it mirrors. A tag that disagrees
+          # with the source publishes an image whose --version contradicts its name, and a
+          # consumer pinning that number gets the other tree forever.
+          WS="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          [ "$WS" = "$V" ] || { echo "::error::version '$V' != workspace version '$WS'"; exit 1; }
+          echo "Tag and Cargo.toml agree on $V."
+
+      # A `latest` that silently moves backwards is worse than no `latest`. Only a version
+      # at or above the one the tag already points at may claim it.
+      - name: Decide whether this version may move :latest
+        id: tags
+        env:
+          V: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAGS="${IMAGE}:${V}"
+          # A prerelease (0.2.0-rc1) never takes :latest.
+          case "$V" in
+            *-*) echo "prerelease: not moving :latest" ;;
+            *)   TAGS="${TAGS}"$'\n'"${IMAGE}:latest" ;;
+          esac
+          {
+            echo "list<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tagging:"; echo "$TAGS"
+
+      - name: Preflight — the Docker Hub credentials are present
+        if: steps.cfg.outputs.push == 'true'
+        env:
+          U: ${{ secrets.DOCKER_USERNAME }}
+          P: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          if [ -z "$U" ] || [ -z "$P" ]; then
+            echo "::error::DOCKER_USERNAME or DOCKER_PASSWORD resolved EMPTY on this repository."
+            echo "Add both under Settings -> Environments -> cicd. They are this repository's"
+            echo "credentials; the monorepo's copies are deliberately not used here."
+            exit 1
+          fi
+          echo "Credentials present (user length ${#U}, token length ${#P})."
+
+      - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Log in to Docker Hub
+        if: steps.cfg.outputs.push == 'true'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build, and push on a tag
+        id: build
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ steps.cfg.outputs.push == 'true' }}
+          load: ${{ steps.cfg.outputs.push != 'true' }}
+          tags: ${{ steps.tags.outputs.list }}
+          # A plain multi-arch manifest; the attestation manifest some runtimes choke on
+          # buys nothing for a scratch image that is one static binary.
+          provenance: false
+
+      # ci.yml proves the Dockerfile builds on every push. This proves the artifact that
+      # is about to be published, or was just published, is the binary it claims to be —
+      # a build that succeeds and produces a binary that cannot run is a real outcome.
+      - name: The published image is the binary, and the binary works
+        env:
+          V: ${{ steps.cfg.outputs.version }}
+          PUSH: ${{ steps.cfg.outputs.push }}
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}:${V}"
+          if [ "$PUSH" = "true" ]; then
+            # Pull it back rather than trusting the local layer cache: this asserts what
+            # the registry actually serves, which is what a user gets.
+            docker pull --platform linux/amd64 "$REF"
+          fi
+          # scratch: no shell and no examples inside, so the app is mounted — which is
+          # also how anybody would really run this.
+          docker run --rm "$REF" --version
+          docker run --rm -v "$PWD/examples:/app:ro" "$REF" check /app/sales.toml
+
+      - name: Summary
+        env:
+          V: ${{ steps.cfg.outputs.version }}
+          PUSH: ${{ steps.cfg.outputs.push }}
+        run: |
+          if [ "$PUSH" = "true" ]; then
+            echo "Pushed and verified \`${IMAGE}:${V}\` (${PLATFORMS})." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Dry run: built and verified \`${IMAGE}:${V}\` (${PLATFORMS}); not pushed." >> "$GITHUB_STEP_SUMMARY"
+          fi

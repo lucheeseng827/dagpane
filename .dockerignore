@@ -1,0 +1,5 @@
+target
+.git
+.gitignore
+docs
+examples/sales.csv

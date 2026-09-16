@@ -1,0 +1,139 @@
+# A complete dagpane app: two controls, five cells, four panes.
+#
+# What to look at: `region_totals` and `top_orders` both read `filtered`, and `filtered`
+# reads both controls. Move the amount slider and the two panes below it recompute — three
+# cells out of seven. Change the region dropdown back to "all" and the `skip_when` below
+# turns that filter off, so `filtered` produces the value it already held and **nothing
+# downstream runs at all**. `dagpane explain` prints both passes.
+
+[app]
+title = "Sales explorer"
+subtitle = "600 orders, August 2026"
+
+[[source]]
+name = "sales"
+csv = "sales.csv"
+
+[[input]]
+name = "min_amount"
+label = "Minimum order value"
+slider = { min = 0.0, max = 800.0, step = 25.0, default = 0.0 }
+
+[[input]]
+name = "region"
+label = "Region"
+select = { options = ["all", "north", "south", "east", "west"], default = "all" }
+
+# ── the pipeline ──────────────────────────────────────────────────────────────────────
+
+[[cell]]
+name = "filtered"
+from = "sales"
+
+[[cell.step]]
+filter = { column = "amount", op = "ge", param = "min_amount" }
+
+# `skip_when` is how a dropdown gets an "everything" option without a conditional: when the
+# control is on "all" this step does nothing, and because the step does nothing the cell
+# produces the value it already had — so the panes below it are not repainted.
+[[cell.step]]
+filter = { column = "region", op = "eq", param = "region", skip_when = "all" }
+
+# Reads the source, not the filters. Whatever the controls do, this cell and its pane are
+# never even looked at — `dagpane explain` reports it as untouched, and a rerun runtime has
+# no way to express that.
+[[cell]]
+name = "all_time_revenue"
+from = "sales"
+[[cell.step]]
+group_by = { agg = [{ column = "amount", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "order_count"
+from = "filtered"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "region_totals"
+from = "filtered"
+[[cell.step]]
+group_by = { by = ["region"], agg = [
+  { agg = "count", as = "orders" },
+  { column = "amount", agg = "sum", as = "revenue" },
+] }
+[[cell.step]]
+sort = { column = "revenue", descending = true }
+
+[[cell]]
+name = "revenue"
+from = "region_totals"
+[[cell.step]]
+group_by = { agg = [{ column = "revenue", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+# A cell that is deliberately insensitive to small changes: the *set* of channels present.
+# Raise the floor by $25 and the totals move, but the same three channels are still there —
+# so this cell recomputes, produces the value it already had, and everything below it (and
+# its pane) is left alone. That is the whole product in four lines of TOML.
+[[cell]]
+name = "channels"
+from = "filtered"
+[[cell.step]]
+group_by = { by = ["channel"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["channel"]
+[[cell.step]]
+sort = { column = "channel" }
+
+[[cell]]
+name = "channel_count"
+from = "channels"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "top_orders"
+from = "filtered"
+[[cell.step]]
+sort = { column = "amount", descending = true }
+[[cell.step]]
+limit = 10
+[[cell.step]]
+select = ["order_id", "day", "region", "channel", "amount"]
+
+# ── the page ──────────────────────────────────────────────────────────────────────────
+
+[[pane]]
+cell = "revenue"
+metric = { label = "Revenue", decimals = 2, prefix = "$" }
+
+[[pane]]
+cell = "all_time_revenue"
+metric = { label = "All-time revenue", decimals = 2, prefix = "$" }
+
+[[pane]]
+cell = "order_count"
+metric = { label = "Orders" }
+
+[[pane]]
+cell = "channel_count"
+metric = { label = "Channels" }
+
+[[pane]]
+cell = "region_totals"
+title = "Revenue by region"
+bar = { label_column = "region", value_column = "revenue" }
+
+[[pane]]
+cell = "channels"
+title = "Channels present"
+table = { max_rows = 10 }
+
+[[pane]]
+cell = "top_orders"
+title = "Largest orders"
+table = { max_rows = 10 }

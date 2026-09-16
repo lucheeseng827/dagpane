@@ -1,0 +1,51 @@
+[package]
+name = "wasm-engines"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Outside any monorepo checkout on purpose: a parent workspace manifest above this
+# would change resolution and the answer with it.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# The representation + only the kernels dagpane's seven verbs need. This is what
+# ARCHITECTURE.md §6's `Frame` seam actually calls for: rows/schema/head/digest.
+arrow-min = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-select", "dep:arrow-ord", "dep:getrandom"]
+# The same, plus the file format — what a shapeshift-written Parquet source would need.
+arrow-parquet = ["arrow-min", "dep:parquet", "dep:bytes"]
+# The full query engine. Only needed if SQL cells ever happen (ROADMAP §6: "last, and
+# possibly never").
+datafusion = ["dep:datafusion", "dep:getrandom"]
+# The alternative ROADMAP §2 warns is closed. Verify rather than repeat.
+polars = ["dep:polars", "dep:getrandom"]
+# ROADMAP §2 names the `parquet` feature specifically as what does not cross-compile.
+# Testing the lean build alone would leave that claim unverified.
+polars-parquet = ["dep:polars-pq", "dep:getrandom"]
+
+[dependencies]
+arrow-array  = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
+arrow-select = { version = "58", optional = true }
+arrow-ord    = { version = "58", optional = true }
+bytes        = { version = "1", optional = true }
+parquet      = { version = "58", optional = true, default-features = false, features = ["arrow", "snap"] }
+datafusion   = { version = "54", optional = true }
+# Not used directly — present so the wasm_js backend feature can be turned on for the
+# transitive copy DataFusion pulls in. See .cargo/config.toml for the matching cfg.
+getrandom    = { version = "0.3", optional = true, features = ["wasm_js"] }
+polars       = { version = "0.44", optional = true, default-features = false, features = ["lazy"] }
+polars-pq    = { package = "polars", version = "0.44", optional = true, default-features = false, features = ["lazy", "parquet"] }
+
+# Size is only meaningful under the profile that would actually ship, and dagpane's own
+# release profile is the reference.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

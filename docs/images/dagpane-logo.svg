@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- A wake: one point lit, the trail behind it fading back into the dark. -->
+  <rect width="32" height="32" rx="7" fill="#03060b"/>
+  <circle cx="7" cy="22" r="1.4" fill="#1a2b3f"/>
+  <circle cx="12" cy="19.5" r="1.8" fill="#27405c"/>
+  <circle cx="17" cy="16.5" r="2.2" fill="#0f7f92"/>
+  <circle cx="23" cy="12" r="3.4" fill="#00e5ff"/>
+  <circle cx="23" cy="12" r="6" fill="#00e5ff" opacity="0.18"/>
+</svg>
