@@ -14,12 +14,12 @@ project exists to remove. Both are bugs in this crate and nowhere else.
 ```mermaid
 flowchart TD
     builder["GraphBuilder<br/>declare cells and their inputs"]
-    graph["Graph — immutable, shared<br/>topological order · per-cell height · reverse edges"]
+    dgraph["Graph — immutable, shared<br/>topological order · per-cell height · reverse edges"]
     session["Session — one per viewer<br/>slots: value · digest · input_digests"]
     trace["Trace<br/>what the pass did"]
 
-    builder -->|"build(): Kahn's algorithm,<br/>cycle rejected here"| graph
-    graph -->|"Arc, shared by every session"| session
+    builder -->|"build(): Kahn's algorithm,<br/>cycle rejected here"| dgraph
+    dgraph -->|"Arc, shared by every session"| session
     session --> trace
 
     digest["digest — 128-bit FNV<br/>taken once, when a value is produced"]
@@ -31,7 +31,7 @@ flowchart TD
     transform --> value
 
     cut["placement — a monotone Cut<br/>server cells · client cells · the frontier"]
-    graph -->|"split(): two ordinary graphs,<br/>boundary cells become sources"| cut
+    dgraph -->|"split(): two ordinary graphs,<br/>boundary cells become sources"| cut
 ```
 
 ## What each module decides
@@ -74,7 +74,7 @@ sequenceDiagram
             else changed
                 S->>F: eval(inputs)
                 F-->>S: a value
-                S->>S: digest it; changed = digest differs
+                S->>S: digest it — changed = digest differs
             end
         end
         S-->>C: Trace — visited · evaluated · reused · changed

@@ -25,12 +25,12 @@ the graph this diagram already declared.
 
 ```mermaid
 flowchart LR
-    manifest["<b>manifest</b><br/>.toml cells + SQL<br/>edges spelled with $"] -->|"compiled once<br/>at start-up"| graph["<b>Graph</b><br/>declared edges<br/>height-sorted (Kahn)<br/>shared, immutable"]
+    manifest["<b>manifest</b><br/>.toml cells + SQL<br/>edges spelled with $"] -->|"compiled once<br/>at start-up"| dgraph["<b>Graph</b><br/>declared edges<br/>height-sorted (Kahn)<br/>shared, immutable"]
 
     input["viewer changes<br/>an input"] -->|"digest vs.<br/>stored value"| changed{"changed?"}
     changed -->|"no"| empty["empty trace<br/>nothing runs, nothing sent"]
     changed -->|"yes — a root"| closure["closure over the graph:<br/>every cell reachable<br/>from the root"]
-    graph -.->|"defines"| closure
+    dgraph -.->|"defines"| closure
     closure --> pass["evaluate in ascending height<br/><b>REUSE</b> input digests still match<br/><b>RUN</b> digests moved, recompute<br/><b>FAIL</b> an input already failed"]
     pass --> trace["Trace<br/>visited · evaluated · reused · changed"]
     trace --> patch["patch = re-rendered views<br/>that differ from what<br/>this viewer already has"]
@@ -39,7 +39,7 @@ flowchart LR
     classDef data fill:#eef2f9,stroke:#57a,stroke-width:2px
     classDef decide fill:#f9f3e0,stroke:#b98,stroke-width:2px
     classDef result fill:#eef7ee,stroke:#4a7,stroke-width:2px
-    class manifest,graph data
+    class manifest,dgraph data
     class changed decide
     class trace,patch,empty result
 ```

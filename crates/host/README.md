@@ -62,15 +62,15 @@ sequenceDiagram
 
     alt already resident
         Note over H: a read lock, a hash lookup, an Arc clone,<br/>and a relaxed store of last-opened.<br/>No writer is woken and nothing is allocated.
-        H-->>R: Arc&lt;App&gt;
+        H-->>R: Arc<App>
     else miss
         H->>S: fetch(key)
         S-->>H: bytes — checked against the key by the HOST,<br/>which is the side that does not trust the answer
         H->>C: compile, OUTSIDE the lock
-        Note over H,C: compiling reads the app's sources; holding a write<br/>lock across a disk read would stall every other<br/>app's hit path for the duration
+        Note over H,C: compiling reads the app's sources — holding a write<br/>lock across a disk read would stall every other<br/>app's hit path for the duration
         C-->>H: an App, and its Footprint
         Note over H: admission: over budget evicts the least<br/>recently opened, or refuses outright
-        H-->>R: Arc&lt;App&gt;
+        H-->>R: Arc<App>
     end
 
     R->>H: session(host)

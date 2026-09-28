@@ -164,7 +164,7 @@ sequenceDiagram
     C-->>B: Patch { seq, panes, stats { visited, evaluated, untouched, micros } }
 
     B->>C: Close
-    Note over C,A: the session is dropped; Arc&lt;App&gt; is not
+    Note over C,A: the session is dropped — Arc<App> is not
 ```
 
 The loop is deliberately sequential: a message is read, a pass runs, a patch goes out, and
