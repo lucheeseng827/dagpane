@@ -1,0 +1,163 @@
+# ENGINEERING MANAGER — "what did the team ship, and what did it cost them in cycle time?"
+#
+# The mechanic: the graph makes the uncomfortable question cheap to ask. Switch `kind` to
+# `incident` and every throughput number re-slices, but `teams_present` still holds the same
+# five teams — so the team list does not flicker, and whatever hangs below it does not run.
+# The page stays legible while the question underneath it changes.
+
+[app]
+title = "Team throughput"
+subtitle = "26 weeks of delivered work"
+
+[[source]]
+name = "items"
+csv = "../data/delivery_items.csv"
+
+[[input]]
+name = "team"
+label = "Team"
+select = { options = ["all", "payments", "retail", "platform", "growth", "ml"], default = "all" }
+
+[[input]]
+name = "kind"
+label = "Work type"
+select = { options = ["all", "feature", "bug", "chore", "incident"], default = "all" }
+
+[[input]]
+name = "done_only"
+label = "Completed only"
+checkbox = { default = true }
+
+[[cell]]
+name = "scoped"
+from = "items"
+[[cell.step]]
+filter = { column = "team", op = "eq", param = "team", skip_when = "all" }
+[[cell.step]]
+filter = { column = "kind", op = "eq", param = "kind", skip_when = "all" }
+[[cell.step]]
+filter = { column = "completed", op = "eq", param = "done_only", skip_when = false }
+
+[[cell]]
+name = "item_count"
+from = "scoped"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "points"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "points", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "mean_cycle"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "cycle_time_days", agg = "mean", as = "mean_days" }] }
+[[cell.step]]
+scalar = { column = "mean_days" }
+
+[[cell]]
+name = "worst_cycle"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "cycle_time_days", agg = "max", as = "worst_days" }] }
+[[cell.step]]
+scalar = { column = "worst_days" }
+
+[[cell]]
+name = "by_team"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["team"], agg = [
+  { agg = "count", as = "items" },
+  { column = "points", agg = "sum", as = "points" },
+  { column = "cycle_time_days", agg = "mean", as = "mean_cycle_days" },
+] }
+[[cell.step]]
+sort = { column = "points", descending = true }
+
+[[cell]]
+name = "by_kind"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["kind"], agg = [
+  { agg = "count", as = "items" },
+  { column = "cycle_time_days", agg = "mean", as = "mean_cycle_days" },
+] }
+[[cell.step]]
+sort = { column = "items", descending = true }
+
+[[cell]]
+name = "slowest_items"
+from = "scoped"
+[[cell.step]]
+sort = { column = "cycle_time_days", descending = true }
+[[cell.step]]
+select = ["item_id", "week", "team", "kind", "points", "cycle_time_days"]
+[[cell.step]]
+limit = 10
+
+[[cell]]
+name = "teams_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["team"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["team"]
+[[cell.step]]
+sort = { column = "team" }
+
+[[cell]]
+name = "team_count"
+from = "teams_present"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "all_items"
+from = "items"
+[[cell.step]]
+count = true
+
+[[pane]]
+cell = "item_count"
+metric = { label = "Items" }
+
+[[pane]]
+cell = "points"
+metric = { label = "Points" }
+
+[[pane]]
+cell = "mean_cycle"
+metric = { label = "Mean cycle time", suffix = " d", decimals = 1 }
+
+[[pane]]
+cell = "worst_cycle"
+metric = { label = "Longest", suffix = " d", decimals = 1 }
+
+[[pane]]
+cell = "team_count"
+metric = { label = "Teams" }
+
+[[pane]]
+cell = "all_items"
+metric = { label = "All items, 26w" }
+
+[[pane]]
+cell = "by_team"
+title = "Points by team"
+bar = { label_column = "team", value_column = "points" }
+
+[[pane]]
+cell = "by_kind"
+title = "By work type"
+table = { max_rows = 5 }
+
+[[pane]]
+cell = "slowest_items"
+title = "Longest cycle times"
+table = { max_rows = 10 }

@@ -1,0 +1,118 @@
+# Where each cell runs, as a manifest decision.
+#
+# THIS FILE IS THE ARGUMENT. It is `sales.toml`'s pipeline with four words added — one
+# `place = "client"` on a control and three on cells — and nothing else changed. No different
+# verbs, no second dialect, no "client version" of the app. The pipeline below would compile
+# and run identically with every `place` line deleted; deleting them is the deployment
+# decision, made in the other direction.
+#
+# What the cut says, and `dagpane check` prints both numbers:
+#
+#   * `sales` is the whole frontier — one cell crosses, once.
+#   * `min_amount` and everything downstream of it is in the page, so moving that slider
+#     needs no message at all.
+#
+# ── READ THIS BEFORE BELIEVING THE PARAGRAPH ABOVE ────────────────────────────────────
+#
+# **`dagpane run` does not serve this split yet.** It compiles the cut, checks it and reports
+# it, and then runs the whole graph on the server exactly as it would with every `place` line
+# deleted. The two halves are real and tested — `crates/app/tests/placement.rs` drives them
+# through the actual `init` and `patch` messages and requires them to produce the same panes
+# one undivided session produces — and `dagpane-wasm` can open the page's half and apply a
+# frontier. What is missing is a page that holds it. `ROADMAP.md` §4 says what is left and why
+# the switch is deliberately not flipped: a browser that cannot consume a frontier would draw
+# this app with its page-side panes missing, which is worse than ignoring the cut.
+#
+# So today this file is a manifest you can check, not a deployment you can make. It is here
+# because the surface is the part worth reviewing first: if `place` is the wrong word or the
+# monotonicity rule is the wrong rule, that is cheaper to find out now than after a protocol
+# is written against it.
+#
+# What the cut will cost when it is served is equally concrete: the rows go to the browser,
+# so this one is right for six hundred orders and wrong for six million. `BENCHMARKS.md`
+# says where the line is.
+#
+# ── the rule ──────────────────────────────────────────────────────────────────────────
+#
+# Placement is monotone: a cell on the server may not read a cell in the page. Values cross
+# once and never come back. Try it — delete the `place` line from `region_totals` below,
+# leaving it on `filtered`, and run `dagpane check`:
+#
+#   dagpane: `region_totals` runs on the server and reads `filtered`, which runs on the
+#   client: values cross the cut once and never come back. Move `region_totals` to the
+#   client, or `filtered` to the server.
+#
+# A refusal at `check` time, naming the edge and both ways out — not a page that loads with
+# a pane missing.
+#
+# That rule is what makes one message per pass enough, and `crates/core/src/placement.rs`
+# has the correctness argument in full.
+
+[app]
+title = "Sales explorer, split"
+subtitle = "600 orders — the filter runs in the page"
+
+# The data stays where the data is. It is read once at start-up, shared by every session,
+# and crosses to each viewer once because cells in the page read it.
+[[source]]
+name = "sales"
+csv = "../sales.csv"
+
+# The slider lives in the page, and so does everything it touches. This is the whole point:
+# no message leaves the browser when it moves.
+[[input]]
+name = "min_amount"
+label = "Minimum order value"
+slider = { min = 0.0, max = 800.0, step = 25.0, default = 0.0 }
+place = "client"
+
+[[cell]]
+name = "filtered"
+from = "sales"
+place = "client"
+[[cell.step]]
+filter = { column = "amount", op = "ge", param = "min_amount" }
+
+[[cell]]
+name = "order_count"
+from = "filtered"
+place = "client"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "region_totals"
+from = "filtered"
+place = "client"
+[[cell.step]]
+group_by = { by = ["region"], agg = [
+  { agg = "count", as = "orders" },
+  { column = "amount", agg = "sum", as = "revenue" },
+] }
+[[cell.step]]
+sort = { column = "revenue", descending = true }
+
+# Left on the server on purpose, and it is the useful half of the example. This cell reads
+# `sales` and not `filtered`, so no control can move it — computing it once per process
+# rather than once per viewer is strictly cheaper, and placing it in the page would make
+# every browser redo work that has one answer.
+[[cell]]
+name = "all_time_revenue"
+from = "sales"
+[[cell.step]]
+group_by = { agg = [{ column = "amount", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[pane]]
+cell = "order_count"
+metric = { label = "Orders" }
+
+[[pane]]
+cell = "all_time_revenue"
+metric = { label = "All-time revenue", decimals = 2, prefix = "$" }
+
+[[pane]]
+cell = "region_totals"
+title = "Revenue by region"
+bar = { label_column = "region", value_column = "revenue" }

@@ -1,0 +1,147 @@
+# ENG MANAGER — "which teams are carrying the most, and which ones ship without a deploy log?"
+#
+# Every cell here is a `select`. That is the point of the file: the dialect exists because
+# four aggregates, a conditional count and a join written as steps is a page of TOML, and
+# written as SQL it is the query somebody would have typed anyway.
+#
+# **A SQL cell is not a second engine.** It is parsed, its tables are resolved, and it lowers
+# to the same nine verbs a hand-written pipeline compiles to — `dagpane graph` shows the edges
+# it produced, `dagpane explain` counts the same cells, and ADR-0005 says why it could not have
+# been done any other way. Two things to look at:
+#
+# **The edges came out of the parse tree.** `from delivery_items` makes `work` depend on that
+# cell; `:max_cycle` makes it depend on that control. Nothing scanned the text — the comment
+# you are reading could name every cell in this file and none of them would become an edge,
+# which is exactly why `ROADMAP.md` §6 put SQL last.
+#
+# **`ml` ships work and never deploys.** `left join` keeps it on the page with a gap where its
+# deploy count would be, and `left anti join` is the same question asked the other way round.
+# Both lower to the `join` verb, so both get its refusals: the join is a lookup, and a
+# duplicated key on the right is an error rather than a doubled total.
+#
+# What the dialect cannot say, and this file works around rather than hides: there is no
+# `skip_when`, so the environment dropdown has no "all" option; and a `select` produces a
+# table, so the two metrics below read their number out with a `scalar` step.
+
+[app]
+title = "Team load"
+subtitle = "Delivery against deploys, five teams"
+
+[[source]]
+name = "delivery_items"
+csv = "../data/delivery_items.csv"
+
+[[source]]
+name = "deploys"
+csv = "../data/deploys.csv"
+
+[[input]]
+name = "max_cycle"
+label = "Cycle time at most (days)"
+slider = { min = 2.0, max = 28.0, step = 2.0, default = 28.0 }
+
+[[input]]
+name = "environment"
+label = "Deploys in"
+select = { options = ["production", "staging"], default = "production" }
+
+# ── what each team finished ───────────────────────────────────────────────────────────
+#
+# `sum(case when … then 1 else 0 end)` is SQL's conditional count. It lowers to a `derive` of
+# the `if` and a `sum` over it, which is what it means — and is the shape that made this file
+# worth writing, because as steps it is two stanzas and a column nobody wanted to name.
+
+[[cell]]
+name = "work"
+sql = """
+  select team,
+         count(*)                                           as items,
+         sum(points)                                        as points,
+         avg(cycle_time_days)                               as mean_cycle,
+         sum(case when kind = 'incident' then 1 else 0 end) as incidents
+  from delivery_items
+  where completed = true and cycle_time_days <= :max_cycle
+  group by team
+"""
+
+# ── what each team deployed ───────────────────────────────────────────────────────────
+#
+# Reads the deploy log and the environment dropdown, and nothing else — so the cycle-time
+# slider is not upstream of it and `dagpane explain` will say so.
+
+[[cell]]
+name = "ship"
+sql = """
+  select team,
+         count(*)             as deploys,
+         avg(lead_time_hours) as mean_lead
+  from deploys
+  where environment = :environment
+  group by team
+"""
+
+# ── where they meet ───────────────────────────────────────────────────────────────────
+
+[[cell]]
+name = "teams"
+sql = """
+  select w.team, w.items, w.points, w.incidents, w.mean_cycle,
+         s.deploys, s.mean_lead,
+         s.deploys / w.items as deploys_per_item
+  from work w
+  left join ship s on w.team = s.team
+  order by w.points desc
+"""
+
+[[cell]]
+name = "no_deploys"
+sql = """
+  select team, items, points, incidents
+  from work
+  left anti join ship on work.team = ship.team
+  order by points desc
+"""
+
+# ── the two numbers over the page ─────────────────────────────────────────────────────
+#
+# A `select` produces a table, so a metric reads its value out with the one verb the dialect
+# has no word for.
+
+[[cell]]
+name = "totals"
+sql = "select count(*) as teams, sum(points) as points from work"
+
+[[cell]]
+name = "team_count"
+from = "totals"
+[[cell.step]]
+scalar = { column = "teams" }
+
+[[cell]]
+name = "points_total"
+from = "totals"
+[[cell.step]]
+scalar = { column = "points" }
+
+[[pane]]
+cell = "team_count"
+metric = { label = "Teams in view" }
+
+[[pane]]
+cell = "points_total"
+metric = { label = "Points completed", decimals = 0 }
+
+[[pane]]
+cell = "teams"
+title = "Delivery against deploys"
+table = { max_rows = 10 }
+
+[[pane]]
+cell = "no_deploys"
+title = "Ships work, no deploy log"
+table = { max_rows = 10 }
+
+[[pane]]
+cell = "work"
+title = "Points by team"
+bar = { label_column = "team", value_column = "points" }

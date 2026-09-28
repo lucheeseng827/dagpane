@@ -20,6 +20,13 @@
 # The root ignores `*.txt` wholesale, and this module has no .txt source. If one is ever
 # added, re-include it here rather than loosening the root.
 
+# The root also ignores `*.png` wholesale. docs/images/ carried only SVGs until the two
+# README screenshots landed; without this negation they're build output as far as git is
+# concerned, `git add` silently drops them, and the README's <img> tags 404 on a fresh
+# clone — the same failure mode a couple of sibling modules' own docs/images/ exceptions
+# already guard against.
+!docs/images/*.png
+
 # The wasm-engines probe is a nested cargo project; its lock and target are build
 # artefacts, and its lock in particular would pin candidate versions the probe exists to
 # re-resolve on each run.

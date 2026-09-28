@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "measured_at": "2026-09-17T13:39:22Z",
+  "machine": {
+    "hostname": "vm",
+    "platform": "Linux-6.18.44-fc-v33-x86_64-with-glibc2.39",
+    "cpus": 4,
+    "memory_bytes": 16877793280
+  },
+  "driver_floor_ms": 20.0,
+  "settings": {
+    "rounds_per_viewer": 1,
+    "think_seconds": 0.0,
+    "saturation_cpu_share": 0.8,
+    "saturation_lateness_ms": 50.0
+  },
+  "runs": [
+    {
+      "runtime": "dagpane",
+      "apps": 32,
+      "viewers_per_app": 1,
+      "fleet_shape": "process-per-app",
+      "boot_and_first_render_s": 6.08,
+      "processes": 32,
+      "resident_rss_bytes": 182587392,
+      "resident_pss_bytes": 29191168,
+      "server_cpu_s": 0.0,
+      "wall_s": 0.77,
+      "interactions": 32,
+      "throughput_per_s": 41.83,
+      "p50_ms": 720.0,
+      "p99_ms": 760.4,
+      "max_ms": 760.4,
+      "driver_cpu_share": 0.82,
+      "driver_dispatch_lateness_p99_ms": 0.0,
+      "saturated": true,
+      "latency_reportable": false,
+      "latency_note": "think=0: every viewer dispatches at once, so these latencies are driver queueing. The memory figures in this run are unaffected."
+    },
+    {
+      "runtime": "dagpane",
+      "apps": 64,
+      "viewers_per_app": 1,
+      "fleet_shape": "process-per-app",
+      "boot_and_first_render_s": 12.26,
+      "processes": 64,
+      "resident_rss_bytes": 365776896,
+      "resident_pss_bytes": 55168000,
+      "server_cpu_s": 0.0,
+      "wall_s": 1.64,
+      "interactions": 64,
+      "throughput_per_s": 38.96,
+      "p50_ms": 1562.9,
+      "p99_ms": 1618.7,
+      "max_ms": 1618.7,
+      "driver_cpu_share": 0.743,
+      "driver_dispatch_lateness_p99_ms": 0.0,
+      "saturated": false,
+      "latency_reportable": false,
+      "latency_note": "think=0: every viewer dispatches at once, so these latencies are driver queueing. The memory figures in this run are unaffected."
+    }
+  ]
+}

@@ -1,0 +1,123 @@
+# ANALYST — "which campaigns earn their spend, and which are just buying impressions?"
+#
+# The mechanic: a top-N list. `sort` then `limit` is a cell like any other, so the leaderboard
+# is digested like any other value — nudge the spend floor and if the same ten campaigns come
+# back in the same order, the table does not repaint even though the cell recomputed.
+
+[app]
+title = "Campaign efficiency"
+subtitle = "4 weeks of paid acquisition"
+
+[[source]]
+name = "campaigns"
+csv = "../data/campaigns.csv"
+
+[[input]]
+name = "min_spend"
+label = "Minimum daily spend"
+slider = { min = 0.0, max = 2000.0, step = 50.0, default = 0.0 }
+
+[[input]]
+name = "channel"
+label = "Channel"
+select = { options = ["all", "search", "social", "email", "partner"], default = "all" }
+
+[[cell]]
+name = "scoped"
+from = "campaigns"
+[[cell.step]]
+filter = { column = "spend", op = "ge", param = "min_spend" }
+[[cell.step]]
+filter = { column = "channel", op = "eq", param = "channel", skip_when = "all" }
+
+[[cell]]
+name = "by_channel"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["channel"], agg = [
+  { column = "spend", agg = "sum", as = "spend" },
+  { column = "signups", agg = "sum", as = "signups" },
+  { column = "clicks", agg = "mean", as = "mean_clicks" },
+] }
+[[cell.step]]
+sort = { column = "spend", descending = true }
+
+[[cell]]
+name = "by_campaign"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["campaign"], agg = [
+  { column = "spend", agg = "sum", as = "spend" },
+  { column = "signups", agg = "sum", as = "signups" },
+] }
+[[cell.step]]
+sort = { column = "signups", descending = true }
+[[cell.step]]
+limit = 10
+
+[[cell]]
+name = "total_spend"
+from = "by_channel"
+[[cell.step]]
+group_by = { agg = [{ column = "spend", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "total_signups"
+from = "by_channel"
+[[cell.step]]
+group_by = { agg = [{ column = "signups", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "channels_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["channel"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["channel"]
+[[cell.step]]
+sort = { column = "channel" }
+
+[[cell]]
+name = "channel_count"
+from = "channels_present"
+[[cell.step]]
+count = true
+
+# Never looked at by either control: the whole-window spend the page is measured against.
+[[cell]]
+name = "lifetime_spend"
+from = "campaigns"
+[[cell.step]]
+group_by = { agg = [{ column = "spend", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[pane]]
+cell = "total_spend"
+metric = { label = "Spend in slice", prefix = "$", decimals = 0 }
+
+[[pane]]
+cell = "total_signups"
+metric = { label = "Signups" }
+
+[[pane]]
+cell = "channel_count"
+metric = { label = "Channels" }
+
+[[pane]]
+cell = "lifetime_spend"
+metric = { label = "Spend, all campaigns", prefix = "$", decimals = 0 }
+
+[[pane]]
+cell = "by_channel"
+title = "Spend by channel"
+bar = { label_column = "channel", value_column = "spend" }
+
+[[pane]]
+cell = "by_campaign"
+title = "Top 10 campaigns by signups"
+table = { max_rows = 10 }

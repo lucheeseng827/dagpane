@@ -7,6 +7,8 @@
 //! that the win is not uniform — it comes almost entirely from the two categoricals, which
 //! is why the encoding decision is per column rather than per frame.
 
+// `memory_size` moved onto the `Frame` seam, so the trait has to be in scope to ask it.
+use dagpane_core::frame::Frame;
 use dagpane_core::value::{Column, ColumnData};
 use dagpane_frame_arrow::{ArrowFrame, Encoding};
 

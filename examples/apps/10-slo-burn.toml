@@ -1,0 +1,158 @@
+# SRE — "which error budgets are actually on fire, and which just look loud?"
+#
+# The mechanic — read `scoped` first. The checkbox is wired with `param`, not with a literal:
+# `skip_when` compares against whatever the filter's parameter currently holds, so
+# `param = "paged_only"` plus `skip_when = false` is the toggle. A literal `value = true` with
+# `skip_when = false` compiles and renders and silently never skips.
+#
+# And the page reads the same source through two independent chains. `paged_today`
+# reads `scoped`; `tier1_burn` reads `by_service`, two heights further down. Height-ordered
+# evaluation is what guarantees the paging count and the burn table can never disagree about
+# which rows they are describing — they are both computed from a `scoped` that was final
+# before either of them started.
+
+[app]
+title = "Error budget burn"
+subtitle = "28 days, eight services, three tiers"
+
+[[source]]
+name = "slo"
+csv = "../data/service_slo.csv"
+
+[[input]]
+name = "min_burn_pct"
+label = "Show burn above (%)"
+slider = { min = 0.0, max = 300.0, step = 10.0, default = 0.0 }
+
+[[input]]
+name = "tier"
+label = "Tier"
+select = { options = ["all", "tier1", "tier2", "tier3"], default = "all" }
+
+[[input]]
+name = "paged_only"
+label = "Only days that paged"
+checkbox = { default = false }
+
+[[cell]]
+name = "scoped"
+from = "slo"
+[[cell.step]]
+filter = { column = "budget_burn_pct", op = "ge", param = "min_burn_pct" }
+[[cell.step]]
+filter = { column = "tier", op = "eq", param = "tier", skip_when = "all" }
+[[cell.step]]
+filter = { column = "paged", op = "eq", param = "paged_only", skip_when = false }
+
+[[cell]]
+name = "day_count"
+from = "scoped"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "paged_days"
+from = "scoped"
+[[cell.step]]
+filter = { column = "paged", op = "eq", value = true }
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "by_service"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["service"], agg = [
+  { column = "budget_burn_pct", agg = "mean", as = "mean_burn_pct" },
+  { column = "budget_burn_pct", agg = "max", as = "worst_burn_pct" },
+  { column = "errors", agg = "sum", as = "errors" },
+] }
+[[cell.step]]
+sort = { column = "mean_burn_pct", descending = true }
+
+# Reads `scoped`, NOT `by_service`. `by_service` is sorted by mean burn, so row 0 is the
+# service with the worst AVERAGE — taking its max there answers a different question than the
+# label asks, and the two diverge on most slices (on `tier=tier1` it read 163.65 when the real
+# worst was 625.54). A max over the whole slice is the max, whatever the ordering above it.
+[[cell]]
+name = "worst_service_burn"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "budget_burn_pct", agg = "max", as = "worst" }] }
+[[cell.step]]
+scalar = { column = "worst" }
+
+[[cell]]
+name = "burn_leaders"
+from = "by_service"
+[[cell.step]]
+limit = 5
+
+[[cell]]
+name = "latency_by_tier"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["tier"], agg = [
+  { column = "latency_p99_ms", agg = "mean", as = "mean_p99_ms" },
+] }
+[[cell.step]]
+sort = { column = "tier" }
+
+[[cell]]
+name = "tiers_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["tier"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["tier"]
+[[cell.step]]
+sort = { column = "tier" }
+
+[[cell]]
+name = "tier_count"
+from = "tiers_present"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "requests_served"
+from = "slo"
+[[cell.step]]
+group_by = { agg = [{ column = "requests", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[pane]]
+cell = "day_count"
+metric = { label = "Service-days shown" }
+
+[[pane]]
+cell = "paged_days"
+metric = { label = "Days that paged" }
+
+[[pane]]
+cell = "worst_service_burn"
+metric = { label = "Worst burn", suffix = "%", decimals = 1 }
+
+[[pane]]
+cell = "tier_count"
+metric = { label = "Tiers in view" }
+
+[[pane]]
+cell = "requests_served"
+metric = { label = "Requests, 28d", decimals = 0 }
+
+[[pane]]
+cell = "by_service"
+title = "Mean burn by service"
+bar = { label_column = "service", value_column = "mean_burn_pct" }
+
+[[pane]]
+cell = "burn_leaders"
+title = "Top five burners"
+table = { max_rows = 5 }
+
+[[pane]]
+cell = "latency_by_tier"
+title = "p99 by tier"
+table = { max_rows = 5 }

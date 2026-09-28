@@ -29,6 +29,9 @@ flowchart TD
     session -.-> digest
     value -.-> digest
     transform --> value
+
+    cut["placement — a monotone Cut<br/>server cells · client cells · the frontier"]
+    graph -->|"split(): two ordinary graphs,<br/>boundary cells become sources"| cut
 ```
 
 ## What each module decides
@@ -40,6 +43,7 @@ flowchart TD
 | `digest` | whether two values are the same, in O(1), whatever their size |
 | `value` | what can travel along an edge: scalars, lists, and a small columnar `Table` |
 | `transform` | the built-in table operations, so an app can be written without a compiler |
+| `placement` | which side of a wire each cell runs on, and the frontier that implies — the one rule is that a value never comes back |
 | `trace` | what a pass did — the product claim as data rather than as a sentence |
 | `error` | the three kinds of failure, kept apart because only one may reach a user mid-session |
 
@@ -116,6 +120,32 @@ cargo test -p dagpane-core
    sentence in a README.
 
 Each has an ADR under `docs/adr/` saying what breaks if you change it.
+
+## Splitting a graph across a wire
+
+`placement` is idea 2 applied to a second dimension. A `Cut` labels every cell `server` or
+`client` and is admitted **only if no client cell feeds a server cell** — values cross once
+and never come back. That single rule turns the cut into a *frontier*: the cells whose values
+must travel are a set, not a sequence, so one message carries a whole pass however the app is
+shaped.
+
+`Graph::split` then returns two **ordinary graphs**, with each boundary cell rewritten as a
+source on the client side. Neither half runs a special evaluator — both run `Session`, so
+ascending height still holds on each side and there is no new code in the pass loop where a
+glitch could hide. The only thing the transport owes is atomicity, which is why
+`Split::deliver` stages a whole `Frontier` and leaves the commit to its caller.
+
+```rust
+let cut = Cut::of_client(&graph, &["knob", "filtered"])?;  // refuses backflow, by edge name
+let split = graph.split(&cut);
+// …server side runs, then:
+split.deliver(&mut client, &split.full_frontier(&server))?;
+client.commit();                                            // once, after the whole frontier
+```
+
+ADR-0008 is the argument; `tests/oracle.rs` cuts two hundred generated graphs at random
+admissible places and requires both halves to agree cell for cell with an undivided session.
+Nothing in this repository *serves* a split yet — see `ROADMAP.md` §4.
 
 ## Errors are values
 

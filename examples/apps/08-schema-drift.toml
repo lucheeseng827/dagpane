@@ -1,0 +1,124 @@
+# DATA ENGINEER — "which columns appeared, and which quietly went away?"
+#
+# The mechanic: a `text` input feeding a `contains` filter. Typing narrows the census one
+# keystroke at a time, and every keystroke is a pass through the same graph — no debounce
+# logic in the app, because each pass only touches what the text actually feeds.
+#
+# `snapshots` is the cell to watch: the set of snapshot days present does not change while
+# you are typing a column name that exists in all of them, so it reports `same value` and
+# the count below it never runs.
+
+[app]
+title = "Schema census"
+subtitle = "Four weekly snapshots of four tables"
+
+[[source]]
+name = "census"
+csv = "../data/column_census.csv"
+
+[[input]]
+name = "name_like"
+label = "Column name contains"
+text = { default = "", placeholder = "account, _at, code…" }
+
+[[input]]
+name = "table"
+label = "Table"
+select = { options = ["all", "fct_order", "dim_account", "stg_clickstream", "fct_ledger_entry"], default = "all" }
+
+[[input]]
+name = "column_type"
+label = "Type"
+select = { options = ["all", "int", "float", "text", "timestamp"], default = "all" }
+
+[[cell]]
+name = "scoped"
+from = "census"
+[[cell.step]]
+filter = { column = "column_name", op = "contains", param = "name_like", skip_when = "" }
+[[cell.step]]
+filter = { column = "table_name", op = "eq", param = "table", skip_when = "all" }
+[[cell.step]]
+filter = { column = "column_type", op = "eq", param = "column_type", skip_when = "all" }
+
+[[cell]]
+name = "matched"
+from = "scoped"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "by_snapshot"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["snapshot_day"], agg = [{ agg = "count", as = "columns" }] }
+[[cell.step]]
+sort = { column = "snapshot_day" }
+
+[[cell]]
+name = "by_table"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["table_name"], agg = [{ agg = "count", as = "columns" }] }
+[[cell.step]]
+sort = { column = "columns", descending = true }
+
+[[cell]]
+name = "detail"
+from = "scoped"
+[[cell.step]]
+sort = { column = "column_name" }
+[[cell.step]]
+select = ["snapshot_day", "table_name", "column_name", "column_type", "nullable"]
+[[cell.step]]
+limit = 25
+
+# The set of snapshot days present. Stable while you type anything that exists throughout.
+[[cell]]
+name = "snapshots"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["snapshot_day"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["snapshot_day"]
+[[cell.step]]
+sort = { column = "snapshot_day" }
+
+[[cell]]
+name = "snapshot_count"
+from = "snapshots"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "total_columns"
+from = "census"
+[[cell.step]]
+count = true
+
+[[pane]]
+cell = "matched"
+metric = { label = "Matching rows" }
+
+[[pane]]
+cell = "snapshot_count"
+metric = { label = "Snapshots covered" }
+
+[[pane]]
+cell = "total_columns"
+metric = { label = "Census rows" }
+
+[[pane]]
+cell = "by_snapshot"
+title = "Columns per snapshot — a step means drift"
+bar = { label_column = "snapshot_day", value_column = "columns" }
+
+[[pane]]
+cell = "by_table"
+title = "By table"
+table = { max_rows = 6 }
+
+[[pane]]
+cell = "detail"
+title = "Matching columns"
+table = { max_rows = 25 }

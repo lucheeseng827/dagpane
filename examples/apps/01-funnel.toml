@@ -1,0 +1,127 @@
+# ANALYST — "where does the funnel leak, for this slice?"
+#
+# The mechanic this one teaches: `steps_present` computes the *set* of funnel steps in the
+# slice. Change the device filter and that set is still the same four steps, so the cell
+# produces the value it already had and `step_count` below it never runs. The step labels on
+# the page are not repainted either — they did not change, so they do not go on the wire.
+
+[app]
+title = "Funnel explorer"
+subtitle = "4 weeks of web events, by device and variant"
+
+[[source]]
+name = "events"
+csv = "../data/web_events.csv"
+
+[[input]]
+name = "device"
+label = "Device"
+select = { options = ["all", "desktop", "mobile", "tablet"], default = "all" }
+
+[[input]]
+name = "variant"
+label = "Variant"
+select = { options = ["all", "control", "treatment"], default = "all" }
+
+[[cell]]
+name = "scoped"
+from = "events"
+[[cell.step]]
+filter = { column = "device", op = "eq", param = "device", skip_when = "all" }
+[[cell.step]]
+filter = { column = "variant", op = "eq", param = "variant", skip_when = "all" }
+
+# Reads the source, not `scoped`. Whatever the two controls do, this cell is never even
+# looked at — it is the denominator the whole page is read against, and it is correct
+# without being recomputed.
+[[cell]]
+name = "all_sessions"
+from = "events"
+[[cell.step]]
+group_by = { agg = [{ column = "sessions", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "by_step"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["step_order", "step"], agg = [
+  { column = "sessions", agg = "sum", as = "sessions" },
+] }
+[[cell.step]]
+sort = { column = "step_order" }
+
+# The insensitive cell. Four steps in, four steps out, whatever the controls say.
+[[cell]]
+name = "steps_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["step"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["step"]
+[[cell.step]]
+sort = { column = "step" }
+
+[[cell]]
+name = "step_count"
+from = "steps_present"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "visits"
+from = "by_step"
+[[cell.step]]
+filter = { column = "step", op = "eq", value = "visit" }
+[[cell.step]]
+scalar = { column = "sessions" }
+
+[[cell]]
+name = "subscribers"
+from = "by_step"
+[[cell.step]]
+filter = { column = "step", op = "eq", value = "subscribe" }
+[[cell.step]]
+scalar = { column = "sessions" }
+
+[[cell]]
+name = "funnel_revenue"
+from = "scoped"
+[[cell.step]]
+filter = { column = "step", op = "eq", value = "subscribe" }
+[[cell.step]]
+group_by = { agg = [{ column = "revenue", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[pane]]
+cell = "visits"
+metric = { label = "Visits in slice" }
+
+[[pane]]
+cell = "subscribers"
+metric = { label = "Subscribed" }
+
+[[pane]]
+cell = "funnel_revenue"
+metric = { label = "Revenue", prefix = "$", decimals = 0 }
+
+[[pane]]
+cell = "all_sessions"
+metric = { label = "All sessions (unfiltered)" }
+
+[[pane]]
+cell = "step_count"
+metric = { label = "Steps present" }
+
+[[pane]]
+cell = "by_step"
+title = "Sessions by funnel step"
+bar = { label_column = "step", value_column = "sessions" }
+
+[[pane]]
+cell = "by_step"
+id = "step_table"
+title = "Step detail"
+table = { max_rows = 10 }

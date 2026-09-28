@@ -1,0 +1,141 @@
+# DEVOPS / SRE — the four delivery numbers, sliced the way the question actually arrives.
+#
+# The mechanic: a `line` pane. A line is one point per row in row order, so the `sort` step is
+# what decides the line's direction — the chart has no opinion of its own, which means the
+# cell above it is the only thing you have to reason about.
+#
+# `environment` defaults to production. Switch it to staging and every delivery number moves,
+# but `services_present` holds the same seven services and the service breakdown below it is
+# left alone.
+
+[app]
+title = "Delivery health"
+subtitle = "28 days of deploys across seven services"
+
+[[source]]
+name = "deploys"
+csv = "../data/deploys.csv"
+
+[[input]]
+name = "environment"
+label = "Environment"
+select = { options = ["production", "staging", "all"], default = "production" }
+
+[[input]]
+name = "team"
+label = "Team"
+select = { options = ["all", "payments", "retail", "platform", "growth"], default = "all" }
+
+[[cell]]
+name = "scoped"
+from = "deploys"
+[[cell.step]]
+filter = { column = "environment", op = "eq", param = "environment", skip_when = "all" }
+[[cell.step]]
+filter = { column = "team", op = "eq", param = "team", skip_when = "all" }
+
+[[cell]]
+name = "deploy_count"
+from = "scoped"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "rollbacks"
+from = "scoped"
+[[cell.step]]
+filter = { column = "rolled_back", op = "eq", value = true }
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "lead_time"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "lead_time_hours", agg = "mean", as = "mean_hours" }] }
+[[cell.step]]
+scalar = { column = "mean_hours" }
+
+[[cell]]
+name = "slowest_deploy"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "duration_min", agg = "max", as = "worst" }] }
+[[cell.step]]
+scalar = { column = "worst" }
+
+# One point per day, in day order — which is what the sort below is for.
+[[cell]]
+name = "per_day"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["day_index"], agg = [{ agg = "count", as = "deploys" }] }
+[[cell.step]]
+sort = { column = "day_index" }
+
+[[cell]]
+name = "by_service"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["service"], agg = [
+  { agg = "count", as = "deploys" },
+  { column = "lead_time_hours", agg = "mean", as = "mean_lead_h" },
+] }
+[[cell.step]]
+sort = { column = "deploys", descending = true }
+
+[[cell]]
+name = "services_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["service"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["service"]
+[[cell.step]]
+sort = { column = "service" }
+
+[[cell]]
+name = "service_count"
+from = "services_present"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "all_deploys"
+from = "deploys"
+[[cell.step]]
+count = true
+
+[[pane]]
+cell = "deploy_count"
+metric = { label = "Deploys" }
+
+[[pane]]
+cell = "rollbacks"
+metric = { label = "Rolled back" }
+
+[[pane]]
+cell = "lead_time"
+metric = { label = "Mean lead time", suffix = " h", decimals = 1 }
+
+[[pane]]
+cell = "slowest_deploy"
+metric = { label = "Slowest deploy", suffix = " min", decimals = 1 }
+
+[[pane]]
+cell = "service_count"
+metric = { label = "Services" }
+
+[[pane]]
+cell = "all_deploys"
+metric = { label = "All deploys, 28d" }
+
+[[pane]]
+cell = "per_day"
+title = "Deploys per day"
+line = { x_column = "day_index", y_column = "deploys" }
+
+[[pane]]
+cell = "by_service"
+title = "By service"
+table = { max_rows = 10 }

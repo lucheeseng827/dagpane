@@ -62,10 +62,20 @@ a test.
   semantics with nothing listening on anything, and it is what keeps
   `cargo check -p dagpane-core --target wasm32-unknown-unknown` passing — which is the
   entire WASM claim and is worth exactly what it costs.
-* **`crates/app` never depends on a server.** No `tokio`, no `axum`, no `hyper`. The patch
-  protocol has to be testable with no socket in the process.
-* **No HTTP client anywhere in the workspace.** Dev-dependencies are exempt: `crates/serve`
-  uses a WebSocket *client* to test its own wire.
+* **Neither `crates/app` nor `crates/host` depends on a server.** No `tokio`, no `axum`, no
+  `hyper` in either. The patch protocol has to be testable with no socket in the process, and
+  so does the rule `host` carries — the graph is shared, the session is not. A runtime in
+  `host` would make `crates/host/tests/isolation.rs` the kind of test that needs a socket,
+  which is exactly the kind that then gets skipped.
+* **Nothing in a default build depends on an HTTP client or a database driver.** This used to
+  read *nowhere in the workspace*, and it was worth what it cost — a data-app runtime that can
+  phone home is not one anybody self-hosts. Real sources made "nowhere" impossible, so it
+  became a shape instead of an absence: `crates/connect` is the one crate either may appear
+  in, both are `optional`, and both features are off. CI checks all three and then checks the
+  thing a manifest rule cannot — what `cargo tree` on a default `dagpane-cli` actually
+  resolves — because some other crate's default feature can satisfy every manifest and still
+  turn the client on. Dev-dependencies are exempt: `crates/serve` uses a WebSocket *client* to
+  test its own wire.
 * **The bundled client fetches nothing and pastes no markup.** No `script src=`, no
   `@import`, no `fetch(`, no `importScripts`, no CDN host, no `insertAdjacentHTML`, no
   `document.write` — and a unit test in `crates/serve/src/lib.rs` also enumerates every
@@ -95,9 +105,11 @@ list of sentences this project does not write; read it before writing a comparis
 ## No new dependency without an argument in the pull request
 
 The workspace has a short dependency list on purpose, and the header of the root
-`Cargo.toml` argues for each *absence* — no polars/duckdb/arrow, no signal or reactivity
-crate, no tokio below `serve`, no HTTP client anywhere. Read those paragraphs before adding
-something; if your dependency contradicts one, the paragraph is what you have to answer.
+`Cargo.toml` argues for each *absence*: no polars and no duckdb, with `arrow` only in
+`crates/frame-arrow` and never in core; no signal or reactivity crate; no `tokio` below
+`serve`; and no HTTP client or database driver in any **default** build. Read those paragraphs
+before adding something; if your dependency contradicts one, the paragraph is what you have to
+answer.
 
 ## The vocabulary is not decoration
 

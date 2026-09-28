@@ -34,11 +34,13 @@ kernel, not a thread, and not a process.
 **Three things the dossier's version of that paragraph claimed have been cut, because
 dagpane has not built them.** They are roadmap, not positioning:
 
-* **Column-granular invalidation.** The dossier's strongest technical argument was
-  comemo-style constrained memoization — a cell reading 3 of 200 columns not invalidating
-  when column 47 moves. v0.1.0 invalidates at whole-value granularity. Change one cell of a
-  `Table` and every cell reading that table recomputes. Nothing in this repository does
-  sub-node invalidation and no README may say otherwise.
+* ~~**Column-granular invalidation.**~~ **Built.** This entry read "nothing in this
+  repository does sub-node invalidation and no README may say otherwise" for the life of the
+  project. It is now false: a cell reading 3 of 200 columns does not invalidate when column
+  47 moves, and `dagpane explain --change-column` prints what that saves on a 122-column
+  example. The predicate half is built too: a filter change that does not move the result set
+  costs nothing. ADR-0006 has the design, the two conditions a constraint rests on, and what
+  it costs.
 * **Engine placement decided at deploy time.** `cargo check -p dagpane-core --target
   wasm32-unknown-unknown` exits 0 and CI runs it. That is the entire claim. There is no
   `crates/wasm`, no wasm-bindgen, no client-side compute, and nothing has ever executed in a
@@ -115,19 +117,27 @@ with no visible maintainer response, is the artifact of that pain. dagpane's uni
 would then be cost and blast radius per hosted app, measured in apps-per-core and p99 under
 N concurrent viewers — numbers no incumbent publishes.
 
-**Not met.** The structure points the right way: the app, the graph and every loaded source
-are one `Arc<App>` behind every connection, so a hundred viewers of the bundled 600-row app
-are a hundred slot vectors over one table, and `Arc::ptr_eq` on an untouched source across
-two sessions is asserted by a test rather than inferred from an RSS reading. But:
+**Met on the numbers, and the numbers are in `BENCHMARKS.md`.** This paragraph read *"not
+met"* while it said no figure existed; all three now do.
 
-* **No apps-per-core number has been measured. No p99 has been measured. No memory figure has
-  been measured.** Until one exists, this is a description of a data structure.
-* **`dagpane run` serves exactly one manifest on one port.** Hosting 400 apps means 400
-  processes. Each is a small static binary with no Python and no package manager, which is
-  cheaper than 400 containers, but "cheaper" is a word and not a number, and the
-  multiplexing story does not exist.
-* The benchmark that would settle this — apps-per-core against a marimo or Streamlit baseline
-  under the same load — is the single highest-value unbuilt thing in this module.
+* **Apps-per-core: 224**, one core, 448 concurrent sessions, 1 908 interactions/s, p99 inside a
+  250 ms budget, four independent runs. `benches/loadgen/`.
+* **p99 under N concurrent viewers**, measured on two rigs — a browser rig that saturates
+  before dagpane does and says so, and a protocol rig 350× finer that does not.
+* **Memory: 0.25 MB per additional app** under `dagpane host` on marginal PSS, against 94.8 MB
+  for Streamlit and 106.6 MB for marimo — 385× and 433×. `benches/fleet/`.
+* **`dagpane host` is the multiplexing story**, and it is what makes that 0.25 MB figure a
+  figure rather than a hope: 400 apps is one process. The line that used to stand here — *"the
+  multiplexing story does not exist"* — has been false since `crates/host` shipped.
+
+**What is still honest to say against it** is narrower and it is about a term nobody had
+priced. A session's cost is what its pipeline **materialises**, not what its app sources: on
+identical data, a row-keeping pipeline costs 7 248 kB per viewer and an aggregating one 145 kB,
+50× apart. The sources really are shared — that is what the 145 kB proves — but a hundred
+viewers of a row-keeping app are a hundred materialised frames, and `--budget-mb` counts
+neither. So the apps-per-core figure is a figure about *apps*, and a plan that multiplies it by
+viewers without reading §"What one more viewer costs" will be wrong in the direction that
+costs money.
 
 ### Condition 2 — nobody writes Rust
 
@@ -137,13 +147,29 @@ want dashboards.
 
 **Partly addressed, which is to say not met.** `examples/sales.toml` is a complete app —
 sources, inputs, cells, panes — with no Rust in it, and the README can lead with it honestly.
-The ceiling is exact and small: a cell's pipeline is drawn from **seven verbs** (`filter`,
-`select`, `sort`, `limit`, `group_by`, `scalar`, `count`) over five widget kinds. There is no
-SQL and no expression language, on purpose — the manifest's job is to produce *edges*, and a
-dependency inferred wrongly from SQL text by a regular expression is a wrong app — but the
-consequence is that the eighth verb an author needs is a `GraphBuilder::cell` closure in Rust.
-Evidence proved SQL + Markdown is a viable BI authoring surface and Mosaic proved
-params/selections is a viable interaction spec; seven verbs is not yet either of those.
+The ceiling is exact and small: a cell's pipeline is drawn from **nine verbs** (`filter`,
+`derive`, `join`, `select`, `sort`, `limit`, `group_by`, `scalar`, `count`) over five widget
+kinds.
+A cell may also be written as a `select`, in a **closed dialect that lowers into those same
+nine verbs** rather than running on an engine of its own (ADR-0005). The edge rule did not
+bend to admit it: a statement's tables come from its resolved parse tree and never from
+scanning text, because a dependency inferred wrongly from SQL text by a regular expression is
+a wrong app.
+
+`derive` and `join` are the eighth and ninth, and they are the first two items on P5's list.
+`derive` removes the ceiling that `margin = revenue - cost` had to be pre-computed somewhere
+the app's author could not edit; `join` removes the one that two tables could sit on a page
+and never meet on a row. Neither gives anything up: a bare name in an expression is a
+**column** and a cell reference is written `$name`, a join's second table is a cell named in
+`with`, and the compiler builds edges from those tokens and from nothing else. The vocabulary
+computes and still declares.
+
+What it does not remove: no aggregates inside an expression, no window functions, no `full`
+outer join, no range or inequality join, and the tenth verb an author needs is still a
+`GraphBuilder::cell` closure in Rust. Evidence proved SQL + Markdown is a viable BI authoring
+surface and Mosaic proved params/selections is a viable interaction spec; nine verbs with a
+one-row expression language and an equi-join is nearer to those than seven verbs was, and is
+not yet either of them.
 
 ### Condition 3 — the differentiator is sub-node invalidation, not node-level reactivity
 
@@ -152,16 +178,41 @@ Node-level reactivity is marimo's, shipped and free. Column-and-predicate-level 
 (Python mutation is untrackable) nor Streamlit (fragments *"can't detect a change in input
 values"*) can do, and is reachable only because Rust can make access observable.
 
-**Not met, and not started.** dagpane invalidates at whole-value granularity. The dossier's
-test for this condition was a measured result of the form "changed one column of a
-200-column frame, recomputed 2 of 40 nodes"; the number this project can print today is
-"changed one input, visited 8 of 11 cells, recomputed 6, repainted 3 of 7 panes", which is a
-different and weaker claim. What v0.1.0 *does* have is the mechanism that makes sub-node
-invalidation worth building — the digest short-circuit, so a cell that recomputes to an equal
-value stops the pass — and a differential oracle (200 random DAGs × 12 interactions = 2,400
-interactions, checked against a full-recompute oracle for correctness and economy after every
-commit) that would catch a sub-node scheme getting it wrong. Those are foundations for
-condition 3, not condition 3.
+**Met.** The dossier's test for this condition was a
+measured result of the form "changed one column of a 200-column frame, recomputed 2 of 40
+nodes". The number this project prints today is:
+
+```
+changed 1 column of a 122-column frame; recomputed 0 of 11 cells
+```
+
+— on `examples/apps/19-wide-telemetry.toml`, for a column the page does not read, with the
+whole table having genuinely changed. Moving a column three cells filter on recomputes three.
+That is the form the dossier asked for, on a real app, out of the tool rather than out of a
+benchmark harness.
+
+The oracle that was described here as a foundation is now load-bearing: `crates/core/tests/oracle.rs`
+gained 120 random graphs over wide frames with one column rewritten per interaction, asserting
+both correctness against a full recompute and that no cell reading none of the moved column
+ran. Four deliberate mutations of the mechanism were run against it and each is caught.
+
+The predicate half — "column- **and predicate**-level invalidation", as the condition is
+worded — is built as well. Three cells on that app filter on `cpu0_user`; move every value in
+it and, at a floor of 40, nothing recomputes, because the same 129 of 204 rows clear the floor
+before and after. At 35, three rows cross and four cells run. Same column, same edit: what is
+compared is the question, not the column.
+
+`sort` carries the same kind of constraint on *order* rather than on membership. An eleventh
+cell on that app ranks the scrape by `cpu0_user` and averages memory over the top ten; it is
+the one cell that sleeps through the 35 edit while the three filtering cells run, because
+nudging every value leaves the ranking exactly where it was.
+
+Two honest limits sit under that. Only the first row-changing step of a pipeline can carry a
+constraint — a correctness rule with a constructed staleness case behind it rather than a
+simplification — and the ordering constraint's conditions are met far less often than the
+predicate one's: nineteen of the twenty bundled apps sort after a `group_by`, and every
+leaderboard in the corpus displays the column it ranks by. ADR-0006 records both, and what
+turning the feature off does and does not change.
 
 ### Condition 4 — Perspective and Mosaic are cited as ancestors on page one
 
@@ -172,8 +223,26 @@ app is SQL over DuckDB and says dagpane has nothing to add there. Whoever writes
 inherits that obligation. A reader who finds Perspective before this project mentions it has
 already decided what kind of project this is.
 
-**Score: zero of four fully met, two of four partly.** That is the honest reading, and it is
-why this file exists in the form it does rather than as a launch narrative.
+**Score: two of four fully met — 1 and 3 — and two partly, 2 and 4.**
+
+**That line read "zero of four fully met" for a round after condition 1's verdict above was
+changed to met**, which is the same failure this file's own §3 preamble warns about from the
+other direction: a grade is only honest while it is maintained, and a summary that outlives the
+thing it summarises is worse than no summary, because a reader trusts it instead of reading.
+The rule that would have caught it is the one `benches/` keeps relearning — **when a verdict
+changes, grep for every sentence that totals it up.**
+
+The score still is not four, and the two that are short are short for different reasons, which
+an earlier draft of this paragraph flattened into "both are writing, not work."
+
+**Condition 2 is product evidence, not prose.** §3 above says what is missing and it is not a
+sentence: the tenth verb an author needs is still a `GraphBuilder::cell` closure in Rust, there
+are no aggregates inside an expression, no window functions, no `full` outer join. Until a
+non-Rust author can build the app they actually want, the condition is unmet by the code and no
+amount of writing moves it.
+
+**Condition 4 is writing**, and specifically the README naming its ancestors on page one, which
+`COMPETITORS.md` §2 already does and the README inherits. That one really is a paragraph.
 
 ---
 
@@ -220,11 +289,15 @@ Each of these is a specific, checkable event. None has happened as of 2026-09-08
 * **Column-granular invalidation with a measured result** — "changed one column of a
   200-column frame, recomputed 2 of 40 cells", produced by `dagpane explain`. Condition 3.
   This is the one that requires new engine work rather than new measurement.
-* **An authoring surface past seven verbs** that still produces edges statically. Condition 2.
-  A SQL front end is the obvious candidate and the reason it is not built is written in
-  `Cargo.toml` and in ADR-0002 — a dependency inferred wrongly from SQL text is a wrong app,
-  and a wrong edge is worse than a verbose one. That constraint is the design problem, not an
-  excuse to skip it.
+* **An authoring surface past nine verbs** that still produces edges statically.
+  Condition 2. `derive` and `join` were the first two moves on this and they are the shape
+  the rest has to take: they compute, and they still declare, because a cell reference is
+  written `$name` or `with` and a bare name is a column — so the compiler builds edges from
+  tokens rather than from a guess about what a name might be. The SQL front end is the third
+  and it took the same shape: ADR-0005 records why its grammar is closed rather than borrowed,
+  which is that a dependency inferred wrongly from SQL text is a wrong app and a wrong edge is
+  worse than a verbose one. That constraint was the design problem, and it was not an excuse
+  to skip it.
 * **Streamlit or marimo shipping value-equality backdating** — a rerun that produces an
   identical value not repainting downstream. COMPETITORS.md §3 records that nobody here has
   checked whether marimo already does this. If it does, the claim in §1 narrows again and

@@ -1,0 +1,25 @@
+# Explicit fields, no `workspace = true` inheritance — same reason as the other crates.
+[package]
+name = "dagpane-host"
+version = "0.1.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/dagpane"
+rust-version = "1.85"
+description = "Many apps in one dagpane process: an app keyed by (app, manifest digest), one compiled graph however many viewers, and eviction against a measured byte budget."
+
+# No tokio, no axum, no hyper — and that is the point of the crate rather than an accident
+# of it. Multiplexing is a decision about a map: which key, which lifetime, which budget.
+# A runtime in this crate would make the isolation invariant — two tenants' sessions over
+# one graph observe nothing of each other — a test that needs a socket to run, which is
+# exactly the test that then gets skipped. `crates/serve` owns the socket and drives this.
+[features]
+default = ["arrow-sources"]
+arrow-sources = ["dagpane-app/arrow-sources"]
+
+[dependencies]
+dagpane-app = { path = "../app", version = "0.1.1", default-features = false }
+dagpane-core = { path = "../core", version = "0.1.1" }
+
+[dev-dependencies]
+tempfile = "3"

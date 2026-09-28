@@ -1,0 +1,111 @@
+# ANALYST — "which signup cohort is actually worth the acquisition spend?"
+#
+# The mechanic: `skip_when`. The dropdown's "all" option is not a conditional in a callback,
+# it is a step that does nothing. Set the funnel step to `subscribe` and watch `revenue_total`
+# report `same value` — only subscriptions carry revenue, so narrowing to that step cannot
+# move the revenue number, and the pass stops there rather than repainting a metric that is
+# already right:
+#
+#     dagpane explain 03-cohort.toml --set funnel_step=subscribe
+#
+# `explain` runs one pass from a fresh session, so a there-and-back round trip on one control
+# is something to watch in the browser rather than in the terminal.
+
+[app]
+title = "Cohort explorer"
+subtitle = "Sessions and revenue by signup cohort"
+
+[[source]]
+name = "events"
+csv = "../data/web_events.csv"
+
+[[input]]
+name = "cohort"
+label = "Cohort"
+select = { options = ["all", "2026-06", "2026-07", "2026-08"], default = "all" }
+
+[[input]]
+name = "funnel_step"
+label = "Funnel step"
+select = { options = ["all", "visit", "signup", "activate", "subscribe"], default = "all" }
+
+[[cell]]
+name = "scoped"
+from = "events"
+[[cell.step]]
+filter = { column = "cohort", op = "eq", param = "cohort", skip_when = "all" }
+[[cell.step]]
+filter = { column = "step", op = "eq", param = "funnel_step", skip_when = "all" }
+
+[[cell]]
+name = "by_cohort"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["cohort"], agg = [
+  { column = "sessions", agg = "sum", as = "sessions" },
+  { column = "revenue", agg = "sum", as = "revenue" },
+] }
+[[cell.step]]
+sort = { column = "cohort" }
+
+[[cell]]
+name = "by_device"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["device"], agg = [{ column = "sessions", agg = "sum", as = "sessions" }] }
+[[cell.step]]
+sort = { column = "sessions", descending = true }
+
+[[cell]]
+name = "sessions_total"
+from = "by_cohort"
+[[cell.step]]
+group_by = { agg = [{ column = "sessions", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "revenue_total"
+from = "by_cohort"
+[[cell.step]]
+group_by = { agg = [{ column = "revenue", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "devices_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["device"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["device"]
+[[cell.step]]
+sort = { column = "device" }
+
+[[cell]]
+name = "device_count"
+from = "devices_present"
+[[cell.step]]
+count = true
+
+[[pane]]
+cell = "sessions_total"
+metric = { label = "Sessions" }
+
+[[pane]]
+cell = "revenue_total"
+metric = { label = "Revenue", prefix = "$", decimals = 0 }
+
+[[pane]]
+cell = "device_count"
+metric = { label = "Devices seen" }
+
+[[pane]]
+cell = "by_cohort"
+title = "Sessions by cohort"
+bar = { label_column = "cohort", value_column = "sessions" }
+
+[[pane]]
+cell = "by_device"
+title = "By device"
+table = { max_rows = 10 }

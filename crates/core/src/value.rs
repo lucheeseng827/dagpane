@@ -312,6 +312,30 @@ impl ColumnData {
         }
     }
 
+    /// Resident bytes this column holds: its allocated buffer, plus the heap behind every
+    /// string in it.
+    ///
+    /// `capacity`, not `len`. A column built by a filter keeps whatever the growth policy
+    /// gave it, and those bytes are resident whether or not an element occupies them — a
+    /// budget that counts only the occupied ones under-admits nothing and over-admits
+    /// steadily.
+    ///
+    /// Exact for this representation and comparable across backends, which is the property
+    /// [`crate::frame::Frame::memory_size`] needs. It counts no `ColumnData` enum header and
+    /// no column name; those are per-column constants, not per-row ones, and the caller
+    /// summing frames is deciding about rows.
+    pub fn memory_size(&self) -> usize {
+        match self {
+            ColumnData::Int(v) => v.capacity() * std::mem::size_of::<Option<i64>>(),
+            ColumnData::Float(v) => v.capacity() * std::mem::size_of::<Option<f64>>(),
+            ColumnData::Bool(v) => v.capacity() * std::mem::size_of::<Option<bool>>(),
+            ColumnData::Text(v) => {
+                v.capacity() * std::mem::size_of::<Option<String>>()
+                    + v.iter().flatten().map(String::capacity).sum::<usize>()
+            }
+        }
+    }
+
     /// One element as a [`Value`], for rendering and for the scalar path in transforms.
     /// A null element reads as [`Value::Null`], never as a zero.
     pub fn value_at(&self, row: usize) -> Value {
@@ -323,6 +347,45 @@ impl ColumnData {
                 .map(|s| Value::text(s.clone()))
                 .unwrap_or(Value::Null),
             ColumnData::Bool(v) => v[row].map(Value::bool).unwrap_or(Value::Null),
+        }
+    }
+
+    /// A new, empty column of a given type, with room for `rows` elements.
+    ///
+    /// The capacity is not a micro-optimisation: [`ColumnData::memory_size`] counts capacity
+    /// rather than length, so a column grown by doubling reports up to twice the bytes it
+    /// needs and a host budget admits proportionally fewer apps.
+    pub fn with_capacity(ty: ColumnType, rows: usize) -> ColumnData {
+        match ty {
+            ColumnType::Int => ColumnData::Int(Vec::with_capacity(rows)),
+            ColumnType::Float => ColumnData::Float(Vec::with_capacity(rows)),
+            ColumnType::Text => ColumnData::Text(Vec::with_capacity(rows)),
+            ColumnType::Bool => ColumnData::Bool(Vec::with_capacity(rows)),
+        }
+    }
+
+    /// Append one [`Value`], recording a null for anything this column cannot hold.
+    ///
+    /// The one conversion it does make is `Int` into a `Float` column, which is the widening
+    /// [`Value::as_float`] already performs and the reason an expression whose static type is
+    /// `float` may still evaluate to an `Int` on a row where both of its branches were
+    /// integers.
+    ///
+    /// Every other mismatch is a null rather than a panic. That case is unreachable through
+    /// the transforms in [`crate::transform`], which build their output columns from the same
+    /// type the values came from; it is written this way so that a future backend reporting a
+    /// type it does not store degrades to a visible null instead of taking the process down.
+    pub fn push(&mut self, value: Value) {
+        match (self, value) {
+            (ColumnData::Int(v), Value::Int { v: x }) => v.push(Some(x)),
+            (ColumnData::Float(v), Value::Float { v: x }) => v.push(Some(x)),
+            (ColumnData::Float(v), Value::Int { v: x }) => v.push(Some(x as f64)),
+            (ColumnData::Bool(v), Value::Bool { v: x }) => v.push(Some(x)),
+            (ColumnData::Text(v), Value::Text { v: x }) => v.push(Some(x)),
+            (ColumnData::Int(v), _) => v.push(None),
+            (ColumnData::Float(v), _) => v.push(None),
+            (ColumnData::Bool(v), _) => v.push(None),
+            (ColumnData::Text(v), _) => v.push(None),
         }
     }
 
@@ -585,69 +648,82 @@ impl Digestible for Table {
     /// Column names and types are hashed as well as the data, so a rename or a retype is a
     /// change even when every cell is identical — a client renders the header from the
     /// schema, so it is part of the value.
+    ///
+    /// **Composed from per-column digests**, exactly as [`crate::frame::digest_frame`]
+    /// composes them. This impl exists beside that one because it reads [`ColumnData`]
+    /// directly and so hashes a text column without building a `String` per cell, which a
+    /// walk through [`crate::frame::Frame::value_at`] cannot avoid. The two producing the
+    /// same bytes is a requirement, not a coincidence:
+    /// `the_canonical_walk_matches_the_hand_written_table_digest` in `frame.rs` is the test
+    /// that catches this pair drifting apart, and it earned its keep when the column digests
+    /// went in.
     fn digest_into(&self, h: &mut Hasher) {
-        h.tag(6)
-            .u64(self.rows as u64)
-            .u64(self.columns.len() as u64);
-        for c in &self.columns {
-            h.str(&c.name);
-            h.tag(match c.data.column_type() {
-                ColumnType::Int => 1,
-                ColumnType::Float => 2,
-                ColumnType::Text => 3,
-                ColumnType::Bool => 4,
-            });
-            match &c.data {
-                ColumnData::Int(v) => {
-                    for e in v {
-                        match e {
-                            Some(x) => {
-                                h.tag(1).i64(*x);
+        let columns: Vec<crate::digest::Digest> = self
+            .columns
+            .iter()
+            .map(|c| {
+                let mut ch = Hasher::new();
+                ch.str(&c.name);
+                ch.tag(match c.data.column_type() {
+                    ColumnType::Int => 1,
+                    ColumnType::Float => 2,
+                    ColumnType::Text => 3,
+                    ColumnType::Bool => 4,
+                });
+                match &c.data {
+                    ColumnData::Int(v) => {
+                        for e in v {
+                            match e {
+                                Some(x) => {
+                                    ch.tag(1).i64(*x);
+                                }
+                                None => {
+                                    ch.tag(0);
+                                }
                             }
-                            None => {
-                                h.tag(0);
+                        }
+                    }
+                    ColumnData::Float(v) => {
+                        for e in v {
+                            match e {
+                                Some(x) => {
+                                    ch.tag(1).f64(*x);
+                                }
+                                None => {
+                                    ch.tag(0);
+                                }
+                            }
+                        }
+                    }
+                    ColumnData::Text(v) => {
+                        for e in v {
+                            match e {
+                                Some(x) => {
+                                    ch.tag(1).str(x);
+                                }
+                                None => {
+                                    ch.tag(0);
+                                }
+                            }
+                        }
+                    }
+                    ColumnData::Bool(v) => {
+                        for e in v {
+                            match e {
+                                Some(x) => {
+                                    ch.tag(1).bytes(&[*x as u8]);
+                                }
+                                None => {
+                                    ch.tag(0);
+                                }
                             }
                         }
                     }
                 }
-                ColumnData::Float(v) => {
-                    for e in v {
-                        match e {
-                            Some(x) => {
-                                h.tag(1).f64(*x);
-                            }
-                            None => {
-                                h.tag(0);
-                            }
-                        }
-                    }
-                }
-                ColumnData::Text(v) => {
-                    for e in v {
-                        match e {
-                            Some(x) => {
-                                h.tag(1).str(x);
-                            }
-                            None => {
-                                h.tag(0);
-                            }
-                        }
-                    }
-                }
-                ColumnData::Bool(v) => {
-                    for e in v {
-                        match e {
-                            Some(x) => {
-                                h.tag(1).bytes(&[*x as u8]);
-                            }
-                            None => {
-                                h.tag(0);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+                ch.finish()
+            })
+            .collect();
+        crate::frame::digest_frame_from_columns(self.rows, &columns, h);
     }
 }
 

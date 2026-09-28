@@ -13,13 +13,22 @@ container and nothing for it to fetch at run time.
 
 ## Read this before you expose it
 
-**There is no authentication in this version.** `dagpane run` binds loopback by default and
-warns when told to bind anything else. Inside a container, "anything else" is the only useful
-choice, which is why every example below passes `--host 0.0.0.0`.
+**Authentication is optional, and off unless you turn it on.** `dagpane run` binds loopback
+by default and warns when told to bind anything else. Inside a container, "anything else" is
+the only useful choice, which is why every example below passes `--host 0.0.0.0` — so the
+warning applies to every containerised deployment.
 
-Put it behind something that authenticates before it is reachable by anyone you would not
+Two answers, and you need one of them before the port is reachable by anyone you would not
 show the data to. Whoever can open the page can move every input in the app and read every
 value it computes.
+
+1. **Put something that authenticates in front of it.** Unchanged, still supported, and the
+   right answer where a proxy already does this.
+2. **Use the built-in front door:** mount a JWKS file and pass `--auth-jwks` with
+   `--auth-issuer`, `--auth-audience` and either `--auth-apps-claim` or `--auth-any-app`. The
+   process verifies OIDC id tokens against that file and makes **no outbound request**, so
+   there is no discovery call to fail at start-up and an air-gapped host works. Access is per
+   app, never per pane, and a token cannot be revoked before it expires.
 
 ## Run it
 

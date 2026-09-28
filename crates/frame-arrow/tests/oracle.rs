@@ -409,3 +409,50 @@ fn a_big_integer_filters_the_same_on_both_backends() {
         }
     }
 }
+
+/// A projection that keeps **only** a derived column must not lose its rows — on either
+/// backend, and identically.
+///
+/// The hole this closes: `WithColumn::select_columns` used to hand the base an empty
+/// projection whenever nothing of the base survived. `ArrowFrame::select_columns` carries
+/// `self.rows` across, so it reported the right height; `Table::select_columns` builds a
+/// `Table` from no columns and takes its height from the first one it does not have, so it
+/// reported zero. `rows()` on the adapter delegates to that base, so the same data came back
+/// four rows tall through one backend and empty through the other.
+///
+/// Two backends disagreeing about one frame is precisely what this file exists to catch, and
+/// `select amount * 2 as x from sales` reaches it in one line of SQL.
+#[test]
+fn a_projection_of_only_the_derived_column_agrees_across_backends() {
+    use dagpane_core::expr::Expr;
+    use dagpane_core::transform;
+
+    let columns = vec![
+        dagpane_core::value::Column::text(
+            "region",
+            (0..4).map(|i| Some(format!("r{i}"))).collect(),
+        ),
+        dagpane_core::value::Column::float("amount", (0..4).map(|i| Some(i as f64)).collect()),
+    ];
+    let expr = Expr::parse("amount * 2").unwrap();
+
+    let both: Vec<Arc<dyn Frame>> = vec![
+        Arc::new(Table::new(columns.clone()).unwrap()),
+        Arc::new(ArrowFrame::from_columns(&columns)),
+    ];
+    for base in both {
+        let backend = base.backend();
+        let derived = transform::derive(&base, "doubled", &expr, &[]).unwrap();
+        assert_eq!(derived.rows(), 4, "{backend}: derive");
+
+        let only = transform::select(&*derived, &["doubled".to_string()]).unwrap();
+        assert_eq!(only.rows(), 4, "{backend}: a projection lost every row");
+        assert_eq!(only.column_names(), vec!["doubled".to_string()]);
+        assert_eq!(only.value_at(3, 0).as_float(), Some(6.0), "{backend}");
+        assert_eq!(
+            only.backend(),
+            backend,
+            "{backend}: the chain changed backend"
+        );
+    }
+}

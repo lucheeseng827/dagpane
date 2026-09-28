@@ -117,13 +117,53 @@ jobs:
           print("counts unchanged:", got)
           PY
 
-      # Exit criterion 3 — the engine still compiles for the browser's target. This is the
-      # whole of the WASM claim and it is worth exactly what it costs: it holds `core` to no
-      # filesystem, no clock and no threads. Nothing runs in a browser and the README says so.
+      # Exit criterion 2b — every worked example still earns its graph. The apps under
+      # examples/apps/ are the documentation for when to reach for this, so an app that
+      # quietly stopped skipping work is a broken argument, not just a stale file. The gate
+      # asserts both halves per app: something was skipped, and something was shown. It has
+      # already caught the failure that motivated it — a checkbox written with a literal
+      # `value` plus `skip_when`, which compiles, renders, and never skips, so the control
+      # was wired to nothing and every pane repainted.
+      - name: every example app still skips work
+        run: DAGPANE=./target/release/dagpane python3 examples/tools/verify.py
+
+      # Exit criterion 3 — the engine in a browser, and it is no longer a `cargo check`.
+      #
+      # This job used to assert only that `dagpane-core` COMPILES for wasm32, which held the
+      # core to no filesystem, no clock and no threads and proved nothing about a browser.
+      # It now builds the artefact a page actually loads and drives it in a real WebAssembly
+      # engine — the four `extern "C"` exports, the hand-written length prefix and the
+      # JavaScript that has to agree with both, which is the seam a hand-rolled ABI breaks at.
+      #
+      # `run.sh` also exports the bundled example and drives THAT, which is what asserts the
+      # published interaction costs the same number of cells in a browser as on a server. A
+      # browser build that recomputed a different number would be a different product.
       - name: the engine still builds for wasm32
         run: |
           rustup target add wasm32-unknown-unknown
           cargo check --locked -p dagpane-core --target wasm32-unknown-unknown
+
+      - name: the engine runs in a browser engine, and an export of it does too
+        run: ./crates/wasm/tests/run.sh
+
+      # The one test in the tree that needs a real BROWSER rather than a JavaScript engine,
+      # because what it asserts is what a browser does about a closed socket — and that logic
+      # lives in `client.html`, which nothing else here executes. A rolling update closes every
+      # open connection on purpose, so this is what decides whether the drain buys a viewer
+      # anything. The runner skips itself with exit 0 when no Chromium is on the machine, which
+      # is why the step installs one rather than hoping.
+      - name: the page comes back when the server does
+        # `DAGPANE_REQUIRE_BROWSER` turns the runner's contributor-friendly skip into a
+        # failure. Without it a runner with no browser would produce a green tick over a test
+        # that never ran, which is worse than not having the step.
+        #
+        # Nothing is installed here: the GitHub-hosted image ships Google Chrome, and the
+        # runner probes for it. If that ever stops being true this step fails loudly and says
+        # which browsers it looked for, rather than an `apt-get` line failing for its own
+        # reasons on an image whose package names move.
+        env:
+          DAGPANE_REQUIRE_BROWSER: "1"
+        run: ./crates/serve/tests/run.sh
 
       # Exit criterion 4 — the single-binary claim is a tested artefact, not a README
       # sentence, and it includes the front end, which lives inside the executable.
@@ -205,50 +245,179 @@ jobs:
             fi
           done
 
-      - name: no HTTP client anywhere in the build
+      - name: host never depends on a runtime
         run: |
-          # A data-app runtime that can phone home is not one anybody self-hosts, and the
-          # promise is only as good as the dependency tree.
+          set -e
+          # `host` decides which app a request gets, how long it stays compiled, and what it
+          # costs. Every one of those is a decision about a map, and a runtime in this crate
+          # would make the isolation suite — two parties over one graph observe nothing of
+          # each other — a test that needs a socket to run. That is precisely the test that
+          # then gets skipped.
+          for banned in tokio axum hyper; do
+            if grep -qE "^\s*${banned}\b" crates/host/Cargo.toml; then
+              echo "::error::crates/host must not depend on ${banned} — crates/serve owns the"
+              echo "::error::socket and drives this one. Keeping the split is what makes"
+              echo "::error::tests/isolation.rs runnable with nothing listening on anything."
+              exit 1
+            fi
+          done
+
+      - name: a network client lives in one place and is never in a default build
+        run: |
+          # The rule used to be "no HTTP client anywhere", and it was worth what it cost: a
+          # data-app runtime that can phone home is not one anybody self-hosts. Real sources
+          # made "nowhere" impossible, so it became a shape instead of an absence, and this
+          # job checks the shape has three parts:
           #
-          # This used to be `grep ... | grep -v "dev-dependencies"`, which cannot work: grep
-          # filters the MATCHED line, and the matched line is `reqwest = "0.12"` — never the
-          # `[dev-dependencies]` header above it. The exemption was inert, so the first
-          # dev-dependency HTTP client would have failed the build with a misleading message.
-          # Parse the sections instead. `crates/serve` legitimately has a WebSocket *client*
-          # in dev-dependencies to test its own wire.
+          #   1. the dependency appears in exactly ONE manifest, `crates/connect`;
+          #   2. it is `optional = true` there, behind a feature that is OFF by default;
+          #   3. a DEFAULT build of the binary resolves neither — checked against the real
+          #      resolution rather than against the manifests, because a feature enabled by
+          #      some other crate's default would satisfy 1 and 2 and still ship the client.
+          #
+          # Part 3 is the one that actually holds. The first two exist so that a change that
+          # would break it fails at review with a message about intent.
           python3 - <<'PY'
           import sys, tomllib
           from pathlib import Path
 
-          BANNED = {"reqwest", "ureq", "isahc", "curl", "surf"}
+          # Clients, not servers. `hyper` is deliberately absent: axum is built on it and
+          # this runtime's whole job is to SERVE HTTP. The promise is that it never CALLS
+          # out, so the list is crates whose purpose is an outbound request or a database
+          # connection. Adding `hyper` here would ban `crates/serve` and the check would be
+          # deleted within a week, which is worse than a check with a stated edge.
+          NET = {"reqwest", "ureq", "isahc", "curl", "surf",
+                 "postgres", "tokio-postgres", "sqlx", "mysql", "rusqlite"}
+          HOME = Path("crates/connect/Cargo.toml")
           SHIPPED = ("dependencies", "build-dependencies")
           bad = []
-          for path in Path(".").rglob("Cargo.toml"):
+
+          for path in sorted(Path(".").rglob("Cargo.toml")):
               if "target" in path.parts:
                   continue
               manifest = tomllib.loads(path.read_text())
-              tables = [manifest.get(s, {}) for s in SHIPPED]
-              tables += [t.get(s, {}) for t in manifest.get("target", {}).values() for s in SHIPPED]
-              ws = manifest.get("workspace", {})
-              tables += [ws.get("dependencies", {})]
-              for table in tables:
-                  bad += [(str(path), name) for name in table if name in BANNED]
+              tables = [(s, manifest.get(s, {})) for s in SHIPPED]
+              tables += [(s, t.get(s, {}))
+                         for t in manifest.get("target", {}).values() for s in SHIPPED]
+              tables += [("workspace.dependencies", manifest.get("workspace", {}).get("dependencies", {}))]
+              for table, entries in tables:
+                  for name, spec in entries.items():
+                      if name not in NET:
+                          continue
+                      if path != HOME:
+                          bad.append(f"{path}: `{name}` in [{table}] — a network client or a "
+                                     f"database driver belongs in {HOME} and nowhere else")
+                      elif not (isinstance(spec, dict) and spec.get("optional")):
+                          bad.append(f"{path}: `{name}` is not `optional = true`, so it would "
+                                     f"be in every build")
+
+          connect = tomllib.loads(HOME.read_text())
+          if connect.get("features", {}).get("default"):
+              bad.append(f"{HOME}: `default` must stay empty — `http` and `sql` are opt-in")
+
+          for line in bad:
+              print(f"::error::{line}")
           if bad:
-              for path, name in bad:
-                  print(f"::error file={path}::{name} is an HTTP client in a shipped dependency table.")
-              print("::error::this runtime does not phone home, and the dependency tree is what makes that true.")
+              print("::error::see crates/connect/Cargo.toml for what this rule replaced and why.")
               sys.exit(1)
-          print("no HTTP client in any shipped dependency table")
+          print(f"network clients confined to {HOME}, all optional, default empty")
           PY
 
-      - name: the bundled client fetches nothing
+          # Part 3: the resolution, not the manifests.
+          for crate in dagpane-cli dagpane-serve dagpane-app; do
+            tree=$(cargo tree -p "$crate" -e normal --prefix none 2>/dev/null | awk '{print $1}' | sort -u)
+            for banned in ureq reqwest isahc curl surf postgres tokio-postgres sqlx; do
+              if echo "$tree" | grep -qx "$banned"; then
+                echo "::error::a default build of ${crate} resolves ${banned}."
+                echo "::error::The promise is that \`cargo install dagpane\` links no network"
+                echo "::error::client and no database driver. Something turned a feature on."
+                exit 1
+              fi
+            done
+          done
+          echo "default builds of cli, serve and app resolve no network client"
+
+      - name: the bundled client fetches nothing it was not told to
         run: |
-          # Also asserted by a unit test; a grep here catches it before a compile.
-          if grep -qE 'script src=|@import|//cdn\.|insertAdjacentHTML|document\.write' \
+          # Also asserted by a unit test, which is the authoritative one — it enumerates the
+          # two `fetch`es and the two `import`s the page is allowed and fails on a third. A
+          # grep here catches the obvious shapes before a compile.
+          if grep -qE 'script src=|@import |//cdn\.|insertAdjacentHTML|document\.write' \
                crates/serve/src/client.html; then
             echo "::error::the client must be one self-contained file that builds DOM nodes."
             exit 1
           fi
+          # A renderer is served with the app. An import naming a host is a CDN with extra
+          # steps, and `manifest::compile_renderers` refuses one — this is the other end.
+          if grep -qE 'import\(["'"'"']?https?:|import\(["'"'"']?//' \
+               crates/serve/src/client.html; then
+            echo "::error::the client must not import code from another origin."
+            exit 1
+          fi
+
+  sources:
+    name: the gated sources, against a real database
+    runs-on: ubuntu-latest
+
+    # `http` and `sql` are off by default — see crates/connect/Cargo.toml for why that rule
+    # replaced "no HTTP client anywhere" — and off by default is not the same as untested.
+    # Without this job they rot until the first person to enable one finds out.
+    #
+    # The database is the point. `crates/app/tests/sql_parity.rs` runs one manifest over a
+    # Postgres table and over a CSV export of the same rows and compares EVERY pane's
+    # rendered view. That test cannot be written against a fake: the findings it exists to
+    # catch — an int2 widened differently, a null read as a zero, a date that is not text on
+    # the wire — are all properties of the real driver talking to a real server, and a mock
+    # would assert this author's model of both.
+    services:
+      postgres:
+        # Pinned by digest, not by tag, for the reason the cargo-deny step below gives about
+        # actions: this file is PUBLISHED to the public mirror, and a moved tag matters most
+        # exactly where a reader cannot see what moved. This digest was resolved from the
+        # registry and its config blob checked: `postgres:16-alpine`, PG_VERSION 16.15.
+        image: postgres@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+        env:
+          # Not a secret, and deliberately not read from one. This database exists for the
+          # length of one job, holds six rows of synthetic sales, and is reachable only from
+          # this runner. Putting it in a repository secret would imply it protects something.
+          # It IS a real password rather than `trust`, so the job exercises the DSN redaction
+          # path the sources promise — an error that quotes it would be a finding.
+          POSTGRES_PASSWORD: dagpane-ci
+          POSTGRES_DB: dagpane_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DAGPANE_TEST_PG_URL: postgres://postgres:dagpane-ci@127.0.0.1:5432/dagpane_ci
+      # Without this the sql tests SKIP when the URL is missing, and a skip reads as a pass.
+      # A green tick over a test that never ran is the failure this whole file exists to
+      # prevent, so in CI the skip is made impossible: the helper panics instead.
+      DAGPANE_REQUIRE_PG: "1"
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup toolchain install 1.94.0 --profile minimal --component clippy && rustup default 1.94.0
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+
+      - name: lint with both features on
+        run: |
+          cargo clippy -p dagpane-connect --features http,sql --all-targets -- -D warnings
+          cargo clippy -p dagpane-cli --features http,sql -- -D warnings
+
+      # The http tests need no network: each starts a listener on 127.0.0.1 and answers its
+      # own requests, because what is being tested is what happens to bytes off a socket —
+      # an absent validator, a status that is not 200, a body past the cap — and a stubbed
+      # client would prove none of it.
+      - name: the sources
+        run: cargo test -p dagpane-connect --features http,sql --locked
+
+      - name: an app over a table renders what the same app over a CSV renders
+        run: cargo test -p dagpane-app --features sql --locked
 
   supplychain:
     name: cargo-deny · audit

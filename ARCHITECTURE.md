@@ -37,16 +37,26 @@ cells recompute → a patch goes out, not a page* — and each segment is a crat
 flowchart TD
     cli["<b>cli</b><br/>the dagpane binary<br/>check · graph · explain · run"]
     serve["<b>serve</b><br/>axum, one session per connection<br/>the only clock and the only socket"]
+    host["<b>host</b><br/>many apps, one process<br/>keyed by (app, manifest digest)"]
     app["<b>app</b><br/>widgets, panes, the patch,<br/>the manifest compiler"]
+    connect["<b>connect</b><br/>file · url · sql<br/>the only network client, gated off"]
+    auth["<b>auth</b><br/>verify a token against a pinned JWKS<br/>no HTTP client: keys are a file"]
     core["<b>core</b><br/>pure. no I/O, no async, no clock<br/>forbid(unsafe_code) · one dependency"]
 
     cli --> serve
     cli --> app
+    cli --> host
+    serve --> host
+    serve --> auth
     serve --> app
+    host --> app
+    app --> connect
     app --> core
+    connect --> core
     core -. "never" .-> app
     core -. "never" .-> serve
     app -. "never" .-> serve
+    host -. "never" .-> serve
 
     classDef pure fill:#eef7ee,stroke:#4a7,stroke-width:2px
     classDef io fill:#eef2f9,stroke:#57a,stroke-width:2px
@@ -63,8 +73,24 @@ The dotted edges are the ones CI enforces with a grep, and each of them is load-
 * **`app` never depends on a server.** The whole patch protocol — what is sent, and what is
   deliberately not sent — is exercised by `cargo test -p dagpane-app` with no process
   listening on anything.
-* **Nothing depends on an HTTP client.** A data-app runtime that can phone home is not one
-  anybody self-hosts, and the promise is only as good as the dependency tree.
+* **Nothing in a default build depends on an HTTP client or a database driver.** This used
+  to read "nothing anywhere", and it was worth what it cost: a data-app runtime that can
+  phone home is not one anybody self-hosts. Real sources made "nowhere" impossible, so it
+  became a shape rather than an absence — one crate (`connect`), both clients `optional`,
+  both features off by default. CI checks all three, and then checks the thing that actually
+  matters: that `cargo tree` on a default `dagpane-cli` resolves neither. A manifest rule can
+  be satisfied while some other crate's default feature turns the client on; the resolution
+  cannot.
+* **`host` never depends on a runtime either,** and for a reason worth stating separately.
+  Serving many apps from one process makes isolation a property of a data structure rather
+  than of a database, and the rule is one line: *the graph is shared, the session is not.*
+  `Host::open` hands out an `Arc<App>` — immutable, compiled once — and each connection
+  builds its own `Session` over it. There is deliberately no call that returns a session
+  somebody else also holds, because that is not a cache hit; it is one viewer reading
+  another viewer's inputs. `crates/host/tests/isolation.rs` is that sentence made
+  adversarial: the *same manifest bytes* deployed under two app ids, both sessions open,
+  one sets an input and the other's panes must not move. A runtime in `host` would make
+  that test need a socket, which is exactly the test that then gets skipped.
 
 `serve` is the smallest crate here on purpose. It owns the three things that cannot exist
 without a machine — an address, a clock and a browser — and nothing else.
@@ -185,26 +211,54 @@ chunking, no dictionary encoding, no SIMD. Sixteen bytes for an `i64`. It is not
 the README says so.
 
 It exists because taking a real dataframe dependency in v0.1.0 would have decided two other
-questions by accident. It would have decided the WASM question — Polars does not build for
-`wasm32-unknown-unknown` — and it would have implied a query capability the rest of the code
-does not have. What is here is honest about its size: it is fine for the
-hundreds-of-thousands-of-rows apps this runtime targets, and it is the wrong tool above that.
+questions by accident. It would have decided the WASM question — this section used to say
+Polars does not build for `wasm32-unknown-unknown`, which `ROADMAP.md` §2 has since measured
+and found wrong — and it would have implied a query capability the rest of the code does not
+have. What is here is honest about its size: it is fine for the hundreds-of-thousands-of-rows
+apps this runtime targets, and it is the wrong tool above that.
 
-**Where a real engine plugs in**, concretely, so that this is a plan and not a gesture:
+**The seam this section used to describe as a plan is now in the tree.** `dagpane_core::frame`
+holds the `Frame` trait, `Value::Frame` carries an `Arc<dyn Frame>`, and there are **two**
+backends rather than one: `Table`, and `crates/frame-arrow`'s `ArrowFrame`. Two was the
+point — a trait with a single implementation is a design fitted to that implementation, and
+there is no second caller to discover what it got wrong. A loaded source fills whichever
+builder it is handed, behind `crates/app`'s default-on `arrow-sources` feature.
 
-1. `Value::Table(Table)` becomes `Value::Frame(Arc<dyn Frame>)`, where `Frame` requires
-   `rows()`, `schema()`, `head(n) -> Table` and `digest() -> Digest`. Only the last of those
-   is interesting: the engine's entire contract with a value is *produce it, digest it,
-   compare the digest*, so an engine that can content-hash a batch cheaply plugs in without
-   touching `session.rs` at all.
-2. `crates/core/src/transform.rs` becomes one implementation of a `Transform` trait rather
-   than the only one, and `manifest.rs`'s `StepOp` compiles against the trait.
-3. `crates/app/src/view.rs` already renders through `Table` alone (`head`, `schema`, `row`),
-   so the render path needs `Frame::head` and nothing else.
+What has **not** changed is where a dependency may live. `dagpane-core` is still serde and
+nothing else, so the crate where the product's claim can be *wrong* stays auditable line by
+line and a backend is only a place where it can be *slow*.
 
-There is deliberately **no such trait in the tree today**. A trait with one implementation
-and no second caller is speculative generality that costs a crate and constrains the design
-before anything has pushed on it. This section is the seam; the code is not.
+**Where the plan was right, and where it was not.** It named four methods — `rows()`,
+`schema()`, `head(n)` and `digest()` — and it got the shape that mattered right: the engine's
+entire contract with a value is *produce it, digest it, compare the digest*, so a backend
+plugs in without `session.rs` changing at all. Three corrections are worth recording, because
+each is a place the plan would have been actively harmful if followed:
+
+1. **Digesting is not a trait method.** `digest_frame` walks any frame through the trait's own
+   accessors, so it sees logical values and cannot see layout, and every backend delegates to
+   it rather than hashing its own buffers. A `digest()` each backend implemented is exactly
+   how a dictionary-encoded column and a plain one holding the same strings come to hash
+   differently — which would invalidate every cell in the graph the moment anybody switched
+   representation, while looking exactly like a correct pass.
+2. **The three methods that carry most of the weight were not on the list.** `take_rows`,
+   because `filter`, `sort` and `limit` all reduce to choosing row indices and calling it, so
+   a backend makes three verbs fast by making one fast. `same_kind`, because `group_by` builds
+   rows rather than selecting them and `transform.rs` must not name a backend — it asks its
+   input to build the result, so a chain stays in the representation it started in.
+   `memory_size`, required rather than defaulted, because `crates/host` admits apps against a
+   byte budget and a default would have to guess.
+3. **`transform.rs` did not become one implementation of a `Transform` trait.** It stayed a
+   single set of verbs written against `&dyn Frame`, which serves every backend. `ROADMAP.md`
+   §2 keeps that half open under the same rule that governed this trait: wait for a second
+   implementation to justify it.
+
+`crates/frame-arrow/tests/oracle.rs` is what holds the two backends to being
+indistinguishable, and it asserts **traces** as well as values. That is the assertion that
+makes the seam real: the short-circuit is driven by content digests, so a backend whose digest
+disagreed by one bit would recompute in one run and reuse in the other, and the counts would
+diverge. `BENCHMARKS.md` has what the second backend is worth — 4.1× on the bundled example's
+source columns, and 41% of a whole session, with the gap between those two numbers explained
+rather than hidden.
 
 ## 7. The wire contract, and why it is renderer-blind
 
@@ -221,10 +275,16 @@ Every `patch` carries a `stats` block — the same numbers `explain` prints. Tha
 telemetry and it never leaves the connection; it is there so the claim is visible in a
 browser's network tab without a special build.
 
-The client is one file with inline CSS and JavaScript, no package manager and nothing fetched
-at run time. A test asserts that the only URL in it is the SVG namespace. That matters twice:
-the first five minutes of using this project do not involve `npm install`, and an app served
-on an air-gapped host renders.
+The client is one file with inline CSS and JavaScript, no package manager and no third-party
+resource at run time. A test asserts that the only external URL in it is the SVG namespace.
+That matters twice: the first five minutes of using this project do not involve `npm install`,
+and an app served on an air-gapped host renders.
+
+The stronger claim — *fetches nothing* — held until renderer scripts and the wasm glue gave
+the page code it did not ship with. Four same-origin requests are now allowed and enumerated:
+`GET /auth`, a configured provider's token endpoint, a declared renderer script, and
+`./dagpane.js` in an exported bundle. ADR-0007 argues why the two `import`s cannot reach
+another origin; the air-gapped case still holds because none of the four is a third party.
 
 ## 8. What is checked, and what is not
 
@@ -243,8 +303,10 @@ clears a poisoned subtree in one pass; and `visited == set + evaluated + reused 
 holds inside `commit` itself as a `debug_assert`, so every test in the suite checks it for
 free.
 
-**Not checked, and therefore not claimed.** There is no benchmark in this repository. No
-number anywhere in these documents is measured in seconds, and no claim is made about
-apps-per-core, memory under N viewers, or latency against any other runtime. `ROADMAP.md`
-records that the concurrency measurement has to come *before* any performance sentence does,
-not after.
+**Not checked, and therefore not claimed.** `BENCHMARKS.md` does hold measurements now — the
+row sweep, the wasm payload sizes, the fleet comparison and the round-trip figures — each one
+dated and carrying the app, the machine and the command that produced it. What none of them
+is, is a claim about **this runtime** in general, and three specific things are still
+unmeasured: apps-per-core, memory under N viewers, and latency against another runtime under
+identical load. `ROADMAP.md` §7 records that those have to come *before* a general performance
+sentence does, not after.

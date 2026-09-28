@@ -1,0 +1,79 @@
+# The fleet benchmark's app, in dagpane.
+#
+# Kept deliberately close to `examples/sales.toml` in shape and deliberately smaller in
+# surface: five computed cells and four panes, so that the marimo and Streamlit versions
+# beside it can be read end to end and judged idiomatic rather than taken on trust.
+#
+# `all_time_revenue` is the load-bearing cell. It reads the SOURCE, not the filter, so no
+# setting of the control can make it stale. In dagpane that is a declared edge the engine
+# reads; in a rerun runtime it is a line of the script that runs again anyway. The
+# benchmark does not assert anything about it — it is there so that the three apps are
+# genuinely the same app, including the part where they differ.
+
+[app]
+title = "Fleet benchmark"
+
+[[source]]
+name = "sales"
+csv = "sales.csv"
+
+# A number, not a slider. A slider is the nicer control and the wrong one here: the driver
+# has to set an EXACT value in three different UIs and compare against an oracle, and a
+# range input's step quantisation makes "set it to 400" a different instruction in each.
+[[input]]
+name = "min_amount"
+label = "Minimum order value"
+number = { min = 0.0, max = 800.0, default = 0.0 }
+
+[[cell]]
+name = "filtered"
+from = "sales"
+[[cell.step]]
+filter = { column = "amount", op = "ge", param = "min_amount" }
+
+[[cell]]
+name = "revenue"
+from = "filtered"
+[[cell.step]]
+group_by = { agg = [{ column = "amount", agg = "sum", as = "t" }] }
+[[cell.step]]
+scalar = { column = "t" }
+
+[[cell]]
+name = "order_count"
+from = "filtered"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "all_time_revenue"
+from = "sales"
+[[cell.step]]
+group_by = { agg = [{ column = "amount", agg = "sum", as = "t" }] }
+[[cell.step]]
+scalar = { column = "t" }
+
+[[cell]]
+name = "by_region"
+from = "filtered"
+[[cell.step]]
+group_by = { by = ["region"], agg = [{ column = "amount", agg = "sum", as = "revenue" }] }
+[[cell.step]]
+sort = { column = "revenue", descending = true }
+
+[[pane]]
+cell = "revenue"
+metric = { label = "Revenue", decimals = 2 }
+
+[[pane]]
+cell = "order_count"
+metric = { label = "Orders" }
+
+[[pane]]
+cell = "all_time_revenue"
+metric = { label = "All-time revenue", decimals = 2 }
+
+[[pane]]
+cell = "by_region"
+title = "Revenue by region"
+table = { max_rows = 10 }

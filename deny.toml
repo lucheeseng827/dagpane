@@ -39,6 +39,16 @@ allow = [
     # arrived with the Arrow backend and was not caught then, because this gate runs on the
     # public mirror and the mirror had never been synced.
     "CC0-1.0",
+    # webpki-roots, via rustls <- ureq <- crates/connect's `http` feature. This is the
+    # Mozilla CA root store: a list of certificates, not code, under a permissive DATA
+    # licence with no condition on a binary that embeds it. Listed rather than granted as an
+    # exception, for the same reason Unicode-3.0 is — a reader should see in the allowlist
+    # everything that ships.
+    #
+    # NOTE this is reachable only with `--features http`, and `[graph] all-features = true`
+    # above is what makes this gate see it at all. A default build links no TLS stack and no
+    # root store; that is checked separately by the `invariants` job.
+    "CDLA-Permissive-2.0",
 ]
 # `unicode-ident` is `(MIT OR Apache-2.0) AND Unicode-3.0`; the Unicode-3.0 half is listed
 # above rather than granted as an exception, because it applies to data tables that ship in

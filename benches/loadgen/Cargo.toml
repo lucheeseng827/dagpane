@@ -1,0 +1,43 @@
+# The protocol-level load generator.
+#
+# A STANDALONE cargo project with its own lock, deliberately outside the module's workspace
+# even though it is a Rust binary in the same tree. The workspace header says why in full:
+# that resolution is fixed because the product's claim is a COUNT, and a benchmark tool's
+# dependencies have no business being able to move it. This project's lock IS committed —
+# unlike the wasm-engines probe beside it, which exists to re-resolve — because a load
+# generator whose own dependencies drift is a load generator whose numbers cannot be compared
+# across two runs.
+#
+#   cargo build --release --manifest-path benches/loadgen/Cargo.toml
+#
+[workspace]
+
+[package]
+name = "dagpane-loadgen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Drives dagpane's WebSocket directly: no browser per viewer, so the generator is not the thing being measured."
+
+[[bin]]
+name = "dagpane-loadgen"
+path = "src/main.rs"
+
+[dependencies]
+# The same WebSocket client `crates/serve`'s own socket tests use, for the same reason: the
+# protocol is the product's visible surface, and a generator that spoke a reimplementation of
+# it would be measuring the reimplementation.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync"] }
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+
+# Release, because a debug-built load generator IS the bottleneck. Not `opt-level = "z"` like
+# the product profile: this binary is never shipped and never measured for size, and `3` is
+# what keeps it out of the way of what is.
+[profile.release]
+opt-level = 3
+lto = "thin"

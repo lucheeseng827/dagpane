@@ -280,7 +280,7 @@ follows is an intellectual debt ledger, and it is a real one.
 |---|---|---|---|
 | **salsa** — *and this is also "the rust-analyzer red-green algorithm"; they are the same codebase, published by rust-analyzer's maintainer Lukas Wirth, and presenting them as two entries is an error* | 0.28.2, published 2026-08-03; Apache-2.0 OR MIT; 7,957,243 lifetime / 2,254,440 downloads in 90 days; self-described *"(experimental)"* | **Backdating** — stop propagating when a recomputed value equals the previous one. dagpane's digest comparison is that idea at cell granularity, and it is the single mechanism that makes an over-declared edge cost one recomputation instead of a cascade. `crates/core/src/session.rs` is where it lives. | The **demand-driven pull** discipline and the global revision counter. dagpane pushes dirty marks over the structural closure and evaluates eagerly in ascending `height`; salsa validates lazily on demand. dagpane also did not take salsa's compile-time query set — this graph is built at run time from a manifest — nor **durability tiers**, which would be the right answer to "a 600-row CSV source should never be revalidated because a slider moved" and are not built. |
 | **comemo** (Typst's engine) | 0.5.1, 2026-01-29; MIT OR Apache-2.0; 2,763,162 lifetime / 1,121,750 in 90 days | **Nothing, in v0.1.0.** Recorded here because it is the idea this project most owes and has not paid: `#[track]` makes a type's *accesses* observable and `#[memoize]` reuses a cached result when only untouched parts of an argument changed. Applied to a table, that is column-level provenance — a cell reading 3 of 200 columns not invalidating when column 47 moves. | All of it, for now. dagpane invalidates at whole-value granularity: change one cell of a `Table` and every cell reading that table recomputes. comemo's global cache with coarse eviction would also be wrong for a multi-session server even if the mechanism were adopted. This is the gap POSITIONING.md's condition 3 is about, and it is not closed. |
-| **Shiny's reactive graph (R, 2012)** — and py-shiny 1.6.0 | py-shiny 1.6.0, 2026; 259,860 dl/30d | The **origin of the whole idea** in a data-app framework, and the credit belongs here rather than to marimo. Also the demonstration that a reactive graph is worth *inspecting*: Shiny 1.6.0's OpenTelemetry export is the ancestor of `dagpane explain`. | **Read-time dependency capture**, which is Shiny's actual mechanism and leptos's — the reader is recorded when a value is read, so the graph is exact and needs no analysis. The dossier this module was built from recommended it explicitly. dagpane went the other way, on purpose: read-time capture means the graph exists only after a run, so a cycle is a run-time surprise, the graph cannot be printed before it executes, and it cannot be built once and shared immutably across sessions. ADR-0002 records that decision and the cost it accepts — an over-declared edge — rather than pretending there is none. |
+| **Shiny's reactive graph (R, 2012)** — and py-shiny 1.6.0 | py-shiny 1.6.0, 2026; 259,860 dl/30d | The **origin of the whole idea** in a data-app framework, and the credit belongs here rather than to marimo. Also the demonstration that a reactive graph is worth *inspecting*: Shiny 1.6.0's OpenTelemetry export is the ancestor of `dagpane explain`. | **Read-time dependency capture**, which is Shiny's actual mechanism and leptos's — the reader is recorded when a value is read, so the graph is exact and needs no analysis. The dossier this module was built from recommended it explicitly. dagpane went the other way, on purpose: read-time capture means the graph exists only after a run, so a cycle is a run-time surprise, the graph cannot be printed before it executes, and it cannot be built once and shared immutably across sessions. ADR-0001 records that decision and the cost it accepts — an over-declared edge — rather than pretending there is none. |
 | **Observable's runtime** | Framework 1.13.4, last npm publish 2026-03-02 | The **topologically-sorted cell dataflow** shape. dagpane's ascending-`height` pass is the same family of answer to the same glitch problem: evaluate in an order where every input is final before its consumer runs. | Framework's build-time data-loader model, which is a different product — snapshots computed once at build, not recomputed per interaction. |
 | **Adapton** | 0.3.31, last published 2019-12-22; 435 downloads in 90 days; MPL-2.0; dead | The **papers** — the Demanded Computation Graph, and **nominal matching**: naming allocations so a re-execution reuses the same node identity instead of allocating a fresh one. | The crate, which would be a finding in any review. And the mechanism, which v0.1.0 does not need: dagpane's graph is built once and never changes shape at run time, so node identity is trivially stable. The problem nominal Adapton names arrives the moment a manifest can add or remove cells while a session is live, and that is the day to read the papers properly. |
 | **differential-dataflow / timely** | dd 0.25.1 (2026-07-15), timely 0.31.0 (2026-07-14); MIT; 60,589 / 70,720 downloads per 90 days | Nothing yet. The correct model for incrementality *inside* an operator — a changed row updating a join or aggregate in time proportional to the change — if dagpane ever grows a live table. | The core. DD requires the whole computation expressed in DD operators; a dagpane cell is an opaque `Fn(Inputs) -> Result<Value, CellError>` that DD cannot differentiate, so the cost of arrangements and traces would arrive with none of the benefit. Its per-dataflow memory footprint is also hostile to many concurrent sessions. |
@@ -322,16 +322,28 @@ POSITIONING.md rather than here.
 
 **"You are asking a data scientist to write Rust."** Partly. The manifest path
 (`examples/sales.toml`) means an app is TOML — sources, inputs, cells with a pipeline of
-seven verbs (`filter`, `select`, `sort`, `limit`, `group_by`, `scalar`, `count`), and panes —
-with no Rust in it. But the vocabulary is seven verbs, not SQL and not an expression
-language, and the moment an app needs an eighth the author is writing a `GraphBuilder::cell`
-closure in Rust. The manifest is deliberately not an expression language: its job is to
-produce *edges*, and a dependency inferred wrongly from SQL text by a regular expression is
-a wrong app. That is a defensible reason and it is also a real ceiling.
+nine verbs (`filter`, `derive`, `join`, `select`, `sort`, `limit`, `group_by`, `scalar`,
+`count`), and panes — with no Rust in it, **or as a `select` statement**, which is parsed and
+lowered to those same nine verbs rather than run by a second engine (ADR-0005). So
+`margin = revenue - cost`, "put the deploy count next to the error budget" and a
+four-aggregate group-by are all things the manifest can now say. What it cannot say is an
+aggregate inside an expression, a window function, a subquery, a `with` clause, a `having`, a
+`full` outer join or a join on anything but equality — the dialect is closed on purpose, and an
+author who knows SQL will hit its edges. Past them, the author is writing a
+`GraphBuilder::cell` closure in Rust. Even inside SQL the edge rule does not bend: the tables
+come from the resolved parse tree and never from scanning the text, and a control is written
+`:name`. That is a defensible position and the ceiling above it is still real.
 
-**"v0.1.0 has no authentication."** Correct. `dagpane run` binds 127.0.0.1 and `--host`
-anything else prints a warning. Sessions are per-connection: closing the tab discards one,
-and there is no store, no eviction, no TTL and no reconnection token. That removes the
-sticky-session problem by having no state worth preserving across a reconnect, which is a
-smaller and more honest claim than making session state serialisable — a thing this project
-has not built. SECURITY.md is the place for the rest.
+**"v0.1.0 has no authentication."** It did not; 0.1.1 has an optional one. `--auth-jwks`
+verifies OIDC id tokens against a JWKS file, so the process still makes no outbound request,
+and without it `dagpane run` binds 127.0.0.1 and `--host` anything else prints a warning. The
+narrower claim is the one worth holding onto: access is per **app** and never per pane, an
+accepted connection is not logged, and a token cannot be revoked before it expires.
+
+Sessions are still per-connection: closing the tab discards one, and there is no store, no
+eviction, no TTL and no server-side resumption token. The viewer's own control values ride in
+their page's URL fragment instead, which is what makes a filtered dashboard a link without
+making it a thing to name and guard. That removes the sticky-session problem by having no
+state worth preserving across a reconnect — a smaller and more honest claim than making
+session state serialisable, which this project still has not built. SECURITY.md is the place
+for the rest.

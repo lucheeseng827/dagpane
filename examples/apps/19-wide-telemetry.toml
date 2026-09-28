@@ -1,0 +1,192 @@
+# A host fleet's scrape, one column per metric — the app sub-node invalidation exists for.
+#
+# `host_metrics.csv` is 122 columns wide because nobody designed it: an exporter emits a
+# metric per core, per device, per interface, per mount, and the warehouse job pivots the lot
+# into one row per host per scrape. This page reads **five** of those columns. The other
+# hundred and seventeen are carried because dropping them would mean deciding in advance
+# which metric nobody will ever ask about.
+#
+# What to look at here is the *data* moving, not a control.
+#
+# **A column nothing reads costs nothing:**
+#
+#     dagpane explain examples/apps/19-wide-telemetry.toml --change-column metrics.disk_sdb_write_ops
+#       → recomputed 0 of 11 cells
+#
+# The table changed, every cell was still *visited* — they all declare an edge to `metrics`
+# and the engine cannot know better until it looks — and not one ran. Whole-value
+# invalidation cannot express that: to it, the table changed.
+#
+# **A column three cells filter on can also cost nothing**, and this is the second, harder
+# half. `--set` settles the slider in its own pass; the column change is what gets measured.
+#
+#     ... --set busy_cpu=40 --change-column metrics.cpu0_user   → recomputed 0 of 11 cells
+#     ... --set busy_cpu=35 --change-column metrics.cpu0_user   → recomputed 4 of 11, 3 panes
+#
+# Same column, same edit, same three cells filtering on it. At a floor of 40 no value crosses
+# it — 129 of 204 rows clear the floor before and after — so the *rows* are the same and the
+# cells cannot have a different answer. At 35, three rows cross, and the cells run. What the
+# engine compares is not the column but the question asked of it.
+#
+# **The same column again, asked a different question.** `busiest_ten_memory` ranks the scrape
+# by `cpu0_user` and averages memory over the top ten. Read the 35 line: `busy_scrapes`,
+# `memory_by_host` and `hosts_present` all ran, because their rows moved — and
+# `busiest_ten_memory` was **reused**, because a nudge to every value leaves the ranking
+# exactly where it was. One column, one edit, one pass: the filters' answer moved and the
+# sort's did not.
+#
+# Note what the 35 line also shows: `hosts_present` ran and produced the value it already
+# held, so nothing below it ran. The mechanisms stack.
+
+[app]
+title = "Host fleet"
+subtitle = "17 hosts, 12 scrapes each, 122 columns — five of them read"
+
+[[source]]
+name = "metrics"
+csv = "../data/host_metrics.csv"
+
+[[input]]
+name = "busy_cpu"
+label = "CPU user% at or above"
+slider = { min = 0.0, max = 100.0, step = 5.0, default = 0.0 }
+
+# ── the pipeline ──────────────────────────────────────────────────────────────────────
+#
+# Every cell reads `metrics` directly rather than a shared filtered copy. That is not a
+# stylistic choice, it is the one the width forces: a materialised 122-column intermediate
+# would be a cell that depends on all 122 columns, and everything below it would inherit
+# that. Reading the source and filtering per cell keeps each cell's dependency down to the
+# columns it actually names — which is the whole of what this page is demonstrating.
+
+# Reads no column at all. A row count depends on which rows are there and on nothing in
+# them, so all 122 columns can move and this cell still reuses; add a scrape and it does not.
+[[cell]]
+name = "scrapes"
+from = "metrics"
+[[cell.step]]
+count = true
+
+# Reads `cpu0_user` — and only because that column decides which rows survive, never because
+# a value of it is displayed. The row set is a dependency exactly as much as a shown number.
+[[cell]]
+name = "busy_scrapes"
+from = "metrics"
+[[cell.step]]
+filter = { column = "cpu0_user", op = "ge", param = "busy_cpu" }
+[[cell.step]]
+count = true
+
+# Reads three: `cpu0_user` to filter, `host` to group, `mem_available_bytes` to average.
+[[cell]]
+name = "memory_by_host"
+from = "metrics"
+[[cell.step]]
+filter = { column = "cpu0_user", op = "ge", param = "busy_cpu" }
+[[cell.step]]
+group_by = { by = ["host"], agg = [
+  { agg = "count", as = "scrapes" },
+  { column = "mem_available_bytes", agg = "mean", as = "free_bytes" },
+] }
+[[cell.step]]
+sort = { column = "free_bytes" }
+
+[[cell]]
+name = "tightest_host"
+from = "memory_by_host"
+[[cell.step]]
+scalar = { column = "host" }
+
+# Reads exactly one column of the 122. Move any other and this does not run.
+[[cell]]
+name = "ingress"
+from = "metrics"
+[[cell.step]]
+group_by = { agg = [{ column = "net_eth0_rx_bytes", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "peak_load"
+from = "metrics"
+[[cell.step]]
+group_by = { agg = [{ column = "load1", agg = "max", as = "peak" }] }
+[[cell.step]]
+scalar = { column = "peak" }
+
+# The set of hosts above the floor. Raise the CPU floor a little and the same hosts are
+# usually still there, so this recomputes to the value it already held and its pane is not
+# repainted — the lesson `sales.toml` teaches, on a frame twenty times wider.
+[[cell]]
+name = "hosts_present"
+from = "metrics"
+[[cell.step]]
+filter = { column = "cpu0_user", op = "ge", param = "busy_cpu" }
+[[cell.step]]
+group_by = { by = ["host"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["host"]
+[[cell.step]]
+sort = { column = "host" }
+
+[[cell]]
+name = "host_count"
+from = "hosts_present"
+[[cell.step]]
+count = true
+
+# Ranks the scrape by one column and never shows it. What this cell depends on is the *order*
+# `cpu0_user` put the rows in, plus the memory column it averages — so a change to the CPU
+# readings that leaves the ranking standing cannot move it, and it does not run. That is the
+# constraint the filters above make on *which rows*, made on *what order* instead.
+[[cell]]
+name = "busiest_ten_memory"
+from = "metrics"
+[[cell.step]]
+sort = { column = "cpu0_user", descending = true }
+[[cell.step]]
+limit = 10
+[[cell.step]]
+group_by = { agg = [{ column = "mem_available_bytes", agg = "mean", as = "free" }] }
+[[cell.step]]
+scalar = { column = "free" }
+
+# ── the page ──────────────────────────────────────────────────────────────────────────
+
+[[pane]]
+cell = "scrapes"
+metric = { label = "Scrapes" }
+
+[[pane]]
+cell = "busy_scrapes"
+metric = { label = "Scrapes above the floor" }
+
+[[pane]]
+cell = "host_count"
+metric = { label = "Hosts" }
+
+[[pane]]
+cell = "tightest_host"
+metric = { label = "Least free memory" }
+
+[[pane]]
+cell = "busiest_ten_memory"
+metric = { label = "Free memory, ten busiest scrapes", suffix = " B", decimals = 0 }
+
+[[pane]]
+cell = "ingress"
+metric = { label = "eth0 ingress", suffix = " B" }
+
+[[pane]]
+cell = "peak_load"
+metric = { label = "Peak load1", decimals = 2 }
+
+[[pane]]
+cell = "memory_by_host"
+title = "Free memory by host"
+bar = { label_column = "host", value_column = "free_bytes" }
+
+[[pane]]
+cell = "hosts_present"
+title = "Hosts present"
+table = { max_rows = 20 }

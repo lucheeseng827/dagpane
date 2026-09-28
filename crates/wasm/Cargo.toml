@@ -1,0 +1,38 @@
+# Explicit fields, no `workspace = true` inheritance — same reason as the other crates.
+[package]
+name = "dagpane-wasm"
+version = "0.1.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/dagpane"
+rust-version = "1.85"
+description = "The dagpane engine in a browser: the same manifest, the same nine verbs and the same patch protocol, with no server in the loop."
+
+# `cdylib` is what a browser instantiates. `rlib` is what `cargo test` links, and it is not a
+# convenience: everything interesting in this crate is in `engine`, which is ordinary safe
+# Rust and is tested on the host like any other module. Only the pointer marshalling is
+# wasm-only, and that is the part with the least logic in it.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# NO wasm-bindgen, and that is a decision rather than an omission.
+#
+# The interface this crate needs is one JSON string in and one JSON string out. wasm-bindgen
+# would bring a proc-macro dependency tree, a `wasm-bindgen-cli` version that has to match it
+# exactly, and a post-build step — into a repository whose client is "one file, no build step,
+# no package manager, nothing fetched at run time" and whose published numbers depend on a
+# pinned dependency set. What replaces it is about forty lines of `extern "C"` over linear
+# memory in `abi.rs` and about the same again of JavaScript in `dagpane.js`.
+#
+# `cargo build --target wasm32-unknown-unknown --release` is the whole build. If this crate
+# ever needs to pass structured values rather than bytes — a `Frame` shared with the page
+# without a copy, say — that trade changes and this comment should be the first thing revisited.
+[dependencies]
+# `default-features = false` drops the Arrow backend. ARCHITECTURE.md §6 establishes the two
+# backends are observably identical, so this is a size knob and never a behaviour one — and
+# in a browser the size knob is the whole argument. `BENCHMARKS.md` has what Arrow weighs
+# compiled for wasm32 (1.6 MiB raw) against what this crate weighs without it.
+dagpane-app = { path = "../app", version = "0.1.1", default-features = false }
+dagpane-core = { path = "../core", version = "0.1.1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

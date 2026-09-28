@@ -1,0 +1,38 @@
+# Explicit fields, no `workspace = true` inheritance — same reason as the other crates.
+[package]
+name = "dagpane-connect"
+version = "0.1.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/dagpane"
+rust-version = "1.85"
+description = "Where a dagpane source's rows come from: a file, a URL, or a read-only SQL query, behind one trait with a cheap staleness check."
+
+# The ONLY crate in the tree permitted a network client, and both are off by default.
+#
+# The invariant this replaces was "no HTTP client anywhere in the build", and it was worth
+# more than the convenience it cost: a data-app runtime that can phone home is not one
+# anybody self-hosts. What makes weakening it acceptable is that the client is still not in
+# any DEFAULT build — `cargo build` of this workspace links no HTTP stack and no database
+# driver — and the CI invariant now names this file as the one place either may appear.
+# Anywhere else is still a build failure.
+[features]
+default = []
+# A URL returning CSV. `ureq` rather than `reqwest`: blocking, so nothing below `serve` needs
+# an async runtime, and `crates/core`'s "no tokio below serve" rule survives a source that
+# reads a network.
+http = ["dep:ureq"]
+# Read-only Postgres. `postgres` (the synchronous rust-postgres client) for the same reason.
+sql = ["dep:postgres"]
+
+[dependencies]
+dagpane-core = { path = "../core", version = "0.1.1" }
+
+# rustls, no native-tls: one TLS story, no system OpenSSL to find at build time or at run
+# time in a `scratch` image. `json` is off — a source hands back rows, and parsing them is
+# this crate's own job.
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+postgres = { version = "0.19", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

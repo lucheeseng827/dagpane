@@ -1,0 +1,196 @@
+# EXEC / FINANCE — "which accounts are worth serving, once support and infrastructure are
+# taken off the top?"
+#
+# The mechanic: `mean` over a cost column with a `prefix` on the metric, plus the one thing
+# that makes this page worth loading in front of a board — `book_revenue` and `book_accounts`
+# read the source, so the portfolio totals are a fixed reference point that no control here
+# can move. Every other number on the page is relative to two numbers that are provably
+# untouched.
+
+[app]
+title = "Account economics"
+subtitle = "360 accounts across three plans"
+
+[[source]]
+name = "accounts"
+csv = "../data/accounts.csv"
+
+[[input]]
+name = "min_revenue"
+label = "Monthly revenue at least"
+slider = { min = 0.0, max = 6000.0, step = 250.0, default = 0.0 }
+
+[[input]]
+name = "plan"
+label = "Plan"
+select = { options = ["all", "starter", "growth", "scale"], default = "all" }
+
+[[input]]
+name = "region"
+label = "Region"
+select = { options = ["all", "north", "south", "east", "west"], default = "all" }
+
+[[cell]]
+name = "scoped"
+from = "accounts"
+[[cell.step]]
+filter = { column = "monthly_revenue", op = "ge", param = "min_revenue" }
+[[cell.step]]
+filter = { column = "plan", op = "eq", param = "plan", skip_when = "all" }
+[[cell.step]]
+filter = { column = "region", op = "eq", param = "region", skip_when = "all" }
+
+[[cell]]
+name = "account_count"
+from = "scoped"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "revenue"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "monthly_revenue", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "cost_to_serve"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [
+  { column = "support_cost", agg = "sum", as = "support" },
+  { column = "infra_cost", agg = "sum", as = "infra" },
+] }
+
+[[cell]]
+name = "support_spend"
+from = "cost_to_serve"
+[[cell.step]]
+scalar = { column = "support" }
+
+[[cell]]
+name = "infra_spend"
+from = "cost_to_serve"
+[[cell.step]]
+scalar = { column = "infra" }
+
+[[cell]]
+name = "mean_revenue"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "monthly_revenue", agg = "mean", as = "mean" }] }
+[[cell.step]]
+scalar = { column = "mean" }
+
+[[cell]]
+name = "by_plan"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["plan"], agg = [
+  { agg = "count", as = "accounts" },
+  { column = "monthly_revenue", agg = "sum", as = "revenue" },
+  { column = "support_cost", agg = "mean", as = "mean_support" },
+  { column = "infra_cost", agg = "mean", as = "mean_infra" },
+] }
+[[cell.step]]
+sort = { column = "revenue", descending = true }
+
+[[cell]]
+name = "by_region"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["region"], agg = [
+  { agg = "count", as = "accounts" },
+  { column = "monthly_revenue", agg = "mean", as = "mean_revenue" },
+] }
+[[cell.step]]
+sort = { column = "region" }
+
+[[cell]]
+name = "heaviest"
+from = "scoped"
+[[cell.step]]
+sort = { column = "support_cost", descending = true }
+[[cell.step]]
+select = ["account", "plan", "region", "monthly_revenue", "support_cost", "infra_cost", "open_tickets"]
+[[cell.step]]
+limit = 10
+
+[[cell]]
+name = "plans_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["plan"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["plan"]
+[[cell.step]]
+sort = { column = "plan" }
+
+[[cell]]
+name = "plan_count"
+from = "plans_present"
+[[cell.step]]
+count = true
+
+# The portfolio. Untouched by every control above.
+[[cell]]
+name = "book_revenue"
+from = "accounts"
+[[cell.step]]
+group_by = { agg = [{ column = "monthly_revenue", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "book_accounts"
+from = "accounts"
+[[cell.step]]
+count = true
+
+[[pane]]
+cell = "revenue"
+metric = { label = "Revenue in view", prefix = "$", decimals = 0 }
+
+[[pane]]
+cell = "mean_revenue"
+metric = { label = "Mean per account", prefix = "$", decimals = 0 }
+
+[[pane]]
+cell = "support_spend"
+metric = { label = "Support cost", prefix = "$", decimals = 0 }
+
+[[pane]]
+cell = "infra_spend"
+metric = { label = "Infrastructure cost", prefix = "$", decimals = 0 }
+
+[[pane]]
+cell = "account_count"
+metric = { label = "Accounts in view" }
+
+[[pane]]
+cell = "plan_count"
+metric = { label = "Plans" }
+
+[[pane]]
+cell = "book_revenue"
+metric = { label = "Whole book", prefix = "$", decimals = 0 }
+
+[[pane]]
+cell = "book_accounts"
+metric = { label = "All accounts" }
+
+[[pane]]
+cell = "by_plan"
+title = "Revenue by plan"
+bar = { label_column = "plan", value_column = "revenue" }
+
+[[pane]]
+cell = "by_region"
+title = "By region"
+table = { max_rows = 5 }
+
+[[pane]]
+cell = "heaviest"
+title = "Heaviest to serve"
+table = { max_rows = 10 }

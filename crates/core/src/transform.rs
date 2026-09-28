@@ -3,23 +3,30 @@
 //! These exist so that an app can be written **without a compiler**: the manifest path in
 //! `dagpane-app` wires a slider to a filter and a filter to a chart, and every one of those
 //! steps is a function in this module. A Rust app can call them too, or ignore them entirely
-//! and return a [`Table`] it built any way it likes — the engine does not care where a value
-//! came from.
+//! and return a [`Table`](crate::value::Table) it built any way it likes — the engine does not
+//! care where a value came from.
 //!
-//! Deliberately small: filter, select, sort, limit, and group-by with five aggregates.
-//! That is the set the example app needs and the set whose null-handling can be stated in
-//! one paragraph. It is not a query engine and the README does not claim one.
+//! Deliberately small: filter, derive, select, sort, limit, and group-by with five
+//! aggregates. That is the set the example app needs and the set whose null-handling can be
+//! stated in one paragraph. It is not a query engine and the README does not claim one.
 //!
 //! **Nulls follow SQL, not Rust.** A null compares equal to nothing, including another
 //! null, so a filter never keeps a null row. `count` counts rows; `sum`, `mean`, `min` and
 //! `max` skip nulls and return null for a group with no non-null values. Sorting puts nulls
 //! last in both directions, because "last" is where a reader looks for missing data.
+//!
+//! [`derive()`] is the exception, and [`crate::expr`] says why at length: inside an expression
+//! a null propagates through everything, `and` and `or` included, because one rule an author
+//! can hold in their head beats a three-valued truth table they have to look up.
+
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::CellError;
 use std::sync::Arc;
 
+use crate::expr::{Expr, Row, Scope, Ty};
 use crate::frame::Frame;
 use crate::value::{Column, ColumnData, ColumnType, Value};
 
@@ -80,13 +87,19 @@ pub struct Filter {
 }
 
 fn missing_column(table: &dyn Frame, name: &str) -> CellError {
+    let names = table.column_names();
+    // The same "did you mean" the expression checker spells, through the same function: a
+    // misspelt column is a misspelt column whether it was written in a `sort` or inside a
+    // `derive`, and two implementations of that sentence is how the two drift apart.
+    let hint = crate::expr::nearest(name, names.iter().map(String::as_str))
+        .map(|n| format!(" — did you mean `{n}`?"))
+        .unwrap_or_default();
     CellError::failed(format!(
-        "no column `{name}`; the table has {}",
-        if table.width() == 0 {
+        "no column `{name}`{hint}; the table has {}",
+        if names.is_empty() {
             "no columns".to_string()
         } else {
-            table
-                .column_names()
+            names
                 .iter()
                 .map(|c| format!("`{c}`"))
                 .collect::<Vec<_>>()
@@ -143,6 +156,25 @@ pub(crate) fn compare_column_to(
 /// used with a non-text needle or against a non-text column — the two cases where the spec
 /// itself, rather than a row, is the thing that does not make sense.
 pub fn filter(table: &dyn Frame, spec: &Filter) -> Result<Arc<dyn Frame>, CellError> {
+    Ok(table.take_rows(&selection(table, spec)?))
+}
+
+/// The rows a filter keeps, in their original order — [`filter`] without the taking.
+///
+/// Split out because a **predicate constraint** needs the selection and not the frame. A cell
+/// that filters on one column and then aggregates others depends on which rows the predicate
+/// picked, and not on the values it picked them by: move a value from 500 to 600 under
+/// `>= 400` and the same rows survive, so the cell's answer cannot have changed. Recording
+/// that means recording this.
+///
+/// `filter` is `take_rows` over this, so a pipeline that needs both the frame and the
+/// selection pays for one pass and not two.
+///
+/// # Errors
+///
+/// The same two as [`filter`]: a column that does not exist, and [`Comparison::Contains`]
+/// against anything but text.
+pub fn selection(table: &dyn Frame, spec: &Filter) -> Result<Vec<usize>, CellError> {
     let idx = table
         .column_index(&spec.column)
         .ok_or_else(|| missing_column(table, &spec.column))?;
@@ -161,24 +193,49 @@ pub fn filter(table: &dyn Frame, spec: &Filter) -> Result<Arc<dyn Frame>, CellEr
                 spec.column
             )));
         }
-        let keep: Vec<usize> = (0..table.rows())
+        return Ok((0..table.rows())
             .filter(|&r| match table.value_at(r, idx) {
                 Value::Text { v } => v.contains(needle),
                 _ => false,
             })
-            .collect();
-        return Ok(table.take_rows(&keep));
+            .collect());
     }
 
-    let keep: Vec<usize> = (0..table.rows())
+    Ok((0..table.rows())
         .filter(|&r| {
             table
                 .compare_to_value(r, idx, &spec.value)
                 .map(|ord| spec.op.holds(ord))
                 .unwrap_or(false)
         })
-        .collect();
-    Ok(table.take_rows(&keep))
+        .collect())
+}
+
+/// The digest of a row selection.
+///
+/// What a predicate constraint stores and compares. Length-prefixed and in order, so a
+/// selection that gained a row, lost one, or reordered is a different digest.
+pub fn selection_digest(keep: &[usize]) -> crate::digest::Digest {
+    rows_digest(0xc1, keep)
+}
+
+/// The digest of a row **ordering**.
+///
+/// What a sort constraint stores. Tagged apart from [`selection_digest`] on purpose: a
+/// selection and a permutation can be the same list of integers while meaning entirely
+/// different things, and two constraints that could compare equal across that boundary would
+/// be a way for one to be validated by the other's answer.
+pub fn ordering_digest(order: &[usize]) -> crate::digest::Digest {
+    rows_digest(0xc2, order)
+}
+
+fn rows_digest(tag: u8, rows: &[usize]) -> crate::digest::Digest {
+    let mut h = crate::digest::Hasher::new();
+    h.tag(tag).u64(rows.len() as u64);
+    for r in rows {
+        h.u64(*r as u64);
+    }
+    h.finish()
 }
 
 /// Keep these columns, in this order. A name that is not there is an error rather than a
@@ -201,6 +258,28 @@ pub fn sort(
     column: &str,
     descending: bool,
 ) -> Result<Arc<dyn Frame>, CellError> {
+    Ok(table.take_rows(&ordering(table, column, descending)?))
+}
+
+/// The order a sort puts the rows in — [`sort`] without the taking.
+///
+/// Split out for the same reason [`selection`] was: a cell downstream of a `sort` depends on
+/// the **order the rows ended up in**, and not on the values that decided it. A column whose
+/// values all move by the same amount produces the same permutation, and a ranking that does
+/// not change cannot change any answer computed from it.
+///
+/// Stable, and that matters here rather than only aesthetically: an unstable sort could return
+/// a different permutation for the same data, and a constraint recorded against one would fail
+/// against the other for no reason a reader could see.
+///
+/// # Errors
+///
+/// [`CellError::Failed`] if the column does not exist.
+pub fn ordering(
+    table: &dyn Frame,
+    column: &str,
+    descending: bool,
+) -> Result<Vec<usize>, CellError> {
     let idx = table
         .column_index(column)
         .ok_or_else(|| missing_column(table, column))?;
@@ -221,7 +300,7 @@ pub fn sort(
             }
         }
     });
-    Ok(table.take_rows(&rows))
+    Ok(rows)
 }
 
 pub(crate) fn column_is_null(data: &ColumnData, row: usize) -> bool {
@@ -249,6 +328,414 @@ pub fn limit(table: &dyn Frame, n: usize) -> Arc<dyn Frame> {
     table.head(n)
 }
 
+/// Add one column, computed from each row by an expression.
+///
+/// The eighth verb, and the only one that *adds* to its input rather than reshaping it —
+/// which is why it takes an `Arc` where its siblings take a `&dyn`. The result shares every
+/// existing column with `table` (see [`crate::frame::with_column`]) and allocates exactly the
+/// one column it computed, so a derive over a million rows costs one column and not a frame.
+///
+/// `params` supplies the `$name` references, in an order the caller chooses and the
+/// expression does not: binding resolves each name to its position here. In a manifest that
+/// order is the order the steps first mention them, so a compiled index is stable.
+///
+/// Both the schema check and the type check happen once, before the first row is read. After
+/// that, evaluation cannot fail — every way an expression can fail to produce a number yields
+/// null instead, so one bad row is a gap in a column rather than a broken pane.
+///
+/// # Errors
+///
+/// [`CellError::Failed`] if a column the expression names does not exist here, if a parameter
+/// holds a table or a list, if an operator is applied to types it has no meaning for, or if
+/// `name` is already a column — a second column of the same name would shadow the first for
+/// every later step that looks one up by name, which is a wrong app that looks like a working
+/// one.
+pub fn derive(
+    table: &Arc<dyn Frame>,
+    name: &str,
+    expr: &Expr,
+    params: &[(String, Value)],
+) -> Result<Arc<dyn Frame>, CellError> {
+    let schema = table.schema();
+    if let Some((existing, _)) = schema.iter().find(|(c, _)| c == name) {
+        return Err(CellError::failed(format!(
+            "this table already has a column `{existing}`; a derived column needs a name of \
+             its own, because every step after this one that names `{existing}` would still \
+             find the original"
+        )));
+    }
+
+    let mut scope = Scope::new().with_columns(schema);
+    for (param, value) in params {
+        let ty = Ty::of_value(value).ok_or_else(|| {
+            CellError::failed(format!(
+                "`${param}` holds a {}, and an expression works on one row at a time; \
+                 a {} is not a value it can read",
+                value.type_name(),
+                value.type_name()
+            ))
+        })?;
+        scope = scope.with_param(param, ty);
+    }
+
+    let program = expr
+        .bind(&scope)
+        .map_err(|e| CellError::failed(format!("`{name} = {expr}`: {e}")))?;
+
+    // The parameter values, positionally, exactly as `scope` recorded their names.
+    let values: Vec<Value> = params.iter().map(|(_, v)| v.clone()).collect();
+    let mut data = ColumnData::with_capacity(program.output_type(), table.rows());
+    for row in 0..table.rows() {
+        data.push(program.eval(&FrameRow {
+            frame: &**table,
+            row,
+            params: &values,
+        }));
+    }
+    Ok(crate::frame::with_column(
+        table.clone(),
+        Column::new(name, data),
+    ))
+}
+
+/// One row of a frame, as the expression evaluator reads it.
+///
+/// Built per row; three fields and no allocation. `param` clones the parameter's value on
+/// every read, which is free for a number and one short string for text — the alternative is
+/// a lifetime on [`crate::expr::Row`] that every caller would carry to buy back an allocation
+/// a manifest makes at most a handful of per row.
+struct FrameRow<'a> {
+    frame: &'a dyn Frame,
+    row: usize,
+    params: &'a [Value],
+}
+
+impl Row for FrameRow<'_> {
+    fn column(&self, at: usize) -> Value {
+        self.frame.value_at(self.row, at)
+    }
+
+    fn param(&self, at: usize) -> Value {
+        self.params[at].clone()
+    }
+}
+
+// ── joining ────────────────────────────────────────────────────────────────────────────
+
+/// Which rows a join keeps, and what it carries across.
+///
+/// Four, and the two that are missing are missing on purpose. **`right` is `left` with the
+/// two cells swapped**, which a manifest can write and this enum therefore does not need.
+/// **`full` is not built**: nothing has needed it yet, and its one real decision — which side
+/// a key column's value comes from on a row that matched only one of them — is better made
+/// against an app that wants it than invented here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum How {
+    /// Keep the left rows that matched, widened by the right's columns.
+    Inner,
+    /// Keep every left row, widened by the right's columns — nulls where nothing matched.
+    Left,
+    /// Keep the left rows that matched. **Adds no columns and no rows**, so it is a filter
+    /// that happens to read another table: "the accounts that have a ticket".
+    Semi,
+    /// Keep the left rows that did *not* match. The other half of the same filter: "the
+    /// accounts that have no ticket".
+    Anti,
+}
+
+impl fmt::Display for How {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            How::Inner => "inner",
+            How::Left => "left",
+            How::Semi => "semi",
+            How::Anti => "anti",
+        })
+    }
+}
+
+impl How {
+    /// Whether this kind carries the right-hand table's columns across. `semi` and `anti` do
+    /// not, which is why they cost nothing but the hash map.
+    fn widens(self) -> bool {
+        matches!(self, How::Inner | How::Left)
+    }
+}
+
+/// Match rows of one table against another on equal keys.
+///
+/// The ninth verb. Its edge was never the hard part — both tables are cells the manifest
+/// names, so `dagpane graph` draws them — and every interesting decision here is about what
+/// happens when the *data* does not fit the join the author had in mind.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Join {
+    /// The key columns on the left, in order.
+    pub left_on: Vec<String>,
+    /// The key columns on the right, positionally paired with `left_on`. The right's key
+    /// columns never appear in the output: they are equal to the left's by construction, and
+    /// a second copy of a column is a collision waiting to be found by somebody else.
+    pub right_on: Vec<String>,
+    /// Which rows survive.
+    pub how: How,
+    /// Appended to every non-key column carried over from the right. Empty means none, and
+    /// then a name that appears on both sides is an error rather than a second column with
+    /// the same name.
+    pub suffix: String,
+    /// Whether one left row may match several right rows.
+    ///
+    /// **Default `false`, and that is the load-bearing decision in this file.** A right-hand
+    /// table with a duplicated key silently multiplies rows, and a chart whose total doubled
+    /// because a dimension table gained a duplicate is exactly the failure this project
+    /// exists to not have — it renders confidently and it is wrong. So the ordinary join is a
+    /// *lookup*, a duplicate key is an error that names the key, and an author who really
+    /// does mean one-to-many writes `multiple = true` and thereby tells the next reader that
+    /// the output may be longer than the left.
+    pub multiple: bool,
+}
+
+/// The columns a join produces, or why it cannot produce any.
+///
+/// **One function, two callers**: [`join`] itself, and the manifest checker, which knows both
+/// schemas before the app runs. That is the whole reason it is public — a second
+/// implementation of these rules is how the two come to disagree, and the disagreement would
+/// show up as an app that `dagpane check` passed and the run time refused.
+///
+/// # Errors
+///
+/// A sentence, for the caller to wrap in whatever error type it reports: a key column that is
+/// not there, a key pair of different types, no keys at all, or two output columns that would
+/// share a name.
+pub fn join_schema(
+    left: &[(String, ColumnType)],
+    right: &[(String, ColumnType)],
+    spec: &Join,
+) -> Result<Vec<(String, ColumnType)>, String> {
+    if spec.left_on.is_empty() {
+        return Err("a join needs at least one key column".to_string());
+    }
+    if spec.left_on.len() != spec.right_on.len() {
+        return Err(format!(
+            "a join's keys pair up positionally: {} on the left against {} on the right",
+            spec.left_on.len(),
+            spec.right_on.len()
+        ));
+    }
+
+    for (l, r) in spec.left_on.iter().zip(&spec.right_on) {
+        let lt = look_up(left, l, "the left-hand table")?;
+        let rt = look_up(right, r, "the right-hand table")?;
+        // Not widened. An `int` key against a `float` one is a data-modelling mistake, and
+        // the two ways of being lenient about it are both worse than saying so: matching
+        // across the types makes a join that works until a value stops being whole, and
+        // refusing silently makes an empty table with no explanation.
+        if lt != rt {
+            return Err(format!(
+                "key `{l}` is {lt} on the left and `{r}` is {rt} on the right; a join matches \
+                 values of one type"
+            ));
+        }
+    }
+
+    let mut out: Vec<(String, ColumnType)> = left.to_vec();
+    if spec.how.widens() {
+        for (name, ty) in right {
+            if spec.right_on.iter().any(|k| k == name) {
+                continue;
+            }
+            out.push((format!("{name}{}", spec.suffix), *ty));
+        }
+    }
+
+    // A duplicate name would leave every later step that looks one up finding the first,
+    // which is a wrong app that looks like a working one — the same rule `derive` enforces
+    // when it refuses to shadow.
+    for i in 0..out.len() {
+        if out[..i].iter().any(|(n, _)| *n == out[i].0) {
+            return Err(format!(
+                "both tables have a column `{}`; give the right-hand one a `suffix`, or \
+                 `select` it away before joining",
+                out[i].0
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn look_up(
+    schema: &[(String, ColumnType)],
+    name: &str,
+    where_: &str,
+) -> Result<ColumnType, String> {
+    if let Some((_, ty)) = schema.iter().find(|(c, _)| c == name) {
+        return Ok(*ty);
+    }
+    let hint = crate::expr::nearest(name, schema.iter().map(|(c, _)| c.as_str()))
+        .map(|n| format!(" — did you mean `{n}`?"))
+        .unwrap_or_default();
+    Err(format!(
+        "no column `{name}` in {where_}{hint}; it has {}",
+        if schema.is_empty() {
+            "no columns".to_string()
+        } else {
+            schema
+                .iter()
+                .map(|(c, _)| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    ))
+}
+
+/// Match `left` against `right` on equal keys.
+///
+/// Row order is the left's, always: a left row's position in the output is its position in
+/// the input, and under `multiple` its several matches appear together in the right's own row
+/// order. That determinism is not a nicety — an output that reordered itself between two runs
+/// over identical data would digest differently and repaint a page that did not change.
+///
+/// **A null key matches nothing**, including another null, which is SQL's rule and the one
+/// [`crate::transform`] already follows everywhere else. Under [`How::Left`] a left row with a
+/// null key keeps its row and gets nulls across; under [`How::Inner`] it is dropped.
+///
+/// [`How::Semi`] and [`How::Anti`] return `left.take_rows(…)` and allocate nothing but the
+/// hash map — they choose rows and never build a column, so a semi-join over an Arrow frame
+/// is the same Arrow frame with fewer rows.
+///
+/// # Errors
+///
+/// [`CellError::Failed`] for anything [`join_schema`] rejects, and for a duplicated right-hand
+/// key when `multiple` is false.
+pub fn join(left: &dyn Frame, right: &dyn Frame, spec: &Join) -> Result<Arc<dyn Frame>, CellError> {
+    let left_schema = left.schema();
+    let right_schema = right.schema();
+    let out_schema = join_schema(&left_schema, &right_schema, spec).map_err(CellError::failed)?;
+
+    let left_keys: Vec<usize> = spec
+        .left_on
+        .iter()
+        .map(|n| left.column_index(n).expect("join_schema resolved it"))
+        .collect();
+    let right_keys: Vec<usize> = spec
+        .right_on
+        .iter()
+        .map(|n| right.column_index(n).expect("join_schema resolved it"))
+        .collect();
+
+    // The right-hand side, bucketed by key. Rendered rather than typed, like `group_by`'s:
+    // the tag in front of each part means an `Int` 1 and the text "1" cannot land in one
+    // bucket, which matters more here than the cost of formatting does.
+    let mut index: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::with_capacity(right.rows());
+    for row in 0..right.rows() {
+        let Some(key) = key_of(right, row, &right_keys) else {
+            // A null key matches nothing, so it never enters the index at all.
+            continue;
+        };
+        index.entry(key).or_default().push(row);
+    }
+
+    if !spec.multiple && spec.how.widens() {
+        if let Some((_, rows)) = index.iter().find(|(_, rows)| rows.len() > 1) {
+            return Err(CellError::failed(format!(
+                "the right-hand table has {} rows for one key ({}), so this join would make \
+                 the table longer than it is; aggregate the right-hand side first, or say you \
+                 meant it with `multiple = true` on a `join` step",
+                rows.len(),
+                readable_key(right, rows[0], &right_keys)
+            )));
+        }
+    }
+
+    let mut pairs: Vec<(usize, Option<usize>)> = Vec::with_capacity(left.rows());
+    let mut keep: Vec<usize> = Vec::new();
+    for row in 0..left.rows() {
+        let matched = key_of(left, row, &left_keys).and_then(|k| index.get(&k));
+        match spec.how {
+            How::Semi => {
+                if matched.is_some() {
+                    keep.push(row);
+                }
+            }
+            How::Anti => {
+                if matched.is_none() {
+                    keep.push(row);
+                }
+            }
+            How::Inner => {
+                if let Some(rows) = matched {
+                    pairs.extend(rows.iter().map(|&r| (row, Some(r))));
+                }
+            }
+            How::Left => match matched {
+                Some(rows) => pairs.extend(rows.iter().map(|&r| (row, Some(r)))),
+                None => pairs.push((row, None)),
+            },
+        }
+    }
+
+    if !spec.how.widens() {
+        // A filter, so it is one: every column shared with the input, nothing built.
+        return Ok(left.take_rows(&keep));
+    }
+
+    let mut columns: Vec<Column> = Vec::with_capacity(out_schema.len());
+    for (i, (name, ty)) in out_schema.iter().enumerate().take(left_schema.len()) {
+        let mut data = ColumnData::with_capacity(*ty, pairs.len());
+        for &(l, _) in &pairs {
+            data.push(left.value_at(l, i));
+        }
+        columns.push(Column::new(name.clone(), data));
+    }
+    let mut at = left_schema.len();
+    for (j, (_, ty)) in right_schema.iter().enumerate() {
+        if right_keys.contains(&j) {
+            continue;
+        }
+        let mut data = ColumnData::with_capacity(*ty, pairs.len());
+        for &(_, r) in &pairs {
+            // `None` is an unmatched left row under `How::Left`, and a null is what it gets:
+            // "there was no row over there" is missing data, not a zero.
+            data.push(r.map(|r| right.value_at(r, j)).unwrap_or(Value::Null));
+        }
+        columns.push(Column::new(out_schema[at].0.clone(), data));
+        at += 1;
+    }
+
+    // Built through the seam, so a join over an Arrow left-hand side stays Arrow. Every column
+    // came from `pairs`, so they share a length.
+    Ok(left.same_kind(columns))
+}
+
+/// The bucket key for one row, or `None` if any part of it is null.
+fn key_of(frame: &dyn Frame, row: usize, cols: &[usize]) -> Option<String> {
+    let mut key = String::new();
+    for (n, &c) in cols.iter().enumerate() {
+        let value = frame.value_at(row, c);
+        if matches!(value, Value::Null) {
+            return None;
+        }
+        if n > 0 {
+            key.push('\u{1f}');
+        }
+        key.push_str(&render_key(&value));
+    }
+    Some(key)
+}
+
+/// One row's key as a person would write it, for the duplicate-key error. The rendered bucket
+/// key carries type tags and a separator nobody can type, which is right for a `HashMap` and
+/// wrong for a message somebody has to act on.
+fn readable_key(frame: &dyn Frame, row: usize, cols: &[usize]) -> String {
+    cols.iter()
+        .map(|&c| match frame.value_at(row, c) {
+            Value::Text { v } => format!("`{v}`"),
+            other => format!("`{}`", &render_key(&other)[1..]),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// What to compute per group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -268,6 +755,18 @@ pub enum Agg {
     Min,
     /// Largest non-null value; null for a group with none. Same typing as [`Agg::Min`].
     Max,
+}
+
+impl fmt::Display for Agg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Agg::Count => "count",
+            Agg::Sum => "sum",
+            Agg::Mean => "mean",
+            Agg::Min => "min",
+            Agg::Max => "max",
+        })
+    }
 }
 
 /// One output column of a group-by.
@@ -364,10 +863,10 @@ pub fn group_by(table: &dyn Frame, spec: &GroupBy) -> Result<Arc<dyn Frame>, Cel
         let ty = table
             .column_type(i)
             .expect("a column index the frame itself resolved");
-        let mut out = empty_column_of(ty);
+        let mut out = ColumnData::with_capacity(ty, order.len());
         for key in &order {
             let first = groups[key][0];
-            push_value(&mut out, table.value_at(first, i));
+            out.push(table.value_at(first, i));
         }
         columns.push(Column::new(spec.by[n].clone(), out));
     }
@@ -406,37 +905,6 @@ fn render_key(value: &Value) -> String {
         Value::Text { v } => format!("s{v}"),
         Value::Bool { v } => format!("b{v}"),
         other => format!("?{}", other.type_name()),
-    }
-}
-
-/// An empty owned column of a given type — the start of an output column, which is small:
-/// one row per group, not one per input row.
-fn empty_column_of(ty: ColumnType) -> ColumnData {
-    match ty {
-        ColumnType::Int => ColumnData::Int(Vec::new()),
-        ColumnType::Float => ColumnData::Float(Vec::new()),
-        ColumnType::Bool => ColumnData::Bool(Vec::new()),
-        ColumnType::Text => ColumnData::Text(Vec::new()),
-    }
-}
-
-/// Append one [`Value`] to an output column.
-///
-/// A value whose type does not match the column records a null rather than panicking. That
-/// case is unreachable through `group_by`, which builds the column from the same
-/// `column_type` the value came from; it is written this way so that a future backend
-/// reporting a type it does not store degrades to a visible null instead of taking the
-/// process down.
-fn push_value(out: &mut ColumnData, value: Value) {
-    match (out, value) {
-        (ColumnData::Int(v), Value::Int { v: x }) => v.push(Some(x)),
-        (ColumnData::Float(v), Value::Float { v: x }) => v.push(Some(x)),
-        (ColumnData::Bool(v), Value::Bool { v: x }) => v.push(Some(x)),
-        (ColumnData::Text(v), Value::Text { v: x }) => v.push(Some(x)),
-        (ColumnData::Int(v), _) => v.push(None),
-        (ColumnData::Float(v), _) => v.push(None),
-        (ColumnData::Bool(v), _) => v.push(None),
-        (ColumnData::Text(v), _) => v.push(None),
     }
 }
 
@@ -528,7 +996,7 @@ fn aggregate_from_frame(
             Ok(ColumnData::Float(out))
         }
         (ty, agg) => Err(CellError::failed(format!(
-            "cannot compute {agg:?} over a {ty} column (`{}`)",
+            "cannot compute `{agg}` over a {ty} column (`{}`)",
             spec.column
         ))),
     }
@@ -584,6 +1052,474 @@ mod tests {
             Column::int("units", vec![Some(1), Some(3), None, Some(2)]),
         ])
         .unwrap()
+    }
+
+    /// `derive` takes an `Arc` because it keeps its input rather than rewriting it.
+    fn frame(t: Table) -> Arc<dyn Frame> {
+        Arc::new(t)
+    }
+
+    fn derived(text: &str, params: &[(String, Value)]) -> Result<Arc<dyn Frame>, CellError> {
+        let expr = Expr::parse(text).expect("the test wrote a parseable expression");
+        derive(&frame(sales()), "out", &expr, params)
+    }
+
+    #[test]
+    fn derive_appends_one_column_computed_per_row() {
+        let f = derived("amount * 2", &[]).unwrap();
+        assert_eq!(f.rows(), 4);
+        assert_eq!(f.width(), 4);
+        assert_eq!(f.column_names().last().map(String::as_str), Some("out"));
+        assert_eq!(f.column_type(3), Some(ColumnType::Float));
+        assert_eq!(cell(&*f, "out", 1).as_float(), Some(60.0));
+        // And the columns it was given are still there, unchanged.
+        assert_eq!(cell(&*f, "region", 0).as_text(), Some("north"));
+    }
+
+    #[test]
+    fn derive_reads_a_parameter_by_name() {
+        let f = derived(
+            "amount * (1 - $rate)",
+            &[("rate".to_string(), Value::float(0.5))],
+        )
+        .unwrap();
+        assert_eq!(cell(&*f, "out", 1).as_float(), Some(15.0));
+    }
+
+    #[test]
+    fn a_null_row_derives_a_null_and_not_a_zero() {
+        // `units` is null in row 2. A missing measurement must not arrive at a page as 0.
+        let f = derived("units + 1", &[]).unwrap();
+        assert!(matches!(cell(&*f, "out", 2), Value::Null));
+        assert_eq!(cell(&*f, "out", 3).as_int(), Some(3));
+    }
+
+    #[test]
+    fn derive_does_not_copy_the_columns_it_was_given() {
+        // The whole reason `with_column` exists: adding a column to a wide frame must cost
+        // one column, not a frame. Two `f64` columns' worth of slack is the `Option<f64>`
+        // buffer this derive actually allocated.
+        let base = frame(sales());
+        let before = base.memory_size();
+        let f = derive(&base, "out", &Expr::parse("amount * 2").unwrap(), &[]).unwrap();
+        let one_column = 4 * std::mem::size_of::<Option<f64>>();
+        assert_eq!(f.memory_size(), before + one_column);
+        // An adapter, not a representation: a derive over an Arrow frame is still Arrow.
+        assert_eq!(f.backend(), base.backend());
+    }
+
+    #[test]
+    fn a_derived_column_filters_sorts_and_groups_like_any_other() {
+        let f = derived("amount * 2", &[]).unwrap();
+        let kept = filter(
+            &*f,
+            &Filter {
+                column: "out".to_string(),
+                op: Comparison::Gt,
+                value: Value::float(20.0),
+            },
+        )
+        .unwrap();
+        assert_eq!(kept.rows(), 1);
+        assert_eq!(cell(&*kept, "region", 0).as_text(), Some("south"));
+
+        let sorted = sort(&*f, "out", true).unwrap();
+        assert_eq!(cell(&*sorted, "out", 0).as_float(), Some(60.0));
+
+        let grouped = group_by(
+            &*f,
+            &GroupBy {
+                by: vec!["region".to_string()],
+                aggs: vec![AggSpec {
+                    column: "out".to_string(),
+                    agg: Agg::Sum,
+                    as_name: "total".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(cell(&*grouped, "total", 0).as_float(), Some(30.0));
+    }
+
+    #[test]
+    fn select_after_derive_keeps_the_derived_column_or_drops_it() {
+        let f = derived("amount * 2", &[]).unwrap();
+        let dropped = select(&*f, &["region".to_string()]).unwrap();
+        assert_eq!(dropped.column_names(), vec!["region".to_string()]);
+
+        let kept = select(&*f, &["region".to_string(), "out".to_string()]).unwrap();
+        assert_eq!(
+            kept.column_names(),
+            vec!["region".to_string(), "out".to_string()]
+        );
+        assert_eq!(cell(&*kept, "out", 1).as_float(), Some(60.0));
+
+        // The reordering path, which is the one that materialises. Same content either way.
+        let moved = select(&*f, &["out".to_string(), "region".to_string()]).unwrap();
+        assert_eq!(cell(&*moved, "out", 1).as_float(), Some(60.0));
+        assert_eq!(cell(&*moved, "region", 1).as_text(), Some("south"));
+    }
+
+    #[test]
+    fn selecting_only_the_derived_column_keeps_its_rows() {
+        let f = derived("amount * 2", &[]).unwrap();
+        let only = select(&*f, &["out".to_string()]).unwrap();
+        assert_eq!(only.rows(), 4, "the derived column lost its rows");
+        assert_eq!(only.column_names(), vec!["out"]);
+        assert_eq!(cell(&*only, "out", 1).as_float(), Some(60.0));
+    }
+
+    #[test]
+    fn two_derives_stack() {
+        let one = derived("amount * 2", &[]).unwrap();
+        let two = derive(&one, "twice", &Expr::parse("out + units").unwrap(), &[]).unwrap();
+        assert_eq!(two.width(), 5);
+        assert_eq!(cell(&*two, "twice", 1).as_float(), Some(63.0));
+        assert!(matches!(cell(&*two, "twice", 2), Value::Null));
+    }
+
+    #[test]
+    fn a_derived_column_may_not_shadow_an_existing_one() {
+        // Two columns of one name would leave every later step finding the original, which
+        // is a wrong app that looks like a working one.
+        let expr = Expr::parse("amount * 2").unwrap();
+        let e = derive(&frame(sales()), "amount", &expr, &[]).unwrap_err();
+        assert!(
+            e.to_string().contains("already has a column `amount`"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_holding_a_table_is_refused_by_name() {
+        let expr = Expr::parse("$other + 1").unwrap();
+        let e = derive(
+            &frame(sales()),
+            "out",
+            &expr,
+            &[("other".to_string(), Value::table(sales()))],
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("`$other`"), "{e}");
+        assert!(e.to_string().contains("table"), "{e}");
+    }
+
+    #[test]
+    fn a_bad_column_reference_names_the_columns_that_are_there() {
+        let e = derived("amonut * 2", &[]).unwrap_err();
+        let message = e.to_string();
+        assert!(message.contains("did you mean `amount`?"), "{message}");
+        assert!(message.contains("`units`"), "{message}");
+        // And it quotes the expression back, because the author is looking at a manifest.
+        assert!(message.contains("out = amonut * 2"), "{message}");
+    }
+
+    #[test]
+    fn deriving_over_an_empty_frame_produces_an_empty_column() {
+        let empty: Arc<dyn Frame> = Arc::new(Table::empty());
+        let f = derive(&empty, "out", &Expr::parse("1 + 1").unwrap(), &[]).unwrap();
+        assert_eq!(f.rows(), 0);
+        assert_eq!(f.width(), 1);
+    }
+
+    // ── joining ────────────────────────────────────────────────────────────────────────
+
+    /// A dimension table: one row per region, and an `east` that `sales` never mentions.
+    fn regions() -> Table {
+        Table::new(vec![
+            Column::text(
+                "region",
+                vec![
+                    Some("north".into()),
+                    Some("south".into()),
+                    Some("east".into()),
+                ],
+            ),
+            Column::int("head_count", vec![Some(3), Some(5), Some(2)]),
+            Column::text("lead", vec![Some("ana".into()), Some("bo".into()), None]),
+        ])
+        .unwrap()
+    }
+
+    fn on_region(how: How) -> Join {
+        Join {
+            left_on: vec!["region".to_string()],
+            right_on: vec!["region".to_string()],
+            how,
+            suffix: String::new(),
+            multiple: false,
+        }
+    }
+
+    #[test]
+    fn an_inner_join_widens_the_left_and_keeps_its_row_order() {
+        let f = join(&sales(), &regions(), &on_region(How::Inner)).unwrap();
+        // Row 3 of `sales` has a null region and matches nothing; `east` has no sales.
+        assert_eq!(f.rows(), 3);
+        assert_eq!(
+            f.column_names(),
+            vec!["region", "amount", "units", "head_count", "lead"]
+        );
+        assert_eq!(cell(&*f, "amount", 0).as_float(), Some(10.0));
+        assert_eq!(cell(&*f, "amount", 1).as_float(), Some(30.0));
+        assert_eq!(cell(&*f, "head_count", 0).as_int(), Some(3));
+        assert_eq!(cell(&*f, "head_count", 1).as_int(), Some(5));
+        assert_eq!(cell(&*f, "head_count", 2).as_int(), Some(3));
+    }
+
+    #[test]
+    fn the_right_hand_key_column_does_not_appear_twice() {
+        // It is equal to the left's by construction, and a second column of one name is a
+        // collision waiting to be found by somebody else.
+        let f = join(&sales(), &regions(), &on_region(How::Inner)).unwrap();
+        assert_eq!(
+            f.column_names().iter().filter(|n| *n == "region").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_left_join_keeps_every_left_row_and_fills_nulls() {
+        let f = join(&sales(), &regions(), &on_region(How::Left)).unwrap();
+        assert_eq!(f.rows(), 4);
+        // Row 3's region is null, which matches nothing — so it keeps its row and gets
+        // nothing across, rather than being dropped or matching the other null.
+        assert!(matches!(cell(&*f, "region", 3), Value::Null));
+        assert!(matches!(cell(&*f, "head_count", 3), Value::Null));
+        assert_eq!(cell(&*f, "amount", 3).as_float(), Some(1.0));
+    }
+
+    #[test]
+    fn a_null_key_matches_nothing_including_another_null() {
+        let nulls = Table::new(vec![
+            Column::text("region", vec![None]),
+            Column::int("n", vec![Some(9)]),
+        ])
+        .unwrap();
+        let inner = join(&sales(), &nulls, &on_region(How::Inner)).unwrap();
+        assert_eq!(inner.rows(), 0, "two nulls are not a match");
+        let anti = join(&sales(), &nulls, &on_region(How::Anti)).unwrap();
+        assert_eq!(anti.rows(), 4, "so every left row is unmatched");
+    }
+
+    #[test]
+    fn semi_and_anti_are_filters_that_add_nothing() {
+        let semi = join(&sales(), &regions(), &on_region(How::Semi)).unwrap();
+        assert_eq!(semi.schema(), sales().schema(), "no column was added");
+        assert_eq!(semi.rows(), 3);
+        assert_eq!(cell(&*semi, "amount", 2).as_float(), Some(5.0));
+
+        let anti = join(&sales(), &regions(), &on_region(How::Anti)).unwrap();
+        assert_eq!(anti.schema(), sales().schema());
+        assert_eq!(anti.rows(), 1, "only the null-region row is unmatched");
+        assert_eq!(cell(&*anti, "amount", 0).as_float(), Some(1.0));
+
+        // They are `take_rows` and nothing else, which is what makes them free.
+        let by_hand = Frame::take_rows(&sales(), &[0, 1, 2]);
+        assert!(same(&semi, &by_hand));
+    }
+
+    #[test]
+    fn a_duplicated_right_hand_key_is_refused_and_names_the_key() {
+        // The failure this default exists to prevent: a dimension table that gained a
+        // duplicate silently doubles a total, and the page looks fine.
+        let dupes = Table::new(vec![
+            Column::text("region", vec![Some("north".into()), Some("north".into())]),
+            Column::int("head_count", vec![Some(3), Some(4)]),
+        ])
+        .unwrap();
+        let e = join(&sales(), &dupes, &on_region(How::Inner)).unwrap_err();
+        let message = e.to_string();
+        assert!(message.contains("`north`"), "{message}");
+        assert!(message.contains("multiple = true"), "{message}");
+    }
+
+    #[test]
+    fn multiple_admits_the_fan_out_and_orders_it() {
+        let dupes = Table::new(vec![
+            Column::text("region", vec![Some("north".into()), Some("north".into())]),
+            Column::int("head_count", vec![Some(3), Some(4)]),
+        ])
+        .unwrap();
+        let mut spec = on_region(How::Inner);
+        spec.multiple = true;
+        let f = join(&sales(), &dupes, &spec).unwrap();
+        // Two north sales rows, two north dimension rows: four rows, the left's order
+        // outermost and the right's within it. Deterministic, because a join that reordered
+        // itself between runs would digest differently and repaint a page that did not move.
+        assert_eq!(f.rows(), 4);
+        let got: Vec<(f64, i64)> = (0..4)
+            .map(|r| {
+                (
+                    cell(&*f, "amount", r).as_float().unwrap(),
+                    cell(&*f, "head_count", r).as_int().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(got, vec![(10.0, 3), (10.0, 4), (5.0, 3), (5.0, 4)]);
+    }
+
+    #[test]
+    fn semi_never_fans_out_so_it_never_needs_permission_to() {
+        let dupes = Table::new(vec![
+            Column::text("region", vec![Some("north".into()), Some("north".into())]),
+            Column::int("head_count", vec![Some(3), Some(4)]),
+        ])
+        .unwrap();
+        let f = join(&sales(), &dupes, &on_region(How::Semi)).unwrap();
+        assert_eq!(f.rows(), 2, "the two north rows, once each");
+    }
+
+    #[test]
+    fn a_key_of_two_different_types_is_refused_rather_than_matched_across() {
+        let by_number = Table::new(vec![
+            Column::int("region", vec![Some(1)]),
+            Column::int("n", vec![Some(1)]),
+        ])
+        .unwrap();
+        let e = join(&sales(), &by_number, &on_region(How::Inner)).unwrap_err();
+        assert!(
+            e.to_string().contains("text on the left")
+                && e.to_string().contains("int on the right"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_missing_key_column_says_which_side_it_is_missing_from() {
+        let mut spec = on_region(How::Inner);
+        spec.left_on = vec!["regoin".to_string()];
+        let e = join(&sales(), &regions(), &spec).unwrap_err();
+        let message = e.to_string();
+        assert!(message.contains("the left-hand table"), "{message}");
+        assert!(message.contains("did you mean `region`?"), "{message}");
+
+        let mut spec = on_region(How::Inner);
+        spec.right_on = vec!["head_cont".to_string()];
+        let e = join(&sales(), &regions(), &spec).unwrap_err();
+        let message = e.to_string();
+        assert!(message.contains("the right-hand table"), "{message}");
+        assert!(message.contains("did you mean `head_count`?"), "{message}");
+    }
+
+    #[test]
+    fn a_column_on_both_sides_is_an_error_until_a_suffix_resolves_it() {
+        let clash = Table::new(vec![
+            Column::text("region", vec![Some("north".into())]),
+            Column::float("amount", vec![Some(7.0)]),
+        ])
+        .unwrap();
+        let e = join(&sales(), &clash, &on_region(How::Inner)).unwrap_err();
+        assert!(
+            e.to_string().contains("both tables have a column `amount`"),
+            "{e}"
+        );
+
+        let mut spec = on_region(How::Inner);
+        spec.suffix = "_plan".to_string();
+        let f = join(&sales(), &clash, &spec).unwrap();
+        assert_eq!(
+            f.column_names(),
+            vec!["region", "amount", "units", "amount_plan"]
+        );
+        assert_eq!(cell(&*f, "amount_plan", 0).as_float(), Some(7.0));
+    }
+
+    #[test]
+    fn keys_may_have_different_names_on_the_two_sides() {
+        let lookup = Table::new(vec![
+            Column::text("name", vec![Some("north".into()), Some("south".into())]),
+            Column::int("head_count", vec![Some(3), Some(5)]),
+        ])
+        .unwrap();
+        let spec = Join {
+            left_on: vec!["region".to_string()],
+            right_on: vec!["name".to_string()],
+            how: How::Inner,
+            suffix: String::new(),
+            multiple: false,
+        };
+        let f = join(&sales(), &lookup, &spec).unwrap();
+        // The left's name survives; the right's key is dropped, not carried and not renamed.
+        assert_eq!(
+            f.column_names(),
+            vec!["region", "amount", "units", "head_count"]
+        );
+    }
+
+    #[test]
+    fn a_composite_key_matches_on_every_part() {
+        let left = Table::new(vec![
+            Column::text("a", vec![Some("x".into()), Some("x".into())]),
+            Column::int("b", vec![Some(1), Some(2)]),
+        ])
+        .unwrap();
+        let right = Table::new(vec![
+            Column::text("a", vec![Some("x".into())]),
+            Column::int("b", vec![Some(2)]),
+            Column::text("tag", vec![Some("hit".into())]),
+        ])
+        .unwrap();
+        let spec = Join {
+            left_on: vec!["a".to_string(), "b".to_string()],
+            right_on: vec!["a".to_string(), "b".to_string()],
+            how: How::Left,
+            suffix: String::new(),
+            multiple: false,
+        };
+        let f = join(&left, &right, &spec).unwrap();
+        assert!(
+            matches!(cell(&*f, "tag", 0), Value::Null),
+            "x/1 does not match x/2"
+        );
+        assert_eq!(cell(&*f, "tag", 1).as_text(), Some("hit"));
+    }
+
+    #[test]
+    fn join_schema_is_the_schema_the_join_produces() {
+        // The invariant that lets `dagpane check` reject a bad join before the app runs:
+        // the checker and the run time call the same function.
+        for how in [How::Inner, How::Left, How::Semi, How::Anti] {
+            let spec = on_region(how);
+            let predicted = join_schema(&sales().schema(), &regions().schema(), &spec).unwrap();
+            let actual = join(&sales(), &regions(), &spec).unwrap().schema();
+            assert_eq!(predicted, actual, "{how:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_right_hand_table_is_not_an_error() {
+        let empty = Table::new(vec![
+            Column::text("region", vec![]),
+            Column::int("head_count", vec![]),
+        ])
+        .unwrap();
+        assert_eq!(
+            join(&sales(), &empty, &on_region(How::Inner))
+                .unwrap()
+                .rows(),
+            0
+        );
+        assert_eq!(
+            join(&sales(), &empty, &on_region(How::Left))
+                .unwrap()
+                .rows(),
+            4
+        );
+        assert_eq!(
+            join(&sales(), &empty, &on_region(How::Anti))
+                .unwrap()
+                .rows(),
+            4
+        );
+    }
+
+    #[test]
+    fn a_join_reads_a_derived_column_like_any_other() {
+        let derived = derived("amount * 2", &[]).unwrap();
+        let f = join(&*derived, &regions(), &on_region(How::Inner)).unwrap();
+        assert_eq!(cell(&*f, "out", 1).as_float(), Some(60.0));
+        assert_eq!(cell(&*f, "head_count", 1).as_int(), Some(5));
     }
 
     #[test]
@@ -677,6 +1613,46 @@ mod tests {
         let a = sort(&sales(), "region", false).unwrap();
         let b = sort(&sales(), "region", false).unwrap();
         assert!(same(&a, &b));
+    }
+
+    #[test]
+    fn ordering_is_what_sort_took_and_a_shifted_column_ranks_alike() {
+        // The two halves of what a sort constraint rests on. First: `ordering` is exactly the
+        // permutation `sort` applied, so recording one and taking the other cannot drift.
+        let t = sales();
+        let order = ordering(&t, "amount", false).unwrap();
+        let taken = <Table as Frame>::take_rows(&t, &order);
+        assert!(same(&taken, &sort(&t, "amount", false).unwrap()));
+
+        // Second, and the reason the constraint pays at all: a column every value of which
+        // moved by the same amount ranks the rows identically, so the ordering digest is
+        // unchanged while the column's own digest is not.
+        let shifted = Table::new(vec![Column::float(
+            "amount",
+            (0..t.rows())
+                .map(|r| cell(&t, "amount", r).as_float().map(|v| v + 1000.0))
+                .collect(),
+        )])
+        .unwrap();
+        assert_eq!(
+            ordering_digest(&ordering(&shifted, "amount", false).unwrap()),
+            ordering_digest(&order),
+            "shifting every value by the same amount must not move the ranking"
+        );
+        assert_ne!(
+            crate::frame::column_digest(&t, 1),
+            crate::frame::column_digest(&shifted, 0),
+            "...while the column itself has demonstrably moved"
+        );
+    }
+
+    #[test]
+    fn a_selection_and_an_ordering_of_the_same_rows_digest_differently() {
+        // A permutation and a selection can be the same list of integers while meaning
+        // entirely different things. Tagging them apart is what stops one constraint's answer
+        // from ever validating the other's question.
+        let rows = [0usize, 2, 5];
+        assert_ne!(selection_digest(&rows), ordering_digest(&rows));
     }
 
     #[test]

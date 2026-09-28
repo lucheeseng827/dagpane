@@ -66,9 +66,34 @@ deduplicated during the in-degree count, because a cell may legitimately name th
 twice and a doubled reverse edge would make the walk do twice the work and the in-degree
 never reach zero.
 
-The same decision runs through the manifest: there is no expression language and no SQL,
-because the manifest's job is to produce edges and every edge in a compiled app is one
-somebody typed.
+The same decision runs through the manifest: every edge in a compiled app is one somebody
+typed, because the manifest's job is to produce edges.
+
+## Amendment, 2026-09: an expression language that still declares
+
+The manifest now has a `derive` step and an expression language behind it. The decision above
+is unchanged and this is why.
+
+The thing this ADR refuses is an edge **inferred from text**. A SQL string mentioning a table
+name, or an expression in which `rate` is a column or a cell depending on what is declared
+elsewhere in the file, both have the same shape: a compiler guessing, with a wrong guess
+producing a stale number on a page that looks correct.
+
+`derive` does not guess. **A bare name in an expression is a column — data, never an edge. A
+reference to a cell is written `$name`.** The edge set of a derived column is exactly the set
+of `$` tokens the lexer produced, and the compiler builds edges from that set and reads the
+expression for nothing else. `Expr::params` is that function and `compile_cell` is its only
+caller. So:
+
+* a reader can see a derived column's dependencies by reading it, without consulting the rest
+  of the file;
+* a `$name` that resolves to nothing is a compile error (`UnknownParam`, the same one a
+  filter's `param` raises) rather than an edge that quietly does not exist;
+* adding, removing or misspelling a *column* reference cannot change the graph at all.
+
+Text the compiler cannot resolve to an edge is still refused outright rather than scanned:
+there is no SQL, no `eval`, and no way for an expression to name a table. The constraint in
+"Scope, in order of increasing danger" has not moved — only the first item on it has shipped.
 
 ## Consequences
 
@@ -93,9 +118,9 @@ run-time cycle back and cost reason 1 above.
 **A forgotten edge is the author's bug and the engine cannot detect it.** A cell that should
 declare an input and does not will serve a stale value on a page that looks correct — the
 worst failure this project can have, and one a traced runtime cannot have. That asymmetry is
-the honest reason the manifest refuses SQL and expressions: an edge inferred from text by a
-regular expression is a guess with exactly this failure mode, and a verbose edge list is
-better than a wrong one.
+the honest reason the manifest refuses SQL, and the reason its expression language marks every
+edge with a `$` instead of inferring one: an edge inferred from text by a regular expression is
+a guess with exactly this failure mode, and a verbose edge list is better than a wrong one.
 
 **`Compute` is `Send + Sync + 'static`.** The graph is shared across sessions and sessions
 across threads, and the graph outlives every session that borrows it. A closure capturing a

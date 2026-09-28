@@ -6,7 +6,7 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/dagpane"
 rust-version = "1.85"
-description = "The dagpane binary: check, graph, explain, run."
+description = "The dagpane binary: check, graph, explain, run, host."
 
 # The binary is `dagpane`, not `dagpane-cli`. The crate is named for the workspace; the
 # command is named for the product.
@@ -18,12 +18,25 @@ path = "src/main.rs"
 # actually reaches the source representation rather than stopping here.
 [features]
 default = ["arrow-sources"]
-arrow-sources = ["dagpane-app/arrow-sources", "dagpane-serve/arrow-sources"]
+arrow-sources = ["dagpane-app/arrow-sources", "dagpane-serve/arrow-sources", "dagpane-host/arrow-sources", "dep:dagpane-frame-arrow"]
+# Both OFF by default, and passed straight through: a released `dagpane` binary links an
+# HTTP client or a database driver only when somebody built it asking for one.
+http = ["dagpane-app/http"]
+sql = ["dagpane-app/sql"]
 
 [dependencies]
 dagpane-core = { path = "../core", version = "0.1.1" }
+# `refresh` picks the same source representation the manifest compiler does, so the
+# command measures the app a person will actually serve.
+dagpane-frame-arrow = { path = "../frame-arrow", version = "0.1.1", optional = true }
 dagpane-app = { path = "../app", version = "0.1.1", default-features = false }
+dagpane-host = { path = "../host", version = "0.1.1", default-features = false }
+dagpane-auth = { path = "../auth", version = "0.1.1" }
 dagpane-serve = { path = "../serve", version = "0.1.1", default-features = false }
+# `export` writes the JavaScript that drives the wasm module, which that crate carries. It
+# does NOT bring the module itself: see `export.rs` on why the `.wasm` is a path and not an
+# `include_bytes!`.
+dagpane-wasm = { path = "../wasm", version = "0.1.1" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

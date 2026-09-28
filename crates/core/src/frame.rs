@@ -66,6 +66,21 @@ pub trait Frame: fmt::Debug + Send + Sync {
     /// fast to make all three fast.
     fn take_rows(&self, keep: &[usize]) -> Arc<dyn Frame>;
 
+    /// Resident bytes this frame holds, as its own backend accounts for them.
+    ///
+    /// Required rather than defaulted, and that is the whole point of the method. A default
+    /// would have to guess — rows times a nominal width per column type — and a guess is
+    /// exactly what a caller admitting apps against a byte budget must not be handed. Every
+    /// backend can answer this exactly about its own storage and none can answer it about
+    /// anybody else's, so the trait asks and does not assume.
+    ///
+    /// What it counts: the buffers holding this frame's cells, including the heap behind
+    /// each string. What it does not count: the frame's own struct, its schema strings, or
+    /// anything a caller wrapped it in. It is therefore a figure for **comparing frames and
+    /// summing them**, never an RSS prediction — a process holds allocator slack, a graph,
+    /// a client and a socket buffer besides.
+    fn memory_size(&self) -> usize;
+
     /// Which backend this is — `"table"`, `"arrow"`, whatever a future one calls itself.
     ///
     /// Required rather than defaulted, because a default would let a new backend silently
@@ -201,20 +216,102 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
 }
 
-/// The canonical content hash for any [`Frame`].
+/// The canonical content hash for one column: its name, its type tag, and every element,
+/// tagged present-or-null.
 ///
-/// Byte-for-byte the scheme [`Table`] has always used, lifted out so that it is one
-/// definition rather than one per backend: tag, row count, column count, then per column
-/// its name, its type tag, and every element tagged present-or-null. Column names and types
-/// are hashed as well as the data, so a rename or a retype is a change even when every cell
-/// is identical.
-///
-/// It walks values through the trait, so it sees logical content and cannot see layout.
-/// That is the property that lets a dictionary-encoded frame and a plain one agree.
-pub fn digest_frame(frame: &(impl Frame + ?Sized), h: &mut Hasher) {
+/// Split out of [`digest_frame`] because sub-node invalidation compares *columns* and not
+/// frames. A cell that reads three of two hundred columns records the digests of those
+/// three; a pass that rewrites a fourth finds all three equal and the cell reuses. The
+/// frame digest is then composed from these rather than taken separately, so a frame's
+/// columns and its whole are one walk over the data and never two.
+fn digest_column_parts(
+    frame: &(impl Frame + ?Sized),
+    col: usize,
+    name: &str,
+    ty: ColumnType,
+    h: &mut Hasher,
+) {
+    h.str(name);
+    h.tag(match ty {
+        ColumnType::Int => 1,
+        ColumnType::Float => 2,
+        ColumnType::Text => 3,
+        ColumnType::Bool => 4,
+    });
+    for row in 0..frame.rows() {
+        match frame.value_at(row, col) {
+            Value::Null => {
+                h.tag(0);
+            }
+            Value::Int { v } => {
+                h.tag(1).i64(v);
+            }
+            Value::Float { v } => {
+                h.tag(1).f64(v);
+            }
+            Value::Text { v } => {
+                h.tag(1).str(&v);
+            }
+            Value::Bool { v } => {
+                // One byte, not a u64. The existing scheme hashes `bytes(&[x as u8])`
+                // and the two are not the same eight bytes — getting this wrong would
+                // have changed every digest of every table containing a bool, which is
+                // to say invalidated every cached value in every live session on the
+                // day this landed. The test below is what caught it.
+                h.tag(1).bytes(&[u8::from(v)]);
+            }
+            // A frame cell is one of the four column types by construction; the other
+            // Value variants cannot appear here. Hash a distinct tag rather than
+            // panicking, so a future column type shows up as "different" instead of
+            // taking a connection down.
+            other => {
+                h.tag(9).str(other.type_name());
+            }
+        }
+    }
+}
+
+/// One column's digest, on its own.
+pub fn column_digest(frame: &(impl Frame + ?Sized), col: usize) -> Digest {
     let schema = frame.schema();
-    h.tag(6).u64(frame.rows() as u64).u64(schema.len() as u64);
-    for (col, (name, ty)) in schema.iter().enumerate() {
+    let (name, ty) = &schema[col];
+    let mut h = Hasher::new();
+    digest_column_parts(frame, col, name, *ty, &mut h);
+    h.finish()
+}
+
+/// Every column's digest, left to right.
+///
+/// The unit sub-node invalidation compares. Computed once when a value is produced, beside
+/// the frame digest it composes into, so the granular comparison costs a slice lookup per
+/// column read and not a second walk over the table.
+pub fn column_digests(frame: &(impl Frame + ?Sized)) -> Vec<Digest> {
+    frame
+        .schema()
+        .iter()
+        .enumerate()
+        .map(|(col, (name, ty))| {
+            let mut h = Hasher::new();
+            digest_column_parts(frame, col, name, *ty, &mut h);
+            h.finish()
+        })
+        .collect()
+}
+
+/// The digest of a frame's **shape**: its row count and its whole schema, and none of its
+/// data.
+///
+/// This is what makes a column-granular reuse decision safe rather than merely narrow. A
+/// cell that reads no columns at all — `count` over an unfiltered table is exactly that —
+/// has an empty set of column digests to compare, and would reuse forever. Its key carries
+/// this as well, so a row appearing, a column being added, or a column changing type
+/// invalidates the cell even though nothing it named has moved. Cheap: O(width), never
+/// O(cells).
+pub fn shape_digest(frame: &(impl Frame + ?Sized)) -> Digest {
+    let schema = frame.schema();
+    let mut h = Hasher::new();
+    h.tag(7).u64(frame.rows() as u64).u64(schema.len() as u64);
+    for (name, ty) in &schema {
         h.str(name);
         h.tag(match ty {
             ColumnType::Int => 1,
@@ -222,37 +319,37 @@ pub fn digest_frame(frame: &(impl Frame + ?Sized), h: &mut Hasher) {
             ColumnType::Text => 3,
             ColumnType::Bool => 4,
         });
-        for row in 0..frame.rows() {
-            match frame.value_at(row, col) {
-                Value::Null => {
-                    h.tag(0);
-                }
-                Value::Int { v } => {
-                    h.tag(1).i64(v);
-                }
-                Value::Float { v } => {
-                    h.tag(1).f64(v);
-                }
-                Value::Text { v } => {
-                    h.tag(1).str(&v);
-                }
-                Value::Bool { v } => {
-                    // One byte, not a u64. The existing scheme hashes `bytes(&[x as u8])`
-                    // and the two are not the same eight bytes — getting this wrong would
-                    // have changed every digest of every table containing a bool, which is
-                    // to say invalidated every cached value in every live session on the
-                    // day this landed. The test below is what caught it.
-                    h.tag(1).bytes(&[u8::from(v)]);
-                }
-                // A frame cell is one of the four column types by construction; the other
-                // Value variants cannot appear here. Hash a distinct tag rather than
-                // panicking, so a future column type shows up as "different" instead of
-                // taking a connection down.
-                other => {
-                    h.tag(9).str(other.type_name());
-                }
-            }
-        }
+    }
+    h.finish()
+}
+
+/// The canonical content hash for any [`Frame`].
+///
+/// One definition rather than one per backend: tag, row count, column count, then each
+/// column's own digest — name, type tag, and every element tagged present-or-null. Column
+/// names and types are hashed as well as the data, so a rename or a retype is a change even
+/// when every cell is identical.
+///
+/// It walks values through the trait, so it sees logical content and cannot see layout.
+/// That is the property that lets a dictionary-encoded frame and a plain one agree.
+///
+/// **Composed from the column digests rather than taken in one stream.** The bytes this
+/// absorbs are therefore not the bytes the pre-sub-node scheme absorbed, and that is fine
+/// in a way worth stating: a digest is only ever compared against another taken by the same
+/// process, never against one written down earlier. What must not change is the *rule* —
+/// equal content, equal digest — and composing a parent from its children's digests is the
+/// standard way to keep that while making the children separately comparable.
+pub fn digest_frame(frame: &(impl Frame + ?Sized), h: &mut Hasher) {
+    let columns = column_digests(frame);
+    digest_frame_from_columns(frame.rows(), &columns, h);
+}
+
+/// [`digest_frame`] for a caller that already holds the column digests, so a value that
+/// needs both pays for the data walk once.
+pub fn digest_frame_from_columns(rows: usize, columns: &[Digest], h: &mut Hasher) {
+    h.tag(6).u64(rows as u64).u64(columns.len() as u64);
+    for d in columns {
+        h.digest(*d);
     }
 }
 
@@ -282,6 +379,10 @@ impl Frame for Table {
 
     fn take_rows(&self, keep: &[usize]) -> Arc<dyn Frame> {
         Arc::new(Table::take_rows(self, keep))
+    }
+
+    fn memory_size(&self) -> usize {
+        self.columns().iter().map(|c| c.data.memory_size()).sum()
     }
 
     fn backend(&self) -> &'static str {
@@ -396,6 +497,31 @@ mod tests {
 
     /// A rename is a change even when every cell is identical, because a client renders its
     /// header from the schema.
+    #[test]
+    fn memory_size_counts_the_buffer_and_the_strings_behind_it() {
+        // Two int columns of two rows: `Option<i64>` is 16 bytes on every target this
+        // builds for, and nothing else is counted.
+        let ints = Table::new(vec![
+            Column::int("a", vec![Some(1), Some(2)]),
+            Column::int("b", vec![None, Some(4)]),
+        ])
+        .unwrap();
+        assert_eq!(
+            Frame::memory_size(&ints),
+            4 * std::mem::size_of::<Option<i64>>()
+        );
+
+        // A text column costs its `Option<String>` slots plus the bytes each string holds,
+        // which is the part a rows-times-nominal-width guess cannot see.
+        let short = Table::new(vec![Column::text("s", vec![Some("a".into())])]).unwrap();
+        let long = Table::new(vec![Column::text("s", vec![Some("a".repeat(1000))])]).unwrap();
+        assert_eq!(
+            Frame::memory_size(&long) - Frame::memory_size(&short),
+            999,
+            "the heap behind a string is the difference between these two"
+        );
+    }
+
     #[test]
     fn a_renamed_column_digests_differently() {
         let a = Table::new(vec![Column::int("id", vec![Some(1)])]).unwrap();
@@ -633,5 +759,174 @@ impl FrameBuilder for TableBuilder {
     fn finish(self: Box<Self>) -> Arc<dyn Frame> {
         // `new` cannot fail: a caller pushes the same number of rows into every column.
         Arc::new(Table::new(self.columns).expect("columns filled to one length"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One more column, without copying the ones already there
+// ---------------------------------------------------------------------------
+
+/// A frame with one column appended.
+///
+/// Every other verb in [`crate::transform`] rewrites its input; `derive` *keeps* it and adds
+/// to it, and that difference is worth a type. Materialising the base to append would copy
+/// every column of it — which is the mistake `group_by` was rewritten to remove, and the
+/// reason the comment in `dagpane_app`'s pipeline says "an `Arc` bump, not a copy". A
+/// two-column derive over a million-row frame allocates one column, which is the one it
+/// actually computed.
+///
+/// The new column is always last, and [`Frame::backend`] still reports the base's: this is an
+/// adapter, not a representation, so a derive over an Arrow frame is still Arrow and
+/// `same_kind` still builds Arrow.
+///
+/// # Panics
+///
+/// If `column` is not exactly as long as `base` has rows. Every caller inside this crate
+/// builds the column by walking `0..base.rows()`.
+pub fn with_column(base: Arc<dyn Frame>, column: Column) -> Arc<dyn Frame> {
+    assert_eq!(
+        column.data.len(),
+        base.rows(),
+        "a derived column must have one element per row"
+    );
+    Arc::new(WithColumn {
+        base_width: base.width(),
+        base,
+        extra: column,
+    })
+}
+
+#[derive(Debug)]
+struct WithColumn {
+    base: Arc<dyn Frame>,
+    extra: Column,
+    /// Cached, because `width()` walks `schema()` and `value_at` is called once per cell.
+    base_width: usize,
+}
+
+impl WithColumn {
+    fn take_extra(&self, keep: &[usize]) -> Column {
+        let mut data = self.extra.data.empty_like();
+        for &r in keep {
+            self.extra.data.push_from(&mut data, r);
+        }
+        Column::new(self.extra.name.clone(), data)
+    }
+}
+
+impl Frame for WithColumn {
+    fn rows(&self) -> usize {
+        self.base.rows()
+    }
+
+    fn schema(&self) -> Vec<(String, ColumnType)> {
+        let mut s = self.base.schema();
+        s.push((self.extra.name.clone(), self.extra.data.column_type()));
+        s
+    }
+
+    fn value_at(&self, row: usize, col: usize) -> Value {
+        if col == self.base_width {
+            self.extra.data.value_at(row)
+        } else {
+            self.base.value_at(row, col)
+        }
+    }
+
+    fn take_rows(&self, keep: &[usize]) -> Arc<dyn Frame> {
+        Arc::new(WithColumn {
+            base_width: self.base_width,
+            base: self.base.take_rows(keep),
+            extra: self.take_extra(keep),
+        })
+    }
+
+    fn memory_size(&self) -> usize {
+        self.base.memory_size() + self.extra.data.memory_size()
+    }
+
+    fn backend(&self) -> &'static str {
+        self.base.backend()
+    }
+
+    fn same_kind(&self, columns: Vec<Column>) -> Arc<dyn Frame> {
+        self.base.same_kind(columns)
+    }
+
+    fn select_columns(&self, cols: &[usize]) -> Arc<dyn Frame> {
+        let extra_at = self.base_width;
+        let selects_extra = cols.contains(&extra_at);
+        if !selects_extra {
+            // The common shape of `derive` then `select`: the derived column was scaffolding
+            // for a filter and the projection drops it again.
+            return self.base.select_columns(cols);
+        }
+        if cols == [extra_at] {
+            // Nothing of the base survives. Handing it an empty projection would ask it for a
+            // frame with no columns, and a backend that takes its row count from its first
+            // column has none to take it from — `Table` reports zero rows while `extra` still
+            // holds one element per row, and `rows()` here delegates to the base. The two
+            // backends then disagree about the same data, which is the one thing this seam
+            // exists to stop. Reachable from `select amount * 2 as x from sales`.
+            return self.base.same_kind(vec![self.extra.clone()]);
+        }
+        if cols.last() == Some(&extra_at) && !cols[..cols.len() - 1].contains(&extra_at) {
+            // The other common shape: keep some of the base and put the derived column last,
+            // which is where `derive` put it. Still no copy of the base.
+            return Arc::new(WithColumn {
+                base_width: cols.len() - 1,
+                base: self.base.select_columns(&cols[..cols.len() - 1]),
+                extra: self.extra.clone(),
+            });
+        }
+        // A projection that moves the derived column or repeats it. Rare, and the only path
+        // here that materialises — through the base's builder, so the result is still the
+        // base's representation.
+        let schema = self.schema();
+        let mut out = Vec::with_capacity(cols.len());
+        for &c in cols {
+            let mut data = crate::value::ColumnData::with_capacity(schema[c].1, self.rows());
+            for row in 0..self.rows() {
+                data.push(self.value_at(row, c));
+            }
+            out.push(Column::new(schema[c].0.clone(), data));
+        }
+        self.base.same_kind(out)
+    }
+
+    fn width(&self) -> usize {
+        self.base_width + 1
+    }
+
+    fn column_type(&self, col: usize) -> Option<ColumnType> {
+        if col == self.base_width {
+            Some(self.extra.data.column_type())
+        } else {
+            self.base.column_type(col)
+        }
+    }
+
+    fn is_null(&self, row: usize, col: usize) -> bool {
+        if col == self.base_width {
+            crate::transform::column_is_null(&self.extra.data, row)
+        } else {
+            self.base.is_null(row, col)
+        }
+    }
+
+    fn compare_in_column(&self, col: usize, a: usize, b: usize) -> std::cmp::Ordering {
+        if col == self.base_width {
+            crate::transform::order_within_column(&self.extra.data, a, b)
+        } else {
+            self.base.compare_in_column(col, a, b)
+        }
+    }
+
+    fn compare_to_value(&self, row: usize, col: usize, rhs: &Value) -> Option<std::cmp::Ordering> {
+        if col == self.base_width {
+            crate::transform::compare_column_to(&self.extra.data, row, rhs)
+        } else {
+            self.base.compare_to_value(row, col, rhs)
+        }
     }
 }

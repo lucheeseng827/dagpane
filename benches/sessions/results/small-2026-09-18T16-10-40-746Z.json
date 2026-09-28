@@ -1,0 +1,71 @@
+{
+  "machine": {
+    "host": "vm",
+    "cpus": 4
+  },
+  "when": "2026-09-18T16:10:40.746Z",
+  "app": "examples/sales.toml",
+  "csv_bytes": 21677,
+  "settle_ms": 700,
+  "samples_per_rung": 5,
+  "rungs": [
+    {
+      "sessions": 0,
+      "rss": 6299648,
+      "pss": 4172800
+    },
+    {
+      "sessions": 1,
+      "rss": 6787072,
+      "pss": 4654080
+    },
+    {
+      "sessions": 2,
+      "rss": 6975488,
+      "pss": 4842496
+    },
+    {
+      "sessions": 4,
+      "rss": 7417856,
+      "pss": 5284864
+    },
+    {
+      "sessions": 8,
+      "rss": 8151040,
+      "pss": 6018048
+    },
+    {
+      "sessions": 16,
+      "rss": 9633792,
+      "pss": 7500800
+    },
+    {
+      "sessions": 32,
+      "rss": 12582912,
+      "pss": 10449920
+    },
+    {
+      "sessions": 64,
+      "rss": 18468864,
+      "pss": 16335872
+    },
+    {
+      "sessions": 128,
+      "rss": 30212096,
+      "pss": 28079104
+    },
+    {
+      "sessions": 256,
+      "rss": 53641216,
+      "pss": 51508224
+    },
+    {
+      "sessions": 512,
+      "rss": 100528128,
+      "pss": 98395136
+    }
+  ],
+  "marginal_rss_bytes_per_session": 183357.58625339513,
+  "marginal_pss_bytes_per_session": 183357.58625339513,
+  "fixed_rss_bytes": 6299648
+}

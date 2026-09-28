@@ -1,0 +1,157 @@
+# EXEC / FINANCE — "which accounts actually make money, and which ones only look like they do?"
+#
+# The app `15-unit-economics` could not ask this. It can put revenue and cost side by side on
+# a page, but margin is a number *per row*, and until the eighth verb there was no way to
+# write one: the answer had to be pre-computed in the CSV, in a warehouse view, or in Rust,
+# all of which move it somewhere the person reading this file cannot edit.
+#
+# The mechanic, and it is the one to take away: **a `derive` with no `$` in it is not an
+# edge.** `costed` computes margin and margin per user from columns alone, so no control on
+# this page is upstream of it — the per-row arithmetic over every account runs once, at
+# start-up, and never again. `judged` is a separate cell precisely because it *does* read a
+# control: keeping the parameterised expression out of `costed` is what keeps the expensive
+# one off the slider's path. Move the margin floor and `dagpane explain` shows `costed`
+# untouched.
+#
+# One rule worth knowing before you copy this: an account with no users would divide by zero,
+# and division by zero is null here, never an infinity — so `revenue_per_user` would read `—`
+# for it and the page would stay readable. This data happens to contain no such account, which
+# is the point: the rule is why nobody had to check.
+
+[app]
+title = "Account margins"
+subtitle = "360 accounts, margin computed per row"
+
+[[source]]
+name = "accounts"
+csv = "../data/accounts.csv"
+
+[[input]]
+name = "target_margin"
+label = "Margin floor (%)"
+slider = { min = 0.0, max = 90.0, step = 5.0, default = 50.0 }
+
+[[input]]
+name = "plan"
+label = "Plan"
+select = { options = ["all", "starter", "growth", "scale"], default = "all" }
+
+# ── the arithmetic, fenced off from every control ─────────────────────────────────────
+#
+# Bare names are columns. Nothing in these three expressions is an edge, so this cell has
+# exactly one input — the source — and a moving slider can never reach it.
+
+[[cell]]
+name = "costed"
+from = "accounts"
+[[cell.step]]
+derive = { name = "margin", expr = "monthly_revenue - support_cost - infra_cost" }
+[[cell.step]]
+derive = { name = "margin_pct", expr = "margin / monthly_revenue * 100" }
+[[cell.step]]
+derive = { name = "revenue_per_user", expr = "monthly_revenue / active_users" }
+
+# ── the one expression that reads a control ───────────────────────────────────────────
+#
+# `$target_margin` is the edge, and it is the only thing in this file that had to be typed
+# for the graph to know about it. Its own cell, so the arithmetic above stays where it is.
+
+[[cell]]
+name = "judged"
+from = "costed"
+[[cell.step]]
+derive = { name = "verdict", expr = "if(margin_pct >= $target_margin, 'clears', 'below')" }
+
+[[cell]]
+name = "scoped"
+from = "judged"
+[[cell.step]]
+filter = { column = "plan", op = "eq", param = "plan", skip_when = "all" }
+
+# ── what the page shows ───────────────────────────────────────────────────────────────
+
+[[cell]]
+name = "by_verdict"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["verdict"], agg = [
+  { agg = "count", as = "accounts" },
+  { column = "margin", agg = "sum", as = "margin" },
+] }
+[[cell.step]]
+sort = { column = "verdict" }
+
+[[cell]]
+name = "clearing"
+from = "scoped"
+[[cell.step]]
+filter = { column = "verdict", op = "eq", value = "clears" }
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "thinnest"
+from = "scoped"
+[[cell.step]]
+sort = { column = "margin_pct" }
+[[cell.step]]
+select = ["account", "plan", "region", "monthly_revenue", "margin", "margin_pct", "revenue_per_user"]
+[[cell.step]]
+limit = 10
+
+[[cell]]
+name = "mean_margin_pct"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "margin_pct", agg = "mean", as = "mean" }] }
+[[cell.step]]
+scalar = { column = "mean" }
+
+# The insensitive cell: which plans are present at all. Moving the floor cannot change the
+# set, so this recomputes, produces the value it already held, and its pane is not repainted.
+[[cell]]
+name = "plans_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["plan"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["plan"]
+[[cell.step]]
+sort = { column = "plan" }
+
+# The fence. Reads `costed`, which reads the source — so the whole book's margin is a number
+# no control on this page can move, and `dagpane graph` says so before the meeting starts.
+[[cell]]
+name = "book_margin"
+from = "costed"
+[[cell.step]]
+group_by = { agg = [{ column = "margin", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[pane]]
+cell = "book_margin"
+metric = { label = "Whole book margin", prefix = "$", decimals = 0 }
+
+[[pane]]
+cell = "clearing"
+metric = { label = "Accounts clearing the floor" }
+
+[[pane]]
+cell = "mean_margin_pct"
+metric = { label = "Mean margin", suffix = "%", decimals = 1 }
+
+[[pane]]
+cell = "by_verdict"
+title = "Margin, clearing the floor and not"
+bar = { label_column = "verdict", value_column = "margin" }
+
+[[pane]]
+cell = "plans_present"
+title = "Plans present"
+table = { max_rows = 5 }
+
+[[pane]]
+cell = "thinnest"
+title = "Thinnest margins"
+table = { max_rows = 10 }

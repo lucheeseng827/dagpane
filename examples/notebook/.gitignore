@@ -1,0 +1,4 @@
+# What the notebook writes when you run it. The panel is a build product here — the
+# authoring surface is the notebook and `dagpane_notebook.py`, not the directory they emit.
+build/
+__pycache__/

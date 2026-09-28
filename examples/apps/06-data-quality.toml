@@ -1,0 +1,129 @@
+# DATA ENGINEER — "which tables would I be embarrassed to serve a dashboard from?"
+#
+# The mechanic: a `checkbox` as a real edge. `skip_when` compares against the value the
+# filter's PARAMETER currently holds, so a toggle has to be wired with `param`, not with a
+# literal — `param = "sla_only"` plus `skip_when = false` means "unticked, do nothing; ticked,
+# keep the rows whose `missed_sla` is true". Written with a literal the step would never skip
+# and the checkbox would control nothing, which compiles, renders, and is wrong.
+
+[app]
+title = "Table health"
+subtitle = "Null rate and freshness across the warehouse"
+
+[[source]]
+name = "health"
+csv = "../data/table_health.csv"
+
+[[input]]
+name = "max_null_pct"
+label = "Null rate ceiling (%)"
+slider = { min = 0.0, max = 15.0, step = 0.5, default = 15.0 }
+
+[[input]]
+name = "sla_only"
+label = "Missed their load window only"
+checkbox = { default = false }
+
+[[input]]
+name = "domain"
+label = "Domain"
+select = { options = ["all", "core", "growth", "finance", "ml"], default = "all" }
+
+[[cell]]
+name = "scoped"
+from = "health"
+[[cell.step]]
+filter = { column = "domain", op = "eq", param = "domain", skip_when = "all" }
+
+[[cell]]
+name = "breaching"
+from = "scoped"
+[[cell.step]]
+filter = { column = "null_rate_pct", op = "gt", param = "max_null_pct" }
+
+[[cell]]
+name = "breach_count"
+from = "breaching"
+[[cell.step]]
+count = true
+
+# `param` + `skip_when = false` is the whole trick: unticked, this step is not applied at all.
+[[cell]]
+name = "late_loads"
+from = "scoped"
+[[cell.step]]
+filter = { column = "missed_sla", op = "eq", param = "sla_only", skip_when = false }
+
+[[cell]]
+name = "late_load_count"
+from = "late_loads"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "by_table"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["table_name"], agg = [
+  { column = "null_rate_pct", agg = "mean", as = "mean_null_pct" },
+  { column = "freshness_hours", agg = "max", as = "worst_freshness_h" },
+  { column = "rows", agg = "max", as = "max_rows" },
+] }
+[[cell.step]]
+sort = { column = "mean_null_pct", descending = true }
+
+[[cell]]
+name = "dirtiest"
+from = "by_table"
+[[cell.step]]
+limit = 6
+
+[[cell]]
+name = "domains_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["domain"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["domain"]
+[[cell.step]]
+sort = { column = "domain" }
+
+[[cell]]
+name = "domain_count"
+from = "domains_present"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "tables_tracked"
+from = "health"
+[[cell.step]]
+group_by = { by = ["table_name"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+count = true
+
+[[pane]]
+cell = "breach_count"
+metric = { label = "Over null ceiling" }
+
+[[pane]]
+cell = "late_load_count"
+metric = { label = "Snapshots shown" }
+
+[[pane]]
+cell = "domain_count"
+metric = { label = "Domains" }
+
+[[pane]]
+cell = "tables_tracked"
+metric = { label = "Tables tracked" }
+
+[[pane]]
+cell = "by_table"
+title = "Mean null rate by table"
+bar = { label_column = "table_name", value_column = "mean_null_pct" }
+
+[[pane]]
+cell = "dirtiest"
+title = "Worst six"
+table = { max_rows = 6 }

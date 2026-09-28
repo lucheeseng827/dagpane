@@ -1,0 +1,119 @@
+# DATA ENGINEER — "what is late right now, and whose is it?"
+#
+# The mechanic: a `number` input as a threshold you can argue with. The on-call engineer and
+# the team that owns the pipeline disagree about what "late" means; this page lets them move
+# the line and see the answer change, instead of shipping a new alert rule to find out.
+#
+# Note `runs_today` and `total_runs`: both read the source, so no threshold on this page can
+# invalidate them. The "how many runs are we even talking about" number is never recomputed.
+
+[app]
+title = "Pipeline freshness"
+subtitle = "21 days of scheduled runs"
+
+[[source]]
+name = "runs"
+csv = "../data/pipeline_runs.csv"
+
+[[input]]
+name = "late_after_hours"
+label = "Late after (hours)"
+number = { min = 0.0, max = 12.0, default = 2.0 }
+
+[[input]]
+name = "team"
+label = "Owning team"
+select = { options = ["all", "platform", "growth", "finance", "ml"], default = "all" }
+
+[[cell]]
+name = "scoped"
+from = "runs"
+[[cell.step]]
+filter = { column = "owner_team", op = "eq", param = "team", skip_when = "all" }
+
+[[cell]]
+name = "late_runs"
+from = "scoped"
+[[cell.step]]
+filter = { column = "hours_late", op = "gt", param = "late_after_hours" }
+
+[[cell]]
+name = "late_count"
+from = "late_runs"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "late_by_pipeline"
+from = "late_runs"
+[[cell.step]]
+group_by = { by = ["pipeline"], agg = [
+  { agg = "count", as = "late_runs" },
+  { column = "hours_late", agg = "max", as = "worst_hours" },
+] }
+[[cell.step]]
+sort = { column = "late_runs", descending = true }
+
+[[cell]]
+name = "worst_offenders"
+from = "late_by_pipeline"
+[[cell.step]]
+limit = 5
+
+[[cell]]
+name = "failures"
+from = "scoped"
+[[cell.step]]
+filter = { column = "status", op = "eq", value = "failed" }
+[[cell.step]]
+count = true
+
+# Insensitive to the threshold: the set of teams in the slice does not depend on how late
+# "late" is. Move the number and this stops the pass.
+[[cell]]
+name = "teams_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["owner_team"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["owner_team"]
+[[cell.step]]
+sort = { column = "owner_team" }
+
+[[cell]]
+name = "team_count"
+from = "teams_present"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "total_runs"
+from = "runs"
+[[cell.step]]
+count = true
+
+[[pane]]
+cell = "late_count"
+metric = { label = "Late runs" }
+
+[[pane]]
+cell = "failures"
+metric = { label = "Failed runs" }
+
+[[pane]]
+cell = "team_count"
+metric = { label = "Teams in slice" }
+
+[[pane]]
+cell = "total_runs"
+metric = { label = "Runs in window" }
+
+[[pane]]
+cell = "late_by_pipeline"
+title = "Late runs by pipeline"
+bar = { label_column = "pipeline", value_column = "late_runs" }
+
+[[pane]]
+cell = "worst_offenders"
+title = "Worst five"
+table = { max_rows = 5 }

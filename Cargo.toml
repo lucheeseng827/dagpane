@@ -42,7 +42,7 @@
 # keeps the engine testable without a browser in the loop.
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/app", "crates/serve", "crates/cli", "crates/frame-arrow"]
+members = ["crates/core", "crates/connect", "crates/app", "crates/auth", "crates/host", "crates/serve", "crates/cli", "crates/frame-arrow", "crates/wasm"]
 
 [workspace.package]
 version = "0.1.1"
@@ -87,8 +87,15 @@ rust-version = "1.85"
 #     built once and shared immutably across every session. See docs/adr/0002.
 #   no `tokio` anywhere below `serve` — an engine that needs an async runtime to be tested
 #     is an engine nobody tests.
-#   no HTTP client anywhere — a data app runtime that phones home is not one anybody
-#     self-hosts. CI asserts the absence.
+#   no HTTP client in `crates/auth` either, and that is the design rather than a restriction:
+#     the front door verifies tokens against a JWKS the operator supplies as a FILE, so there
+#     is no discovery request to fail at start-up, nothing to redirect, and an air-gapped
+#     install works. `ring` is crypto, not a network client.
+#   no HTTP client and no database driver in any DEFAULT build. The rule used to be "nowhere",
+#     and it was worth what it cost: a data app runtime that phones home is not one anybody
+#     self-hosts. It is now "`crates/connect` only, behind `http` and `sql`, both off" — so
+#     `cargo build` of this workspace still links neither, and CI names that one manifest as
+#     the only place either may appear. Anywhere else is still a build failure.
 # NOT inherited by the member crates. Every crate spells out its own `version`/`edition`/
 # `license`/`repository`/`rust-version` and its own dependency versions, for the reason each
 # crate manifest's header gives: cargo resolves `workspace = true` against whichever workspace
@@ -98,7 +105,10 @@ rust-version = "1.85"
 # version here, change it in the crate that uses it too.
 [workspace.dependencies]
 dagpane-core = { path = "crates/core", version = "0.1.1" }
+dagpane-connect = { path = "crates/connect", version = "0.1.1" }
+dagpane-auth = { path = "crates/auth", version = "0.1.1" }
 dagpane-app = { path = "crates/app", version = "0.1.1" }
+dagpane-host = { path = "crates/host", version = "0.1.1" }
 dagpane-serve = { path = "crates/serve", version = "0.1.1" }
 
 serde = { version = "1", features = ["derive"] }

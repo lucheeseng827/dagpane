@@ -1,0 +1,36 @@
+# Explicit fields, no `workspace = true` inheritance — same reason as the other crates.
+[package]
+name = "dagpane-auth"
+version = "0.1.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/dagpane"
+rust-version = "1.85"
+description = "The front door: verify an OIDC id token against a pinned JWKS, with the algorithm allowlist, the audience and the per-app rule all stated rather than defaulted."
+
+# **No HTTP client, and that is the design rather than a restriction.** This crate never talks
+# to the identity provider: it verifies tokens against a JWKS the operator supplies as a
+# FILE. Three things follow — an air-gapped install works, the "this runtime does not phone
+# home" invariant survives a front door intact, and there is no discovery request to fail at
+# start-up or to be redirected. Rotating keys is `cp` and a restart (or a reload), which is a
+# thing an operator already knows how to do.
+[dependencies]
+# `default-features = false` drops `use_pem`, and with it `simple_asn1`, `pem`, `num-bigint`
+# and `time`. Two reasons, and the second is load-bearing:
+#
+#   * a JWKS carries key COMPONENTS (`n`/`e`, `x`/`y`), not PEM, so the parser is dead weight;
+#   * `time 0.3.55` requires Rust 1.88 and this workspace promises 1.85. Taking the default
+#     features would have raised the MSRV of every crate here for a code path this one does
+#     not execute.
+#
+# Pinned at 9 rather than 11 for the same MSRV reason: 11 itself declares 1.88.
+jsonwebtoken = { version = "9", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Already in the tree under `jsonwebtoken`, so making it direct costs no compilation. Used
+# ONLY to generate a throwaway keypair per test: this repository does not commit keys, and a
+# test that needs one has to make it. See `tests/verify.rs`.
+ring = "0.17"
+base64 = "0.22"

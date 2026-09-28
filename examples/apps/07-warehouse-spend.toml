@@ -1,0 +1,134 @@
+# DATA ENGINEER / FinOps — "who is spending the warehouse budget, on what?"
+#
+# The mechanic: a diamond. `by_team`, `by_warehouse` and `expensive` all read `scoped`, and
+# `scoped` reads both controls. Height-ordered evaluation means `scoped` is final before any
+# of the three runs, so no pane can ever show a number computed from a half-applied filter —
+# which is the failure mode of a callback graph that fans out and does not order itself.
+
+[app]
+title = "Warehouse spend"
+subtitle = "14 days of query cost"
+
+[[source]]
+name = "queries"
+csv = "../data/warehouse_queries.csv"
+
+[[input]]
+name = "min_scanned_gb"
+label = "Minimum scanned (GB)"
+slider = { min = 0.0, max = 60.0, step = 1.0, default = 0.0 }
+
+[[input]]
+name = "warehouse"
+label = "Warehouse size"
+select = { options = ["all", "xsmall", "small", "large"], default = "all" }
+
+[[cell]]
+name = "scoped"
+from = "queries"
+[[cell.step]]
+filter = { column = "scanned_gb", op = "ge", param = "min_scanned_gb" }
+[[cell.step]]
+filter = { column = "warehouse", op = "eq", param = "warehouse", skip_when = "all" }
+
+[[cell]]
+name = "by_team"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["team"], agg = [
+  { column = "cost_usd", agg = "sum", as = "cost" },
+  { agg = "count", as = "queries" },
+  { column = "seconds", agg = "mean", as = "mean_seconds" },
+] }
+[[cell.step]]
+sort = { column = "cost", descending = true }
+
+[[cell]]
+name = "by_warehouse"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["warehouse"], agg = [
+  { column = "cost_usd", agg = "sum", as = "cost" },
+  { agg = "count", as = "queries" },
+] }
+[[cell.step]]
+sort = { column = "cost", descending = true }
+
+[[cell]]
+name = "expensive"
+from = "scoped"
+[[cell.step]]
+sort = { column = "cost_usd", descending = true }
+[[cell.step]]
+limit = 10
+[[cell.step]]
+select = ["query_id", "day", "team", "warehouse", "cost_usd", "scanned_gb"]
+
+[[cell]]
+name = "spend"
+from = "by_team"
+[[cell.step]]
+group_by = { agg = [{ column = "cost", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "query_count"
+from = "scoped"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "teams_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["team"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["team"]
+[[cell.step]]
+sort = { column = "team" }
+
+[[cell]]
+name = "team_count"
+from = "teams_present"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "window_spend"
+from = "queries"
+[[cell.step]]
+group_by = { agg = [{ column = "cost_usd", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[pane]]
+cell = "spend"
+metric = { label = "Spend in slice", prefix = "$", decimals = 2 }
+
+[[pane]]
+cell = "window_spend"
+metric = { label = "Spend, 14 days", prefix = "$", decimals = 2 }
+
+[[pane]]
+cell = "query_count"
+metric = { label = "Queries" }
+
+[[pane]]
+cell = "team_count"
+metric = { label = "Teams" }
+
+[[pane]]
+cell = "by_team"
+title = "Cost by team"
+bar = { label_column = "team", value_column = "cost" }
+
+[[pane]]
+cell = "by_warehouse"
+title = "Cost by warehouse size"
+table = { max_rows = 5 }
+
+[[pane]]
+cell = "expensive"
+title = "Ten most expensive queries"
+table = { max_rows = 10 }

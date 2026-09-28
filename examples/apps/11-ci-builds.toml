@@ -1,0 +1,159 @@
+# DEVOPS — "what is making CI slow, and what is making it a coin toss?"
+#
+# The mechanic: a cell can be insensitive on purpose. `jobs_present` is the set of job names
+# in the slice — raise the duration floor and the same jobs are still there, so the pass stops
+# at that cell rather than repainting the job list. That is the difference between "this is
+# downstream of the control" and "this actually changed", and the second is the only one that
+# should cost a repaint.
+
+[app]
+title = "CI explorer"
+subtitle = "14 days of builds across four repositories"
+
+[[source]]
+name = "builds"
+csv = "../data/ci_builds.csv"
+
+[[input]]
+name = "min_seconds"
+label = "Slower than (seconds)"
+slider = { min = 0.0, max = 1200.0, step = 30.0, default = 0.0 }
+
+[[input]]
+name = "repo"
+label = "Repository"
+select = { options = ["all", "core-api", "web", "infra", "ml-svc"], default = "all" }
+
+[[input]]
+name = "branch"
+label = "Branch"
+select = { options = ["all", "main", "pr"], default = "all" }
+
+[[cell]]
+name = "scoped"
+from = "builds"
+[[cell.step]]
+filter = { column = "duration_sec", op = "ge", param = "min_seconds" }
+[[cell.step]]
+filter = { column = "repo", op = "eq", param = "repo", skip_when = "all" }
+[[cell.step]]
+filter = { column = "branch", op = "eq", param = "branch", skip_when = "all" }
+
+[[cell]]
+name = "build_count"
+from = "scoped"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "failures"
+from = "scoped"
+[[cell.step]]
+filter = { column = "status", op = "eq", value = "failed" }
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "retried"
+from = "scoped"
+[[cell.step]]
+filter = { column = "retries", op = "gt", value = 0 }
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "by_job"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["job"], agg = [
+  { column = "duration_sec", agg = "mean", as = "mean_sec" },
+  { column = "duration_sec", agg = "max", as = "worst_sec" },
+  { column = "retries", agg = "sum", as = "retries" },
+] }
+[[cell.step]]
+sort = { column = "mean_sec", descending = true }
+
+[[cell]]
+name = "slowest_jobs"
+from = "by_job"
+[[cell.step]]
+limit = 5
+
+[[cell]]
+name = "mean_duration"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "duration_sec", agg = "mean", as = "mean_sec" }] }
+[[cell.step]]
+scalar = { column = "mean_sec" }
+
+[[cell]]
+name = "per_day"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["day_index"], agg = [
+  { column = "duration_sec", agg = "mean", as = "mean_sec" },
+] }
+[[cell.step]]
+sort = { column = "day_index" }
+
+[[cell]]
+name = "jobs_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["job"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["job"]
+[[cell.step]]
+sort = { column = "job" }
+
+[[cell]]
+name = "job_count"
+from = "jobs_present"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "all_builds"
+from = "builds"
+[[cell.step]]
+count = true
+
+[[pane]]
+cell = "build_count"
+metric = { label = "Builds shown" }
+
+[[pane]]
+cell = "failures"
+metric = { label = "Failed" }
+
+[[pane]]
+cell = "retried"
+metric = { label = "Needed a retry" }
+
+[[pane]]
+cell = "mean_duration"
+metric = { label = "Mean duration", suffix = " s", decimals = 0 }
+
+[[pane]]
+cell = "job_count"
+metric = { label = "Distinct jobs" }
+
+[[pane]]
+cell = "all_builds"
+metric = { label = "All builds, 14d" }
+
+[[pane]]
+cell = "per_day"
+title = "Mean build seconds per day"
+line = { x_column = "day_index", y_column = "mean_sec" }
+
+[[pane]]
+cell = "by_job"
+title = "Mean seconds by job"
+bar = { label_column = "job", value_column = "mean_sec" }
+
+[[pane]]
+cell = "slowest_jobs"
+title = "Five slowest"
+table = { max_rows = 5 }

@@ -1,0 +1,121 @@
+# ANALYST — "did the treatment move the number, and did it break anything else?"
+#
+# The mechanic: the two controls slice *within* the experiment, never across it, so
+# `variants_present` always holds the same two arms and the arm labels never repaint. And
+# `guardrail_latency_proxy` reads the raw source, so the one number whose job is to stay
+# still is never recomputed at all — a rerun runtime has no way to say that.
+
+[app]
+title = "Experiment readout"
+subtitle = "control vs treatment, 28 days"
+
+[[source]]
+name = "events"
+csv = "../data/web_events.csv"
+
+[[input]]
+name = "device"
+label = "Device"
+select = { options = ["all", "desktop", "mobile", "tablet"], default = "all" }
+
+[[input]]
+name = "cohort"
+label = "Signup cohort"
+select = { options = ["all", "2026-06", "2026-07", "2026-08"], default = "all" }
+
+[[cell]]
+name = "scoped"
+from = "events"
+[[cell.step]]
+filter = { column = "device", op = "eq", param = "device", skip_when = "all" }
+[[cell.step]]
+filter = { column = "cohort", op = "eq", param = "cohort", skip_when = "all" }
+
+[[cell]]
+name = "converted"
+from = "scoped"
+[[cell.step]]
+filter = { column = "step", op = "eq", value = "subscribe" }
+
+[[cell]]
+name = "by_variant"
+from = "converted"
+[[cell.step]]
+group_by = { by = ["variant"], agg = [
+  { column = "sessions", agg = "sum", as = "conversions" },
+  { column = "revenue", agg = "sum", as = "revenue" },
+  { column = "revenue", agg = "mean", as = "mean_revenue" },
+] }
+[[cell.step]]
+sort = { column = "variant" }
+
+# Insensitive: both arms are present in every slice, so this set never moves.
+[[cell]]
+name = "variants_present"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["variant"], agg = [{ agg = "count", as = "n" }] }
+[[cell.step]]
+select = ["variant"]
+[[cell.step]]
+sort = { column = "variant" }
+
+[[cell]]
+name = "arms"
+from = "variants_present"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "control_conversions"
+from = "by_variant"
+[[cell.step]]
+filter = { column = "variant", op = "eq", value = "control" }
+[[cell.step]]
+scalar = { column = "conversions" }
+
+[[cell]]
+name = "treatment_conversions"
+from = "by_variant"
+[[cell.step]]
+filter = { column = "variant", op = "eq", value = "treatment" }
+[[cell.step]]
+scalar = { column = "conversions" }
+
+# The guardrail. It reads `events`, so no control on this page can touch it.
+[[cell]]
+name = "guardrail_all_visits"
+from = "events"
+[[cell.step]]
+filter = { column = "step", op = "eq", value = "visit" }
+[[cell.step]]
+group_by = { agg = [{ column = "sessions", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[pane]]
+cell = "control_conversions"
+metric = { label = "Control" }
+
+[[pane]]
+cell = "treatment_conversions"
+metric = { label = "Treatment" }
+
+[[pane]]
+cell = "arms"
+metric = { label = "Arms" }
+
+[[pane]]
+cell = "guardrail_all_visits"
+metric = { label = "Guardrail: all visits" }
+
+[[pane]]
+cell = "by_variant"
+title = "Conversions by arm"
+bar = { label_column = "variant", value_column = "conversions" }
+
+[[pane]]
+cell = "by_variant"
+id = "arm_detail"
+title = "Arm detail"
+table = { max_rows = 10 }

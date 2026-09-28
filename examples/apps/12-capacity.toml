@@ -1,0 +1,148 @@
+# DEVOPS / PLATFORM — "can I drain a pool tonight without paging anyone?"
+#
+# The mechanic: two `number` inputs as the two halves of a question nobody agrees on. There is
+# no "correct" CPU ceiling; there is the one this conversation is using. Both feed `hot`, and
+# nothing else on the page is downstream of them — the fleet totals below are computed from
+# the source and are never looked at when the thresholds move.
+
+[app]
+title = "Cluster headroom"
+subtitle = "Four node pools across three zones"
+
+[[source]]
+name = "nodes"
+csv = "../data/nodes.csv"
+
+[[input]]
+name = "cpu_ceiling"
+label = "CPU ceiling (%)"
+number = { min = 0.0, max = 100.0, default = 75.0 }
+
+[[input]]
+name = "mem_ceiling"
+label = "Memory ceiling (%)"
+number = { min = 0.0, max = 100.0, default = 80.0 }
+
+[[input]]
+name = "pool"
+label = "Pool"
+select = { options = ["all", "general", "memory", "compute", "spot"], default = "all" }
+
+[[cell]]
+name = "scoped"
+from = "nodes"
+[[cell.step]]
+filter = { column = "pool", op = "eq", param = "pool", skip_when = "all" }
+
+[[cell]]
+name = "hot_cpu"
+from = "scoped"
+[[cell.step]]
+filter = { column = "cpu_pct", op = "gt", param = "cpu_ceiling" }
+
+[[cell]]
+name = "hot_cpu_count"
+from = "hot_cpu"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "hot_mem"
+from = "scoped"
+[[cell.step]]
+filter = { column = "mem_pct", op = "gt", param = "mem_ceiling" }
+
+[[cell]]
+name = "hot_mem_count"
+from = "hot_mem"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "hot_detail"
+from = "hot_cpu"
+[[cell.step]]
+sort = { column = "cpu_pct", descending = true }
+[[cell.step]]
+select = ["node", "pool", "zone", "cpu_pct", "mem_pct", "pods"]
+[[cell.step]]
+limit = 12
+
+[[cell]]
+name = "by_pool"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["pool"], agg = [
+  { agg = "count", as = "nodes" },
+  { column = "cpu_pct", agg = "mean", as = "mean_cpu" },
+  { column = "pods", agg = "sum", as = "pods" },
+] }
+[[cell.step]]
+sort = { column = "nodes", descending = true }
+
+[[cell]]
+name = "by_zone"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["zone"], agg = [
+  { agg = "count", as = "nodes" },
+  { column = "cost_per_hour", agg = "sum", as = "cost_per_hour" },
+] }
+[[cell.step]]
+sort = { column = "zone" }
+
+[[cell]]
+name = "node_count"
+from = "scoped"
+[[cell.step]]
+count = true
+
+# Both read the source: the fleet does not change because you moved a threshold.
+[[cell]]
+name = "fleet_size"
+from = "nodes"
+[[cell.step]]
+count = true
+
+[[cell]]
+name = "fleet_cost_per_hour"
+from = "nodes"
+[[cell.step]]
+group_by = { agg = [{ column = "cost_per_hour", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[pane]]
+cell = "hot_cpu_count"
+metric = { label = "Over CPU ceiling" }
+
+[[pane]]
+cell = "hot_mem_count"
+metric = { label = "Over memory ceiling" }
+
+[[pane]]
+cell = "node_count"
+metric = { label = "Nodes in pool" }
+
+[[pane]]
+cell = "fleet_size"
+metric = { label = "Fleet size" }
+
+[[pane]]
+cell = "fleet_cost_per_hour"
+metric = { label = "Fleet cost/hour", prefix = "$", decimals = 2 }
+
+[[pane]]
+cell = "by_pool"
+title = "Mean CPU by pool"
+bar = { label_column = "pool", value_column = "mean_cpu" }
+
+[[pane]]
+cell = "by_zone"
+title = "By zone"
+table = { max_rows = 5 }
+
+[[pane]]
+cell = "hot_detail"
+title = "Hottest nodes"
+table = { max_rows = 12 }

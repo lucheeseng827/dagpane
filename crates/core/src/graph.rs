@@ -71,15 +71,61 @@ pub struct Inputs<'a> {
     cell: &'a str,
     names: &'a [String],
     values: &'a [&'a Value],
+    reads: &'a crate::reads::ReadLog,
 }
 
 impl<'a> Inputs<'a> {
-    pub(crate) fn new(cell: &'a str, names: &'a [String], values: &'a [&'a Value]) -> Inputs<'a> {
+    pub(crate) fn new(
+        cell: &'a str,
+        names: &'a [String],
+        values: &'a [&'a Value],
+        reads: &'a crate::reads::ReadLog,
+    ) -> Inputs<'a> {
         Inputs {
             cell,
             names,
             values,
+            reads,
         }
+    }
+
+    /// Declare that this cell's output depends on only these columns of input `i`, and on
+    /// that input's shape.
+    ///
+    /// This is the sub-node claim, and it is a claim: the engine will let this cell sleep
+    /// through a change to any column not named here. Getting it wrong shows a user a stale
+    /// number on a page that looks correct, so a compute narrows only what it can account
+    /// for and calls [`Inputs::reads_whole`] for the rest. Saying nothing at all is the safe
+    /// default — see [`crate::reads`].
+    ///
+    /// Repeated calls union. Column indices are against the input frame as it was handed in.
+    pub fn reads_only_columns(&self, i: usize, cols: &[usize]) {
+        self.reads.narrow_to_columns(i, cols);
+    }
+
+    /// Declare that this cell's output depended on this rule's **answer about the rows** of
+    /// input `i`, and not on the values of the column it asked about.
+    ///
+    /// Two verbs qualify. A `filter` decides *which* rows survive; a `sort` decides *what
+    /// order* they end up in. Either way the cell downstream depends on the answer and not on
+    /// the column that produced it.
+    ///
+    /// Strictly weaker than [`Inputs::reads_only_columns`] on the same column, and correct
+    /// only when the rule can be re-run against this input and mean the same thing there: the
+    /// column has to be that input's own, unaltered, and the rows it ran over have to be that
+    /// input's rows. A caller that cannot establish both should name the column instead and
+    /// lose nothing but the saving.
+    pub fn reads_constraint(&self, i: usize, read: crate::reads::RowConstraint) {
+        self.reads.record_constraint(i, read);
+    }
+
+    /// Declare that this cell's output depends on the whole of input `i`, undoing any
+    /// narrowing and refusing any later one.
+    ///
+    /// What a compute reaches for the moment it stops being able to account for what it
+    /// touched. Costs this input its granularity and keeps the answer right.
+    pub fn reads_whole(&self, i: usize) {
+        self.reads.widen_to_whole(i);
     }
 
     /// How many inputs this cell declared. Fixed at build time, so a compute may index up to
@@ -251,6 +297,9 @@ pub(crate) enum Kind {
     Source {
         initial: Arc<crate::session::Outcome>,
         digest: crate::digest::Digest,
+        /// The source's per-column digests, when it holds a frame — taken here, once, for
+        /// the same reason `digest` is. A session copies the `Arc`; it never hashes.
+        grain: Option<Arc<crate::session::Grain>>,
         /// The declared type NAME, for the check in `Session::set`.
         ///
         /// This used to be a whole second `Value`, which meant every loaded table was held
@@ -275,6 +324,51 @@ pub(crate) struct Node {
     pub(crate) height: u32,
     /// Reverse edges. Dirty marks travel along these.
     pub(crate) dependents: Vec<CellId>,
+}
+
+impl Kind {
+    /// A source from parts that were already derived. See [`Node::clone_kind`].
+    pub(crate) fn source_parts(
+        initial: Arc<crate::session::Outcome>,
+        digest: crate::digest::Digest,
+        grain: Option<Arc<crate::session::Grain>>,
+        declared: &'static str,
+    ) -> Kind {
+        Kind::Source {
+            initial,
+            digest,
+            grain,
+            declared,
+        }
+    }
+}
+
+impl Node {
+    /// This cell's behaviour, ready to be pushed into another builder.
+    ///
+    /// Every field of a `Source` is carried over rather than re-derived, which is the point:
+    /// the initial value of a source is usually the app's data, and a split that re-hashed
+    /// a loaded CSV — or worse, deep-copied it — would undo the sharing the `Kind::Source`
+    /// docs above spend a paragraph establishing. `crates/core/src/placement.rs` is the
+    /// caller; `a_split_shares_the_original_source_allocation` is the test.
+    pub(crate) fn clone_kind(&self) -> Kind {
+        match &self.kind {
+            Kind::Source {
+                initial,
+                digest,
+                grain,
+                declared,
+            } => Kind::Source {
+                initial: Arc::clone(initial),
+                digest: *digest,
+                grain: grain.clone(),
+                declared,
+            },
+            Kind::Computed { compute } => Kind::Computed {
+                compute: Arc::clone(compute),
+            },
+        }
+    }
 }
 
 /// An immutable, checked app graph.
@@ -445,10 +539,12 @@ impl GraphBuilder {
         let declared = initial.type_name();
         let outcome = crate::session::Outcome::ok(initial);
         let digest = crate::digest::Digestible::digest(&outcome);
+        let grain = crate::session::grain_of(&outcome);
         self.names.push(name.into());
         self.kinds.push(Kind::Source {
             initial: Arc::new(outcome),
             digest,
+            grain,
             declared,
         });
         self.input_names.push(Vec::new());
@@ -488,6 +584,18 @@ impl GraphBuilder {
         self.input_names
             .push(inputs.into_iter().map(Into::into).collect());
         self
+    }
+
+    /// Declare a cell whose behaviour already exists as a [`Kind`].
+    ///
+    /// The door [`crate::placement::Cut`] uses to rebuild a subgraph. It is deliberately not
+    /// public: `Kind` is a crate-internal representation, and a caller outside this crate
+    /// that wanted to place a pre-digested source would be asking to put a value and a
+    /// digest that disagree into a graph, which is the one way to make this engine lie.
+    pub(crate) fn push_node(&mut self, name: String, kind: Kind, input_names: Vec<String>) {
+        self.names.push(name);
+        self.kinds.push(kind);
+        self.input_names.push(input_names);
     }
 
     /// Resolve names, reject duplicates, unknown inputs and cycles, then compute heights

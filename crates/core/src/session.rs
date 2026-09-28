@@ -31,10 +31,13 @@
 
 use std::sync::Arc;
 
-use crate::digest::{Digest, Digestible};
+use crate::digest::{Digest, Digestible, Hasher};
 use crate::error::{CellError, SessionError};
+use crate::frame::{column_digests, digest_frame_from_columns, shape_digest};
 use crate::graph::{CellId, Graph, Inputs, Kind};
+use crate::reads::{InputReads, ReadLog, RowRule};
 use crate::trace::{Step, StepOutcome, Trace};
+use crate::transform::{ordering, ordering_digest, selection, selection_digest};
 use crate::value::Value;
 
 /// What a cell holds: a value, or the error that stands in place of one.
@@ -112,13 +115,77 @@ impl Digestible for Outcome {
     }
 }
 
+/// The column-level digests of a frame value, taken once when the value was produced.
+///
+/// Only a frame has one. A slider has no columns to be granular about, and a cell holding a
+/// scalar or an error is compared whole as it always was.
+#[derive(Debug)]
+pub(crate) struct Grain {
+    /// Row count and whole schema — see [`crate::frame::shape_digest`]. Carried in every
+    /// granular key so that a cell reading no columns still wakes when a row appears.
+    shape: Digest,
+    /// One digest per column, left to right.
+    columns: Vec<Digest>,
+}
+
+/// What a cell recorded about one input the last time it ran, and what a later pass
+/// compares against that input to decide whether the cached value still stands.
+#[derive(Clone, Debug, PartialEq)]
+enum InputKey {
+    /// The input's whole-value digest. What every non-frame input gets, and what a compute
+    /// that did not narrow gets — which is to say, exactly the behaviour this engine had
+    /// before sub-node invalidation.
+    Whole(Digest),
+    /// The input's shape, the digests of the columns the cell actually read, and the
+    /// *constraints* it placed on columns whose values it never used.
+    ///
+    /// A change to any column outside both lists leaves every one of these equal and the
+    /// cell asleep.
+    Narrowed {
+        /// [`Grain::shape`] as it stood when the cell ran.
+        shape: Digest,
+        /// `(column index, that column's digest)`, in index order.
+        cols: Vec<(u32, Digest)>,
+        /// Rules whose *answer about the rows* the cell depended on while their column's
+        /// values never reached its output.
+        constraints: Vec<RowKey>,
+    },
+}
+
+/// A row constraint, as the engine stores and checks it.
+///
+/// This is constrained memoization proper: the key is not a value but a *question and its
+/// answer*. "Which rows of column 7 satisfy `>= 400`?" — and as long as the answer is the
+/// same list of rows, a cell that filtered on it and totalled something else cannot have
+/// moved, however much column 7 itself did. "In what order does column 7 rank the rows?"
+/// is the same shape of question, and a uniform shift down a metric column answers it
+/// identically.
+#[derive(Clone, Debug, PartialEq)]
+struct RowKey {
+    /// The column the rule reads.
+    column: u32,
+    /// That column's digest when the cell last ran.
+    ///
+    /// Checked first and it is what keeps this cheap: an unmoved column cannot have moved
+    /// its answer, so the overwhelmingly common case costs one digest compare and the rule
+    /// is never re-run at all.
+    column_digest: Digest,
+    /// The question, re-runnable against the input frame.
+    rule: RowRule,
+    /// The answer: [`crate::transform::selection_digest`] of the rows a filter kept, or
+    /// [`crate::transform::ordering_digest`] of the order a sort produced.
+    rows: Digest,
+}
+
 #[derive(Debug)]
 struct Slot {
     outcome: Arc<Outcome>,
     digest: Digest,
-    /// The digests of this cell's inputs the last time its compute ran. The comparison
-    /// against the current ones is the whole of the reuse decision.
-    input_digests: Vec<Digest>,
+    /// This slot's per-column digests, when it holds a frame. `None` for everything else.
+    grain: Option<Arc<Grain>>,
+    /// What this cell recorded about each of its inputs the last time its compute ran. The
+    /// comparison against the inputs as they stand now is the whole of the reuse decision.
+    input_keys: Vec<InputKey>,
     /// False until the cell has been computed once. A source is valid from construction;
     /// a computed cell is not, which is why the first pass evaluates everything and says so.
     valid: bool,
@@ -150,7 +217,7 @@ pub struct Session {
     graph: Arc<Graph>,
     slots: Vec<Slot>,
     epoch: u64,
-    staged: Vec<(CellId, Value)>,
+    staged: Vec<(CellId, Outcome)>,
     /// Visited marks for the dirty walk, stamped with the epoch rather than cleared. Epochs
     /// only ever increase, so a stale stamp can never be mistaken for a fresh one and the
     /// walk costs nothing per pass in clearing.
@@ -177,7 +244,8 @@ impl Session {
             .map(|_| Slot {
                 outcome: Arc::new(Outcome::ok(Value::Null)),
                 digest: Digest::EMPTY,
-                input_digests: Vec::new(),
+                grain: None,
+                input_keys: Vec::new(),
                 valid: false,
                 changed_at: 0,
             })
@@ -193,16 +261,24 @@ impl Session {
 
         for id in session.graph.order().to_vec() {
             if let Kind::Source {
-                initial, digest, ..
+                initial,
+                digest,
+                grain,
+                ..
             } = &session.graph.nodes[id.index()].kind
             {
                 // `Arc::clone`, not a copy of the value. Every session over this graph points
                 // at one allocation per untouched source, and the digest was taken once when
                 // the graph was built.
-                let (initial, digest) = (Arc::clone(initial), *digest);
+                // Every one of these is an `Arc` bump or a `Copy`. A source's per-column
+                // digests were taken once when the graph was built, beside its whole-value
+                // digest, so opening a session over a hundred-column table costs the same as
+                // opening one over a slider.
+                let (initial, digest, grain) = (Arc::clone(initial), *digest, grain.clone());
                 let slot = &mut session.slots[id.index()];
                 slot.outcome = initial;
                 slot.digest = digest;
+                slot.grain = grain;
                 slot.valid = true;
             }
         }
@@ -295,14 +371,101 @@ impl Session {
                 found: value.type_name(),
             });
         }
-        // Last write wins within a pass: a client that drags a slider sends a stream of
-        // values and only the one it stopped on matters.
-        if let Some(slot) = self.staged.iter_mut().find(|(c, _)| *c == id) {
-            slot.1 = value;
-        } else {
-            self.staged.push((id, value));
-        }
+        self.stage(id, Outcome::ok(value));
         Ok(())
+    }
+
+    /// Stage an **outcome** — a value, or the error standing in place of one — for a source.
+    ///
+    /// [`Session::set`] is this with `Outcome::ok`, and is what a widget uses. This one
+    /// exists for the frontier of a split graph: see [`crate::placement`]. A boundary cell
+    /// is computed on the far side, so what has to cross is whatever that cell holds, and in
+    /// this engine a cell holds an `Outcome` — a failure upstream of the cut has to arrive
+    /// as a failure, not as a null that the client would draw as a legitimate empty answer.
+    ///
+    /// Errors are values here (`docs/adr/0004-errors-are-values.md`), so this widens the
+    /// door by exactly the amount that sentence already promised.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::set_id`], except that an `Outcome::Error` skips the declared-type check
+    /// — an error has no type to match, and refusing to deliver one would leave the client
+    /// showing the last good value of a cell that is now broken.
+    pub fn set_outcome(&mut self, name: &str, outcome: Outcome) -> Result<(), SessionError> {
+        let id = self
+            .graph
+            .id(name)
+            .ok_or_else(|| SessionError::UnknownCell(name.to_string()))?;
+        self.set_outcome_id(id, outcome)
+    }
+
+    /// Whether [`Session::set_outcome`] would accept this, without staging it.
+    ///
+    /// The same reason [`Session::can_set`] exists, for the same caller shape: a batch has to
+    /// be checkable before any of it is applied. `crates/core/src/placement.rs` is the one
+    /// that needs it — a frontier refused halfway through would otherwise leave its earlier
+    /// cells staged, and the caller's next commit would apply a fragment of an update the
+    /// caller was told had failed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::set_outcome_id`].
+    pub fn can_set_outcome(&self, name: &str, outcome: &Outcome) -> Result<(), SessionError> {
+        let id = self
+            .graph
+            .id(name)
+            .ok_or_else(|| SessionError::UnknownCell(name.to_string()))?;
+        match outcome.value() {
+            Some(v) => self.can_set(name, v),
+            // An error has no type to check against the declared one; it only has to be
+            // going somewhere that can hold it.
+            None => match self.graph.nodes[id.index()].kind {
+                Kind::Source { .. } => Ok(()),
+                Kind::Computed { .. } => Err(SessionError::NotAnInput {
+                    name: name.to_string(),
+                }),
+            },
+        }
+    }
+
+    /// [`Session::set_outcome`] by id.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::ForeignCell`], [`SessionError::NotAnInput`] or
+    /// [`SessionError::TypeMismatch`], as [`Session::set_id`].
+    pub fn set_outcome_id(&mut self, id: CellId, outcome: Outcome) -> Result<(), SessionError> {
+        match outcome.value() {
+            Some(v) => {
+                let v = v.clone();
+                self.set_id(id, v)?;
+                // `set_id` staged an equal outcome; nothing further to do.
+                Ok(())
+            }
+            None => {
+                if !self.graph.contains(id) {
+                    return Err(SessionError::ForeignCell(id));
+                }
+                let node = &self.graph.nodes[id.index()];
+                if matches!(node.kind, Kind::Computed { .. }) {
+                    return Err(SessionError::NotAnInput {
+                        name: node.name.clone(),
+                    });
+                }
+                self.stage(id, outcome);
+                Ok(())
+            }
+        }
+    }
+
+    /// Last write wins within a pass: a client that drags a slider sends a stream of values
+    /// and only the one it stopped on matters.
+    fn stage(&mut self, id: CellId, outcome: Outcome) {
+        if let Some(slot) = self.staged.iter_mut().find(|(c, _)| *c == id) {
+            slot.1 = outcome;
+        } else {
+            self.staged.push((id, outcome));
+        }
     }
 
     /// Apply everything staged and recompute exactly what depends on whatever actually
@@ -318,15 +481,15 @@ impl Session {
         let staged = std::mem::take(&mut self.staged);
         let mut roots: Vec<CellId> = Vec::with_capacity(staged.len());
         let mut root_names: Vec<String> = Vec::with_capacity(staged.len());
-        for (id, value) in staged {
-            let outcome = Outcome::ok(value);
-            let digest = outcome.digest();
+        for (id, outcome) in staged {
+            let (digest, grain) = weigh(&outcome);
             let slot = &mut self.slots[id.index()];
             if slot.valid && slot.digest == digest {
                 continue;
             }
             slot.outcome = Arc::new(outcome);
             slot.digest = digest;
+            slot.grain = grain;
             slot.valid = true;
             slot.changed_at = epoch;
             roots.push(id);
@@ -366,15 +529,15 @@ impl Session {
         let epoch = self.epoch;
         let staged = std::mem::take(&mut self.staged);
         let mut root_names = Vec::new();
-        for (id, value) in staged {
-            let outcome = Outcome::ok(value);
-            let digest = outcome.digest();
+        for (id, outcome) in staged {
+            let (digest, grain) = weigh(&outcome);
             let slot = &mut self.slots[id.index()];
             if slot.valid && slot.digest == digest {
                 continue;
             }
             slot.outcome = Arc::new(outcome);
             slot.digest = digest;
+            slot.grain = grain;
             slot.valid = true;
             slot.changed_at = epoch;
             root_names.push(self.graph.name(id).to_string());
@@ -508,13 +671,7 @@ impl Session {
                 Kind::Computed { compute } => Arc::clone(compute),
             };
 
-            let current: Vec<Digest> = node
-                .inputs
-                .iter()
-                .map(|i| self.slots[i.index()].digest)
-                .collect();
-
-            if self.slots[id.index()].valid && self.slots[id.index()].input_digests == current {
+            if self.slots[id.index()].valid && self.inputs_unmoved(id, &node.inputs) {
                 steps.push(Step {
                     cell: node.name.clone(),
                     id,
@@ -545,6 +702,11 @@ impl Session {
                 })
             });
 
+            // Where the compute records which columns of which inputs its output actually
+            // depended on. An inherited error never reaches a compute, so the log stays
+            // whole and the cell is compared whole — which is right: the value it holds is
+            // that input's error, not some columns of it.
+            let log = ReadLog::new(node.inputs.len());
             let result = match upstream {
                 Some(err) => Err(err),
                 None => {
@@ -552,7 +714,7 @@ impl Session {
                         .iter()
                         .map(|o| o.value().expect("errors were handled above"))
                         .collect();
-                    compute.eval(Inputs::new(&node.name, &node.input_names, &refs))
+                    compute.eval(Inputs::new(&node.name, &node.input_names, &refs, &log))
                 }
             };
 
@@ -560,7 +722,7 @@ impl Session {
                 Ok(value) => Outcome::ok(value),
                 Err(error) => Outcome::err(error),
             };
-            let digest = outcome.digest();
+            let (digest, grain) = weigh(&outcome);
             let step = match outcome.error() {
                 Some(e) => StepOutcome::Failed {
                     message: e.to_string(),
@@ -571,13 +733,18 @@ impl Session {
                 },
             };
 
+            // Built before the slot is borrowed mutably, and from the log the compute just
+            // wrote rather than from anything declared ahead of time.
+            let keys = self.keys_for(&node.inputs, log.take());
+
             let slot = &mut self.slots[id.index()];
             if !slot.valid || slot.digest != digest {
                 slot.changed_at = epoch;
             }
             slot.outcome = Arc::new(outcome);
             slot.digest = digest;
-            slot.input_digests = current;
+            slot.grain = grain;
+            slot.input_keys = keys;
             slot.valid = true;
 
             steps.push(Step {
@@ -588,6 +755,178 @@ impl Session {
         }
 
         steps
+    }
+
+    /// Whether every key this cell recorded still matches the input it was taken from.
+    ///
+    /// This is the reuse decision, and the only place granularity is actually spent. A
+    /// [`InputKey::Whole`] key compares one digest, exactly as this engine always did. A
+    /// [`InputKey::Columns`] key compares the input's shape and then only the columns the
+    /// cell read — so a two-hundred-column frame with one column rewritten leaves a cell
+    /// that reads three others with three equal digests and an unchanged shape.
+    fn inputs_unmoved(&self, id: CellId, inputs: &[CellId]) -> bool {
+        let keys = &self.slots[id.index()].input_keys;
+        // A cell whose input count changed cannot have its old keys compared against its
+        // new inputs. The graph is immutable so this cannot happen today; it is checked
+        // rather than asserted because the cost is one integer compare and the failure it
+        // would otherwise allow is silent staleness.
+        if keys.len() != inputs.len() {
+            return false;
+        }
+        keys.iter().zip(inputs).all(|(key, input)| {
+            let slot = &self.slots[input.index()];
+            match key {
+                InputKey::Whole(d) => slot.digest == *d,
+                // The input is no longer a frame — a cell that produced a table now
+                // produces a scalar, or an error. There is nothing to compare the recorded
+                // columns against, so the cell runs.
+                InputKey::Narrowed { .. } if slot.grain.is_none() => false,
+                InputKey::Narrowed {
+                    shape,
+                    cols,
+                    constraints,
+                } => {
+                    let grain = slot.grain.as_ref().expect("checked on the arm above");
+                    grain.shape == *shape
+                        && cols
+                            .iter()
+                            .all(|(at, d)| grain.columns.get(*at as usize) == Some(d))
+                        && constraints
+                            .iter()
+                            .all(|c| constraint_still_holds(c, slot, grain))
+                }
+            }
+        })
+    }
+
+    /// Turn what a compute recorded into the keys its next pass will be judged against.
+    ///
+    /// Every path that cannot be made granular falls back to [`InputKey::Whole`], which is
+    /// this engine's pre-existing behaviour and never wrong — only coarser. That includes an
+    /// input that is not a frame, and a narrowing naming a column the frame does not have.
+    fn keys_for(&self, inputs: &[CellId], reads: Vec<InputReads>) -> Vec<InputKey> {
+        inputs
+            .iter()
+            .zip(reads)
+            .map(|(input, read)| {
+                let slot = &self.slots[input.index()];
+                let InputReads::Narrowed {
+                    columns,
+                    constraints,
+                } = read
+                else {
+                    return InputKey::Whole(slot.digest);
+                };
+                let Some(grain) = slot.grain.as_ref() else {
+                    return InputKey::Whole(slot.digest);
+                };
+                let mut taken = Vec::with_capacity(columns.len());
+                for c in &columns {
+                    match grain.columns.get(*c as usize) {
+                        Some(d) => taken.push((*c, *d)),
+                        // A column index the frame does not have. The compute and the frame
+                        // disagree about the shape of the thing it just read, and the safe
+                        // reading of a disagreement is to keep the whole digest.
+                        None => return InputKey::Whole(slot.digest),
+                    }
+                }
+                let mut kept = Vec::with_capacity(constraints.len());
+                for c in constraints {
+                    match grain.columns.get(c.column as usize) {
+                        Some(d) => kept.push(RowKey {
+                            column: c.column,
+                            column_digest: *d,
+                            rule: c.rule,
+                            rows: c.rows,
+                        }),
+                        None => return InputKey::Whole(slot.digest),
+                    }
+                }
+                InputKey::Narrowed {
+                    shape: grain.shape,
+                    cols: taken,
+                    constraints: kept,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Whether a row constraint still holds against the input as it stands now.
+///
+/// The cheap check first, and it is the one that almost always answers: if the column the
+/// rule reads has not moved, its answer cannot have moved either, and nothing is re-run.
+/// Only a column that genuinely changed costs a re-evaluation — one pass over one column,
+/// against a cell whose compute would otherwise touch every column of every surviving row.
+///
+/// The two rules re-run to different digest tags on purpose (see
+/// [`crate::transform::selection_digest`] and [`crate::transform::ordering_digest`]): the
+/// rows `[0, 2, 5]` kept by a filter and the order `[0, 2, 5]` produced by a sort are
+/// different answers to different questions, and neither may ever validate the other.
+fn constraint_still_holds(c: &RowKey, slot: &Slot, grain: &Grain) -> bool {
+    if grain.columns.get(c.column as usize) == Some(&c.column_digest) {
+        return true;
+    }
+    let Some(frame) = slot.outcome.value().and_then(|v| v.as_frame()) else {
+        return false;
+    };
+    // A rule that no longer runs against this frame at all — its column was renamed or
+    // retyped out from under it — costs a recomputation rather than an answer. The shape
+    // digest should already have caught that; this is the belt to its braces.
+    match &c.rule {
+        RowRule::Filter(spec) => match selection(frame, spec) {
+            Ok(keep) => selection_digest(&keep) == c.rows,
+            Err(_) => false,
+        },
+        RowRule::Sort { column, descending } => match ordering(frame, column, *descending) {
+            Ok(order) => ordering_digest(&order) == c.rows,
+            Err(_) => false,
+        },
+    }
+}
+
+/// The digest of an outcome and, when it holds a frame, its per-column digests beside it.
+///
+/// One walk over the data, not two. [`crate::frame::digest_frame`] composes the frame digest
+/// from the column digests, so the bytes absorbed here are exactly the bytes
+/// `outcome.digest()` would absorb — `weigh_agrees_with_the_plain_digest` in `tests/reactive.rs`
+/// is what holds that, because the two are written out separately and nothing but a test
+/// stops them drifting.
+fn weigh(outcome: &Outcome) -> (Digest, Option<Arc<Grain>>) {
+    if let Outcome::Value {
+        value: Value::Frame { v },
+    } = outcome
+    {
+        let frame = v.as_frame();
+        let columns = column_digests(frame);
+        let mut h = Hasher::new();
+        h.tag(0xa0);
+        digest_frame_from_columns(frame.rows(), &columns, &mut h);
+        let shape = shape_digest(frame);
+        return (h.finish(), Some(Arc::new(Grain { shape, columns })));
+    }
+    (outcome.digest(), None)
+}
+
+/// [`weigh`]'s grain half, for a value whose digest the caller already holds.
+///
+/// `pub(crate)` because [`crate::graph::Graph`] takes a source's grain **once**, when the
+/// graph is built, exactly as it already takes the source's digest. Doing it per session
+/// instead would make opening a session O(the data) rather than an `Arc` bump, and N viewers
+/// of one app would each hash the same table — which is precisely the cost the shared graph
+/// exists to not pay.
+pub(crate) fn grain_of(outcome: &Outcome) -> Option<Arc<Grain>> {
+    match outcome {
+        Outcome::Value {
+            value: Value::Frame { v },
+        } => {
+            let frame = v.as_frame();
+            Some(Arc::new(Grain {
+                shape: shape_digest(frame),
+                columns: column_digests(frame),
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -631,5 +970,89 @@ fn type_compatible(declared: &'static str, incoming: &Value) -> bool {
         ("null", _) => true,
         ("float", "int") => true,
         (expected, found) => expected == found,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::{Column, Table};
+
+    fn frame() -> Value {
+        Value::table(
+            Table::new(vec![
+                Column::int("a", vec![Some(1), Some(2), None]),
+                Column::text("b", vec![Some("x".into()), None, Some("z".into())]),
+                Column::bool("c", vec![Some(true), Some(false), None]),
+            ])
+            .expect("one row count"),
+        )
+    }
+
+    #[test]
+    fn weigh_agrees_with_the_plain_digest() {
+        // `weigh` re-implements what `Outcome::digest_into` then `Value::digest_into` absorb,
+        // so that a frame's whole digest and its per-column digests come out of one walk over
+        // the data. Two hand-written encodings of one thing drift, and the drift here would
+        // be silent: every cached value in every live session compared against a digest taken
+        // the other way. This is the test that does not let them.
+        let outcome = Outcome::ok(frame());
+        let (digest, grain) = weigh(&outcome);
+        assert_eq!(digest, outcome.digest(), "weigh and Digestible disagree");
+        assert_eq!(grain.expect("a frame has a grain").columns.len(), 3);
+    }
+
+    #[test]
+    fn a_scalar_outcome_has_no_grain_and_still_digests() {
+        let outcome = Outcome::ok(Value::int(7));
+        let (digest, grain) = weigh(&outcome);
+        assert_eq!(digest, outcome.digest());
+        assert!(
+            grain.is_none(),
+            "an int has no columns to be granular about"
+        );
+
+        let failed = Outcome::err(CellError::failed("no"));
+        let (digest, grain) = weigh(&failed);
+        assert_eq!(digest, failed.digest());
+        assert!(grain.is_none());
+    }
+
+    #[test]
+    fn a_sources_column_digests_are_taken_by_the_graph_and_not_by_each_session() {
+        // The property, pinned where a future edit would break it. Moving this work back into
+        // `Session::new` would make opening a session O(the data) and would have N viewers of
+        // one app each hash the same table — which is exactly the cost `Arc<Graph>` exists to
+        // avoid, and which no test but this one would notice.
+        let mut b = Graph::builder();
+        b.source("wide", frame());
+        b.source("knob", Value::int(1));
+        let graph = b.build().expect("two sources are acyclic");
+
+        let wide = graph.id("wide").expect("declared");
+        let knob = graph.id("knob").expect("declared");
+        match &graph.nodes[wide.index()].kind {
+            Kind::Source { grain, .. } => {
+                let grain = grain.as_ref().expect("a frame source carries its grain");
+                assert_eq!(grain.columns.len(), 3);
+            }
+            Kind::Computed { .. } => panic!("`wide` is a source"),
+        }
+        match &graph.nodes[knob.index()].kind {
+            Kind::Source { grain, .. } => {
+                assert!(grain.is_none(), "an int source has no columns");
+            }
+            Kind::Computed { .. } => panic!("`knob` is a source"),
+        }
+
+        // And every session points at that one allocation rather than making its own.
+        let a = Session::new(Arc::clone(&graph));
+        let c = Session::new(Arc::clone(&graph));
+        let ga = a.slots[wide.index()].grain.as_ref().expect("a frame");
+        let gc = c.slots[wide.index()].grain.as_ref().expect("a frame");
+        assert!(
+            Arc::ptr_eq(ga, gc),
+            "two sessions each computed their own column digests for one shared source"
+        );
     }
 }

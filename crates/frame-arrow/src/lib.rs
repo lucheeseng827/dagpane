@@ -29,6 +29,8 @@
 //! so a backend that hashed its own layout would invalidate every cell in the graph the
 //! moment anybody switched representation — while looking exactly like a correct pass.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -148,12 +150,6 @@ impl ArrowFrame {
             .collect()
     }
 
-    /// Resident bytes, as Arrow accounts for them. The figure to compare against a
-    /// `Vec<Option<T>>` when deciding whether a column is worth encoding.
-    pub fn memory_size(&self) -> usize {
-        self.columns.iter().map(|a| a.get_array_memory_size()).sum()
-    }
-
     /// Back to a [`Table`]. Not on the hot path — this exists so a caller holding a frame
     /// can hand it to code that has not been migrated yet.
     pub fn to_table(&self) -> Table {
@@ -263,6 +259,14 @@ impl Frame for ArrowFrame {
             // Unreachable: `build` produces only the five above.
             other => Value::text(format!("<unsupported arrow type {other}>")),
         }
+    }
+
+    /// Arrow's own accounting — `get_array_memory_size` over every column, so a
+    /// dictionary-encoded column reports the dictionary once and not once per row. That is
+    /// the measurement this crate exists for, and it is now the trait's question rather
+    /// than this type's, so a caller holding `Arc<dyn Frame>` can ask it.
+    fn memory_size(&self) -> usize {
+        self.columns.iter().map(|a| a.get_array_memory_size()).sum()
     }
 
     fn backend(&self) -> &'static str {

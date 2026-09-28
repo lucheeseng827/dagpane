@@ -1,7 +1,12 @@
 <!doctype html>
 <!--
-  The dagpane client. One file, no build step, no package manager, nothing fetched at run
-  time — the binary already contains this page.
+  The dagpane client. One file, no build step, no package manager, and no third-party
+  resource at run time — the binary already contains this page.
+
+  Not "fetches nothing", which is what this said before renderers existed. Four requests are
+  allowed and all are same-origin: `GET /auth`, a configured provider's token endpoint, a
+  renderer script an app declared, and `./dagpane.js` in an exported bundle.
+  `the_client_is_one_self_contained_file` enumerates them and fails on a fifth.
 
   The stats bar at the top is not decoration. It is the product claim, live: for every
   interaction it prints how many of the app's cells the pass looked at, how many ran, how
@@ -74,6 +79,8 @@
   .bar-value { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
   svg { width: 100%; height: 190px; display: block; }
   #offline { display: none; padding: 9px 26px; background: var(--warn); color: #fff; font-size: 13px; }
+  #offline a { color: #fff; }
+  .dropped { margin-top: 6px; color: var(--warn); }
 </style>
 </head>
 <body>
@@ -88,18 +95,438 @@
 // The client keeps no derived state. It holds the pane list the server described once, and
 // replaces a pane's contents when — and only when — the server sends that pane. That is the
 // same discipline the engine runs on, and it is the reason this file is short.
-let socket = null;
+// The thing that carries a message to an engine and brings the answer back.
+//
+// TWO of them, and the page cannot tell which it has. A WebSocket reaches a `dagpane-serve`
+// process; a wasm transport calls into a `dagpane-wasm` module in this tab. Both take a
+// `ClientMessage` and produce a `ServerMessage`, because both are driving the same
+// `AppSession` over the same protocol — so everything below `send` is written once.
+//
+// That is what `ROADMAP.md` §4 means by the placement being a deployment decision: an app
+// moved into the browser is not a port, it is the same page with a different `transport`.
+let transport = null;
+// False until the opening frame has been painted. `handle(init)` loads the app's renderer
+// scripts before it paints, and that is an await — so without this a control moved during
+// that import sends a `Set`, the patch paints the moved panes, and then the pending `init`
+// callback paints its own now-stale views over them. `flush` waits; nothing is lost, because
+// `pending` coalesces and the first flush after the paint sends the latest value.
+let painted = false;
 let seq = 0;
 let panes = new Map();     // pane id -> the <div> that holds its body
 let pending = null;        // values not yet sent, coalesced while a pass is in flight
 let inFlight = false;
 
-function connect() {
-  const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
-  socket = new WebSocket(url);
+// The viewer's own state: input name -> the same wire value a `set` carries.
+//
+// Held HERE and not on the server. A session is its inputs, so the viewer holding them means
+// there is no session store to run, replicate, evict or leak — and it means a filtered
+// dashboard is a URL you can send to somebody. It lives in the fragment, which the browser
+// never puts on the network, so it does not reach a proxy log the way a query string would.
+let saved = readSaved();
+
+function readSaved() {
+  const match = /(?:^|&|#)s=([^&]*)/.exec(location.hash);
+  if (!match) return {};
+  try {
+    const parsed = JSON.parse(decodeURIComponent(match[1]));
+    // An array or a string parses fine and is not a state. The server checks this too; the
+    // client checks it so a mangled link does not take the page down before connecting.
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function writeSaved() {
+  const encoded = Object.keys(saved).length
+    ? "#s=" + encodeURIComponent(JSON.stringify(saved))
+    : location.pathname + location.search;
+  // `replaceState`, not `location.hash`: moving a slider must not put an entry in the
+  // browser's history for every value it passes through.
+  try { history.replaceState(null, "", encoded); } catch (_) { /* file:// and the like */ }
+}
+
+// ── the front door ────────────────────────────────────────────────────────────────────
+//
+// The server verifies tokens; it never talks to the identity provider. Getting one is this
+// page's job, and PKCE is exactly the flow for that — a public client with no secret to
+// keep, which is what a page is. The token lives in `sessionStorage`: it dies with the tab,
+// it is never put in a URL where a proxy would log it, and it is never written to the
+// fragment beside the saved state.
+const TOKEN_KEY = "dagpane.token";
+const VERIFIER_KEY = "dagpane.pkce";
+
+function stored(key) {
+  try { return sessionStorage.getItem(key); } catch (_) { return null; }
+}
+function store(key, value) {
+  try { value === null ? sessionStorage.removeItem(key) : sessionStorage.setItem(key, value); }
+  catch (_) { /* private mode; the viewer signs in again */ }
+}
+
+function b64url(bytes) {
+  let s = "";
+  for (const b of new Uint8Array(bytes)) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function randomVerifier() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return b64url(bytes);
+}
+
+async function challengeFor(verifier) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return b64url(digest);
+}
+
+function redirectUri() {
+  // The page itself, with no query and no fragment: the provider must be able to match it
+  // against a registered value, and the saved state has no business going to the provider.
+  return location.origin + location.pathname;
+}
+
+async function startSignIn(login) {
+  // `crypto.subtle` needs a secure context. `localhost` counts; a bare IP over plain
+  // transport does not, and a viewer deserves to be told which of those is wrong.
+  //
+  // The words "TLS" and "localhost" rather than the scheme names, because a unit test in
+  // `lib.rs` asserts that this file contains exactly two strings beginning with those four
+  // letters — and a comment is not one of the two.
+  if (!window.isSecureContext || !crypto.subtle) {
+    fatal("Signing in needs a secure context: serve this over TLS, or reach it at localhost.");
+    return;
+  }
+  const verifier = randomVerifier();
+  const state = randomVerifier();
+  store(VERIFIER_KEY, JSON.stringify({ verifier, state }));
+
+  const url = new URL(login.authorize_endpoint);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("client_id", login.client_id);
+  url.searchParams.set("redirect_uri", redirectUri());
+  url.searchParams.set("scope", login.scope);
+  url.searchParams.set("state", state);
+  url.searchParams.set("code_challenge", await challengeFor(verifier));
+  url.searchParams.set("code_challenge_method", "S256");
+  location.assign(url.toString());
+}
+
+async function finishSignIn(login, code, returnedState) {
+  const saved = JSON.parse(stored(VERIFIER_KEY) || "null");
+  store(VERIFIER_KEY, null);
+  // Without this an attacker can hand a viewer a link carrying their own code and have the
+  // viewer's page exchange it — the viewer ends up signed in as somebody else.
+  if (!saved || saved.state !== returnedState) {
+    fatal("The sign-in did not match the request this page started. Reload and try again.");
+    return null;
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: redirectUri(),
+    client_id: login.client_id,
+    code_verifier: saved.verifier,
+  });
+  const reply = await fetch(login.token_endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!reply.ok) {
+    fatal("The provider refused the sign-in (HTTP " + reply.status + ").");
+    return null;
+  }
+  const json = await reply.json();
+  // An id token is the one minted FOR this application — its audience is this client — so it
+  // is what the server's audience check is about. An access token is for an API and may not
+  // even be a JWT.
+  return json.id_token || null;
+}
+
+function fatal(text) {
+  const el = document.getElementById("stats");
+  el.textContent = "";
+  const b = document.createElement("b");
+  b.textContent = text;
+  el.appendChild(b);
+}
+
+// Everything up to the point where there is a token, or a reason there is not.
+//
+// Returns `{ open: true, token }` to connect, or `{ open: false }` when the page is
+// navigating away to the provider or has nothing to connect with. Two outcomes rather than a
+// nullable token, because "no token needed" and "no token, do not try" are different and one
+// `null` cannot say which.
+async function frontDoor() {
+  let config;
+  try {
+    config = await (await fetch("/auth")).json();
+  } catch (_) {
+    // No answer — an old server, or something in front. Behave exactly as this page did
+    // before there was a door and let the socket decide.
+    return { open: true };
+  }
+  if (!config.required) return { open: true };
+
+  const existing = stored(TOKEN_KEY);
+  if (existing) return { open: true, token: existing };
+
+  const params = new URLSearchParams(location.search);
+  const code = params.get("code");
+  if (code && config.login) {
+    const token = await finishSignIn(config.login, code, params.get("state"));
+    // The code is one-time and already spent; leaving it in the URL only makes the address
+    // look shareable when it is not.
+    history.replaceState(null, "", redirectUri() + location.hash);
+    if (token) {
+      store(TOKEN_KEY, token);
+      return { open: true, token };
+    }
+    return { open: false };   // `finishSignIn` has already said why
+  }
+
+  if (config.login) {
+    await startSignIn(config.login);
+    return { open: false };   // the page is navigating away
+  }
+  fatal("This app needs a token, and no sign-in is configured. Reach it through whatever issues one.");
+  return { open: false };
+}
+
+// ── the two transports ─────────────────────────────────────────────────────────────────
+
+// An engine in this tab. `window.DAGPANE_LOCAL` is what a static export writes into the page
+// beside this script: the wasm module's URL, the manifest, and the bytes of each source.
+//
+// `send` is synchronous — the call *is* the pass — but the reply is delivered through the
+// same `handle` the socket uses, so `inFlight`, the coalescing and the stats bar work
+// unchanged. Wrapping a completed answer in a promise would only add a turn of the event
+// loop; what it would buy, a pass that does not block the frame, needs a worker rather than
+// a promise, and that is a different piece of work with its own measurement behind it.
+async function connectLocal(spec) {
+  let app;
+  try {
+    // The import is INSIDE the try. Outside it, a glue module that is missing, blocked by a
+    // CSP or served with the wrong type rejects a promise nobody is awaiting, and the page
+    // sits on "connecting…" for ever with the real reason only in the console.
+    const module = await import(spec.glue || "./dagpane.js");
+    app = await module.open(spec.wasm || "./dagpane.wasm", {
+      manifest: spec.manifest,
+      sources: spec.sources || {},
+      renderers: spec.renderers || {},
+      resume: saved,
+    });
+  } catch (e) {
+    // `file://` is the one failure worth naming, because it is the one people will hit by
+    // accident: an exported app is a folder, a folder looks double-clickable, and a browser
+    // gives every `file://` document its own opaque origin. A module import and the wasm
+    // fetch are both cross-origin from there and both are refused. Nothing can be done about
+    // that from inside the page, so the page says what to do instead.
+    const why = e && e.message ? e.message : String(e);
+    fatal(
+      location.protocol === "file:"
+        ? "This page has to be served over http:// — a browser refuses to load modules and " +
+          "WebAssembly from file://. Run any static server in this folder, for example " +
+          "`python3 -m http.server`, and open the address it prints."
+        : why
+    );
+    return;
+  }
+  transport = {
+    ready: () => true,
+    send: (message) => handle(app.send(message)),
+  };
+  handle(app.init);
+}
+
+function connect(token) {
+  const base = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+  // The state goes on the SOCKET's query, not the page's. The page is one static file every
+  // viewer of every app receives identically, and a per-viewer query would make it
+  // uncacheable for nothing.
+  const query = Object.keys(saved).length
+    ? "?s=" + encodeURIComponent(JSON.stringify(saved))
+    : "";
+  // A browser cannot set headers on `new WebSocket()`, so a token rides in the
+  // subprotocol: a constant entry the server selects, and the credential beside it. Not the
+  // query string — that is logged by every proxy in the path.
+  const socket = token
+    ? new WebSocket(base + query, ["dagpane", "dagpane.auth." + token])
+    : new WebSocket(base + query);
+  transport = {
+    ready: () => socket.readyState === 1,
+    send: (message) => socket.send(JSON.stringify(message)),
+  };
+  // Whether THIS socket's upgrade succeeded, which is the question a refusal turns on: a
+  // server that refuses answers 401 or 403 and the upgrade never completes, so `onopen` is
+  // exactly the signal "the door let this through".
+  let opened = false;
+  // `onerror` is followed by `onclose` for the same socket — the WebSocket standard closes a
+  // failed connection through the same path — so without this both fire and two reconnects
+  // get scheduled, double-counting the backoff and racing each other.
+  let settled = false;
+  const gone = () => {
+    if (settled) return;
+    settled = true;
+    dropped(opened, token);
+  };
+
   socket.onmessage = (e) => handle(JSON.parse(e.data));
-  socket.onclose = () => { document.getElementById("offline").style.display = "block"; };
-  socket.onerror = () => { document.getElementById("offline").style.display = "block"; };
+  socket.onclose = gone;
+  socket.onerror = gone;
+  socket.onopen = () => {
+    opened = true;
+    // This PAGE has been through the door at least once. See `dropped`.
+    everConnected = true;
+    // The socket is back. Reset the backoff so the *next* drop starts from a short wait
+    // again, and clear the banner — the page is live from here.
+    attempt = 0;
+    document.getElementById("offline").style.display = "none";
+    flush();
+  };
+}
+
+// ── coming back ────────────────────────────────────────────────────────────────────────
+//
+// **A closed socket is the ordinary case, not an error.** A rolling update drains and closes
+// every one of them on purpose; so does a scale-in, a spot reclamation, a laptop lid, and a
+// proxy that reaped a connection somebody was only reading. The page's answer to all of those
+// used to be a banner saying "Disconnected", which left the viewer to notice and reload.
+//
+// Reconnecting is cheap here for a reason that is structural rather than clever: **a session
+// is a connection, and the viewer holds what makes it theirs.** The control values live in
+// this page's URL fragment, the socket carries them on its query string, and the server
+// stages them before the first render. So a reconnect is the same `connect()` as the first
+// one, it costs one pass, and it can land on a different replica than the one that went away
+// without anybody noticing. There is nothing to resume, because there was never anything
+// kept here to lose.
+
+let attempt = 0;             // consecutive failed attempts, for the backoff
+let retryTimer = null;
+let everConnected = false;   // has this PAGE ever been through the door?
+const RETRY_CAP_MS = 30000;
+// How many attempts that open nothing a token-bearing page will make before it concludes the
+// door is shut rather than the server absent. The browser will not tell it which: a WebSocket
+// exposes neither status nor body for a failed upgrade, so **time is the only evidence there
+// is**. A restart is back within seconds; a token that expired mid-session fails every time.
+// Six attempts is roughly half a minute of backoff — long enough to sit out a rolling update,
+// short enough that somebody whose session ended is told so rather than left watching a
+// banner that will never change.
+const REFUSE_AFTER = 6;
+
+function dropped(everOpened, token) {
+  // A page holding a token that has **never** been through the door is a refusal, and it is
+  // the only one that can be told apart immediately: nothing about it has ever worked.
+  // Retrying that on a timer hammers a door that is not going to open and buries the one
+  // message that says what to do about it.
+  if (token && !everConnected) { refused(token); return; }
+  // A page that HAS been through the door and now cannot get back is, at first, a server that
+  // went away — which is the ordinary case and the whole point of reconnecting. Treating it as
+  // a refusal was a real bug: an authenticated viewer stopped retrying the moment their server
+  // restarted, so every deployment with a front door lost the feature. Only a run of attempts
+  // that open nothing is evidence of a door rather than an outage.
+  if (token && !everOpened && attempt >= REFUSE_AFTER) { refused(token); return; }
+
+  transport = null;
+  // A pass that was in flight when the socket went is a pass whose answer will never arrive.
+  // `flush` refuses to send while `inFlight`, so leaving it set would reconnect to a page
+  // that renders perfectly and answers nothing — which is the exact failure this whole
+  // mechanism exists to remove, reproduced on the far side of the fix.
+  inFlight = false;
+
+  const wait = backoff(attempt++);
+  const banner = document.getElementById("offline");
+  banner.textContent =
+    "Disconnected. Reconnecting in " + Math.round(wait / 1000) + "s — the page below is the " +
+    "last state the server sent.";
+  banner.style.display = "block";
+
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => connect(token), wait);
+}
+
+// Exponential, capped, and **jittered**, which is the part that is about a fleet rather than
+// about one page. Every viewer of a replica that just drained is reconnecting at the same
+// instant; without jitter they arrive together, retry together, and keep arriving together
+// for as long as the outage lasts. The cap is what stops a long outage becoming an hour-long
+// wait after it ends.
+function backoff(n) {
+  const ceiling = Math.min(500 * Math.pow(2, n), RETRY_CAP_MS);
+  return ceiling / 2 + Math.random() * (ceiling / 2);
+}
+
+// A socket that closed before it ever spoke, on a page that had a token.
+//
+// **A browser does not tell JavaScript why a WebSocket upgrade failed** — not the status, not
+// the body — so this page cannot distinguish "your token expired" from "you may not open this
+// app". That is a browser rule and not something to work around; what it means is that the
+// honest message names both and offers the one action that helps with either.
+//
+// This is the one close that does **not** retry. Everything else goes to `dropped`, because
+// everything else is a transport event that will clear on its own.
+function refused(token) {
+  const banner = document.getElementById("offline");
+  banner.textContent = "";
+  banner.appendChild(document.createTextNode(
+    "The server refused this connection. Your session may have expired, or you may not " +
+    "have access to this app. "
+  ));
+  const again = document.createElement("a");
+  again.textContent = "Sign in again";
+  again.href = "#";
+  again.onclick = (e) => {
+    e.preventDefault();
+    store(TOKEN_KEY, null);
+    location.reload();
+  };
+  banner.appendChild(again);
+  banner.style.display = "block";
+}
+
+// ── the extension point ────────────────────────────────────────────────────────────────
+//
+// Everything above draws the five presentations the runtime knows about. This is how a page
+// gets a sixth without any of it changing.
+//
+// A `custom` pane names a renderer; a script the app declared registers one under that name.
+// The engine still decides which rows exist, whether anything moved and what goes on the
+// wire — a renderer is handed the answer and an element, and that is the whole of its job.
+// It cannot make the product claim untrue because it is never on the path that decides it.
+//
+//   dagpane.renderer("treemap", (data, options, el) => { … });
+//
+//   data     `{ data: "table", head: [{name, type}], rows: [[…]], total_rows }`
+//            or `{ data: "scalar", value: {kind, v} }` — whichever shape the cell has.
+//   options  the pane's `options` table from the manifest, verbatim JSON.
+//   el       an empty `<div>` inside the pane's card. Fill it however you like.
+//
+// A renderer that throws is contained: the pane says so and the rest of the page keeps
+// working, which is the same rule a cell in error follows.
+const renderers = new Map();
+
+window.dagpane = {
+  renderer(name, draw) {
+    if (typeof name !== "string" || typeof draw !== "function") {
+      throw new TypeError("dagpane.renderer(name, function)");
+    }
+    renderers.set(name, draw);
+  },
+};
+
+// Declared scripts, loaded before the first paint so a pane is never drawn by a renderer that
+// has not arrived yet. A script that fails to load is reported in the pane that needed it
+// rather than silently leaving a blank card — `build` says which renderer it could not find.
+async function loadRenderers(paths) {
+  for (const path of paths || []) {
+    try {
+      await import(new URL(path, document.baseURI).href);
+    } catch (e) {
+      console.error("dagpane: renderer script " + path + " failed to load", e);
+    }
+  }
 }
 
 function handle(msg) {
@@ -107,10 +534,33 @@ function handle(msg) {
     document.getElementById("title").textContent = msg.title;
     document.getElementById("subtitle").textContent = msg.subtitle || "";
     document.title = msg.title;
+    // Anything the server would not take is dropped from the saved state before the
+    // controls are built, so the URL heals itself and the controls cannot show a value the
+    // panes were not computed from.
+    // An entry naming no input is the WHOLE state refused — too long, or unreadable — which
+    // is what `connection()` pushes for a `ResumeError`. `delete saved[""]` removes nothing,
+    // so deleting by name left every value in place and drew controls from a state the panes
+    // were computed without. That is the disagreement the paragraph above says cannot happen.
+    for (const d of msg.dropped || []) {
+      if (d.input) delete saved[d.input];
+      else saved = {};
+    }
+    if (msg.dropped && msg.dropped.length) writeSaved();
+
     buildControls(msg.widgets);
     buildPanes(msg.panes);
-    for (const u of msg.views) paint(u, false);
-    showStats(msg.stats, msg.views.length, "first");
+    // The scripts first, then the paint. Drawing a custom pane before its renderer exists
+    // would show "no renderer" on a page that is about to have one, and the flicker would be
+    // indistinguishable from a real misconfiguration.
+    loadRenderers(msg.renderers).then(() => {
+      for (const u of msg.views) paint(u, false);
+      showStats(msg.stats, msg.views.length, "first");
+      showDropped(msg.dropped);
+      // Only now may anything be sent — see `painted`. A control moved while the renderer
+      // scripts were loading is still in `pending`, and this is what lets it go.
+      painted = true;
+      flush();
+    });
   } else if (msg.type === "patch") {
     for (const u of msg.panes) paint(u, true);
     showStats(msg.stats, msg.panes.length, "patch");
@@ -138,16 +588,18 @@ function handle(msg) {
 function set(name, value) {
   if (pending === null) pending = {};
   pending[name] = value;
+  saved[name] = value;
+  writeSaved();
   flush();
 }
 
 function flush() {
-  if (inFlight || pending === null || !socket || socket.readyState !== 1) return;
+  if (!painted || inFlight || pending === null || !transport || !transport.ready()) return;
   const values = pending;
   pending = null;
   inFlight = true;
   seq += 1;
-  socket.send(JSON.stringify({ type: "set", seq, values }));
+  transport.send({ type: "set", seq, values });
 }
 
 function showStats(s, sent, kind) {
@@ -188,6 +640,30 @@ function showStats(s, sent, kind) {
   if (s.micros !== undefined) put(" · " + (s.micros / 1000).toFixed(2) + " ms");
 }
 
+// What this control is actually set to: the restored value if the server took it, and the
+// manifest's default otherwise. Reading `w.default` directly would draw a slider at zero
+// beside a pane computed from four hundred — the controls and the numbers disagreeing, which
+// is the one thing a restored session must not do.
+function current(w) {
+  return Object.prototype.hasOwnProperty.call(saved, w.cell) ? saved[w.cell] : w.default;
+}
+
+function showDropped(dropped) {
+  if (!dropped || !dropped.length) return;
+  const el = document.getElementById("stats");
+  const note = document.createElement("div");
+  note.className = "dropped";
+  const lead = document.createElement("b");
+  lead.textContent = "Some saved settings were not restored: ";
+  note.appendChild(lead);
+  note.appendChild(
+    document.createTextNode(
+      dropped.map((d) => (d.input ? d.input + " — " + d.reason : d.reason)).join("; ")
+    )
+  );
+  el.appendChild(note);
+}
+
 function buildControls(widgets) {
   const root = document.getElementById("controls");
   root.textContent = "";
@@ -201,12 +677,12 @@ function buildControls(widgets) {
     if (w.widget === "slider") {
       const out = document.createElement("span");
       out.className = "readout";
-      out.textContent = valueOf(w.default);
+      out.textContent = valueOf(current(w));
       name.appendChild(out);
       const input = document.createElement("input");
       input.type = "range";
       input.min = w.min; input.max = w.max; input.step = w.step;
-      input.value = valueOf(w.default);
+      input.value = valueOf(current(w));
       input.oninput = () => {
         out.textContent = input.value;
         set(w.cell, { kind: "float", v: parseFloat(input.value) });
@@ -219,13 +695,13 @@ function buildControls(widgets) {
         o.value = option; o.textContent = option;
         select.appendChild(o);
       }
-      select.value = valueOf(w.default);
+      select.value = valueOf(current(w));
       select.onchange = () => set(w.cell, { kind: "text", v: select.value });
       label.appendChild(select);
     } else if (w.widget === "checkbox") {
       const input = document.createElement("input");
       input.type = "checkbox";
-      input.checked = w.default.v === true;
+      input.checked = current(w).v === true;
       input.onchange = () => set(w.cell, { kind: "bool", v: input.checked });
       label.appendChild(input);
     } else if (w.widget === "number") {
@@ -233,14 +709,14 @@ function buildControls(widgets) {
       input.type = "number";
       if (w.min !== null && w.min !== undefined) input.min = w.min;
       if (w.max !== null && w.max !== undefined) input.max = w.max;
-      input.value = valueOf(w.default);
+      input.value = valueOf(current(w));
       input.onchange = () => set(w.cell, { kind: "float", v: parseFloat(input.value) });
       label.appendChild(input);
     } else {
       const input = document.createElement("input");
       input.type = "text";
       input.placeholder = w.placeholder || "";
-      input.value = valueOf(w.default);
+      input.value = valueOf(current(w));
       input.oninput = () => set(w.cell, { kind: "text", v: input.value });
       label.appendChild(input);
     }
@@ -254,7 +730,14 @@ function buildPanes(specs) {
   panes = new Map();
   for (const spec of specs) {
     const card = document.createElement("div");
-    card.className = "pane" + (spec.pane === "table" || spec.pane === "line" ? " wide" : "");
+    // A custom pane gets the full width unless it says otherwise. Most drawings that are
+    // worth writing a renderer for are shapes over many rows, and a renderer that wants a
+    // card can set `options.wide = false` and have one.
+    const wide =
+      spec.pane === "table" ||
+      spec.pane === "line" ||
+      (spec.pane === "custom" && (!spec.options || spec.options.wide !== false));
+    card.className = "pane" + (wide ? " wide" : "");
     if (spec.title) {
       const h = document.createElement("h2");
       h.textContent = spec.title;
@@ -263,7 +746,10 @@ function buildPanes(specs) {
     const body = document.createElement("div");
     card.appendChild(body);
     root.appendChild(card);
-    panes.set(spec.id, { card, body });
+    // The spec is kept, not just the elements. A custom renderer's `options` are static and
+    // ride the pane rather than every patch, so this is where they live for the life of the
+    // page — which is the whole reason a patch does not carry them.
+    panes.set(spec.id, { card, body, spec });
   }
 }
 
@@ -273,7 +759,7 @@ function paint(update, flash) {
   const pane = panes.get(update.id);
   if (!pane) return;
   pane.body.textContent = "";
-  pane.body.appendChild(build(update.view));
+  pane.body.appendChild(build(update.view, pane.spec));
   if (flash) {
     pane.card.classList.remove("flash");
     void pane.card.offsetWidth;
@@ -282,7 +768,7 @@ function paint(update, flash) {
   }
 }
 
-function build(view) {
+function build(view, spec) {
   switch (view.view) {
     case "metric": {
       const box = document.createElement("div");
@@ -303,6 +789,7 @@ function build(view) {
     case "table": return buildTable(view);
     case "bar": return buildBars(view);
     case "line": return buildLine(view);
+    case "custom": return buildCustom(view, spec);
     case "error": {
       const p = document.createElement("div");
       p.className = "err";
@@ -318,6 +805,39 @@ function build(view) {
       return p;
     }
   }
+}
+
+function buildCustom(view, spec) {
+  const draw = renderers.get(view.renderer);
+  if (!draw) {
+    const p = document.createElement("div");
+    p.className = "err";
+    const code = document.createElement("code");
+    code.textContent = view.renderer;
+    p.append(
+      code,
+      document.createTextNode(
+        ": no renderer by that name is registered. Add it to the app's `renderers` list, " +
+        "or check the script calls dagpane.renderer(\"" + view.renderer + "\", …)."
+      )
+    );
+    return p;
+  }
+  const box = document.createElement("div");
+  try {
+    // The whole view is passed, not just its data half: a renderer may want `total_rows` to
+    // say what it is not showing, exactly as the table pane does.
+    draw(view, (spec && spec.options) || {}, box);
+  } catch (e) {
+    // A renderer that throws takes out its own pane and nothing else. The same rule a cell
+    // in error follows, for the same reason: one broken thing should not take the page.
+    box.textContent = "";
+    box.className = "err";
+    const code = document.createElement("code");
+    code.textContent = view.renderer;
+    box.append(code, document.createTextNode(": " + (e && e.message ? e.message : String(e))));
+  }
+  return box;
 }
 
 function buildTable(view) {
@@ -427,7 +947,17 @@ function format(n) {
   return Number.isInteger(n) ? String(n) : n.toFixed(2);
 }
 
-connect();
+// An engine in this tab needs no front door: there is no server to be refused by, and the
+// data is already in the page. A served app asks the front door first — with none configured
+// `frontDoor` returns immediately and this is the same single `connect()` it always was, and
+// with one the page may navigate away to the provider and come back here with a code.
+if (window.DAGPANE_LOCAL) {
+  connectLocal(window.DAGPANE_LOCAL);
+} else {
+  frontDoor().then((door) => {
+    if (door.open) connect(door.token);
+  });
+}
 </script>
 </body>
 </html>

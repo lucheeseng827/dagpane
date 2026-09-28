@@ -13,6 +13,11 @@ description = "The app model on top of the dagpane engine: widgets, views, the p
 [features]
 default = ["arrow-sources"]
 arrow-sources = ["dep:dagpane-frame-arrow"]
+# Passed through to `dagpane-connect`. Both OFF by default, so a default build of this crate
+# links no HTTP client and no database driver — see that crate's manifest for why the
+# "nowhere" invariant became "there, gated".
+http = ["dagpane-connect/http"]
+sql = ["dagpane-connect/sql"]
 
 [dependencies]
 # A loaded CSV source becomes an Arrow frame rather than a `Vec<Option<T>>` table, which is
@@ -22,9 +27,17 @@ arrow-sources = ["dep:dagpane-frame-arrow"]
 # knob and never a behaviour one.
 dagpane-frame-arrow = { path = "../frame-arrow", version = "0.1.1", optional = true }
 dagpane-core = { path = "../core", version = "0.1.1" }
+# Where a source's rows come from. `connect` sits beside `core` under this crate rather
+# than inside it: `app` decides what a pane is, `connect` decides what a row is, and
+# neither needs the other's vocabulary.
+dagpane-connect = { path = "../connect", version = "0.1.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+# `tests/sql_parity.rs` seeds the table both halves of the parity test read. A test that
+# asked the source under test to write its own fixture would be asserting the source against
+# itself; this writes the rows with the driver and reads them back through dagpane.
+postgres = "0.19"

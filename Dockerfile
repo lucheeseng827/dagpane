@@ -6,7 +6,12 @@
 # nothing for it to fetch at run time.
 #
 #   docker build -t dagpane .
-#   docker run --rm -p 8787:8787 -v "$PWD/examples:/app" dagpane run /app/sales.toml --host 0.0.0.0
+#   docker run --rm -p 8787:8787 -v "$PWD/examples:/app" \
+#     dagpane serve /app/sales.toml --origin http://localhost:8787
+#
+# `serve` binds every interface already, which is what a container needs. The `--origin` is
+# not decoration: the WebSocket origin allowlist is otherwise derived from the address bound,
+# so a wildcard bind allows an origin no browser sends and the page loads with dead controls.
 #
 # NOTE THE `--host 0.0.0.0`, and note what it prints. There is **no authentication in this
 # version**: `dagpane run` binds loopback by default and warns when told to bind anything

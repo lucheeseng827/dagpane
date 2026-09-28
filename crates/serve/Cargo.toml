@@ -14,19 +14,36 @@ description = "The dagpane server: an axum WebSocket loop, one session per conne
 # actually reaches the source representation rather than stopping here.
 [features]
 default = ["arrow-sources"]
-arrow-sources = ["dagpane-app/arrow-sources"]
+arrow-sources = ["dagpane-app/arrow-sources", "dagpane-host/arrow-sources"]
 
 [dependencies]
 dagpane-app = { path = "../app", version = "0.1.1", default-features = false }
+# Multi-app serving. `host` owns no socket and this crate owns no map, which is why the
+# arrow points this way and not the other.
+dagpane-host = { path = "../host", version = "0.1.1", default-features = false }
+# The front door. No HTTP client comes with it — see that crate's manifest.
+dagpane-auth = { path = "../auth", version = "0.1.1" }
 dagpane-core = { path = "../core", version = "0.1.1" }
-axum = { version = "0.8", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
+axum = { version = "0.8", features = ["ws", "json"] }
+# `signal` is `SIGTERM` as well as Ctrl-C, `sync` is the watch channel the probe listener
+# and the drain share their state through, and `time` is the drain window itself.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "sync", "time"] }
+# `Login` is serialised straight to the page by `/auth`.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # A WebSocket *client*, for tests only. The protocol is the product's visible surface — the
 # patch is what a browser receives — so it is worth one dev-dependency to assert on the real
 # frames rather than on the function that would have produced them.
 [dev-dependencies]
+# `tests/door.rs` mints its own tokens against a keypair it generates per test. Both are
+# already in the tree under `dagpane-auth`, so neither costs a compilation.
+jsonwebtoken = { version = "9", default-features = false }
+ring = "0.17"
+base64 = "0.22"
+# `tests/multi_app.rs` writes a directory of manifests and a CSV per test, and they run
+# concurrently — a shared fixture directory would make one test's redeploy another's flake.
+tempfile = "3"
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }

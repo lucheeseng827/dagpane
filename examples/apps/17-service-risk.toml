@@ -1,0 +1,140 @@
+# SRE — "which services are burning error budget, and are they the ones we keep shipping to?"
+#
+# Two tables, and the question needs both: the SLO feed knows about burn, the deploy log knows
+# about shipping, and neither knows what the other knows. Before the ninth verb this page could
+# not be written — the two numbers could sit side by side and nothing could put them on one row.
+#
+# The mechanic, and it is the one to take away: **aggregate first, then join.** Both sides are
+# grouped to one row per service before they meet, so the join is a lookup — one row matches at
+# most one row — and the totals on this page cannot be doubled by a duplicate. A join that
+# fans out is legal here, but you have to write `multiple = true` and say so; the default
+# refuses, because a chart whose total doubled when a table gained a duplicate row renders
+# confidently and is wrong.
+#
+# The second thing to watch: the two controls reach **different sides of the join**. `tier`
+# filters the SLO feed, `environment` filters the deploy log, and `services_watched` reads the
+# SLO side alone — so moving the environment dropdown recomputes half this page and provably
+# cannot touch that number. `dagpane graph` shows both edges into `risk` before you run it.
+#
+# `anti` is the third: `unshipped` is the services we hold an error budget for and never deploy
+# to. It adds no columns and no rows — it is a filter that happens to read another table — and
+# on this data it finds `reporting`, which appears in the SLO feed 30 times and in the deploy
+# log never.
+
+[app]
+title = "Service risk"
+subtitle = "Error budget against deploy activity, eight services"
+
+[[source]]
+name = "slo"
+csv = "../data/service_slo.csv"
+
+[[source]]
+name = "deploys"
+csv = "../data/deploys.csv"
+
+[[input]]
+name = "tier"
+label = "Tier"
+select = { options = ["all", "tier1", "tier2", "tier3"], default = "all" }
+
+[[input]]
+name = "environment"
+label = "Deploys in"
+select = { options = ["all", "production", "staging"], default = "all" }
+
+# ── the left-hand side: burn, per service ─────────────────────────────────────────────
+
+[[cell]]
+name = "slo_scoped"
+from = "slo"
+[[cell.step]]
+filter = { column = "tier", op = "eq", param = "tier", skip_when = "all" }
+
+[[cell]]
+name = "burn_by_service"
+from = "slo_scoped"
+[[cell.step]]
+group_by = { by = ["service"], agg = [
+  { column = "budget_burn_pct", agg = "mean", as = "burn_pct" },
+  { column = "errors", agg = "sum", as = "errors" },
+] }
+
+# A number about the SLO feed alone. The environment dropdown is not upstream of it and
+# cannot become so without somebody typing an edge.
+[[cell]]
+name = "services_watched"
+from = "burn_by_service"
+[[cell.step]]
+count = true
+
+# ── the right-hand side: shipping, per service ────────────────────────────────────────
+
+[[cell]]
+name = "deploys_scoped"
+from = "deploys"
+[[cell.step]]
+filter = { column = "environment", op = "eq", param = "environment", skip_when = "all" }
+
+[[cell]]
+name = "ship_by_service"
+from = "deploys_scoped"
+[[cell.step]]
+group_by = { by = ["service"], agg = [
+  { agg = "count", as = "deploys" },
+  { column = "lead_time_hours", agg = "mean", as = "lead_hours" },
+] }
+
+# ── where they meet ───────────────────────────────────────────────────────────────────
+#
+# `left`, not `inner`: a service we watch and never deploy to must stay on the page with a
+# gap where its deploy count would be, rather than disappearing from a risk register.
+
+[[cell]]
+name = "risk"
+from = "burn_by_service"
+[[cell.step]]
+join = { with = "ship_by_service", on = "service", how = "left" }
+[[cell.step]]
+derive = { name = "errors_per_deploy", expr = "errors / deploys" }
+[[cell.step]]
+sort = { column = "burn_pct", descending = true }
+
+# The other half of the same question, and it adds no columns: which services have an error
+# budget and no deploys at all?
+[[cell]]
+name = "unshipped"
+from = "burn_by_service"
+[[cell.step]]
+join = { with = "ship_by_service", on = "service", how = "anti" }
+[[cell.step]]
+select = ["service", "burn_pct", "errors"]
+
+[[cell]]
+name = "unshipped_count"
+from = "unshipped"
+[[cell.step]]
+count = true
+
+[[pane]]
+cell = "services_watched"
+metric = { label = "Services watched" }
+
+[[pane]]
+cell = "unshipped_count"
+metric = { label = "Watched but never deployed" }
+
+[[pane]]
+cell = "risk"
+title = "Burn against shipping"
+table = { max_rows = 10 }
+
+[[pane]]
+cell = "unshipped"
+title = "No deploys in this window"
+table = { max_rows = 10 }
+
+[[pane]]
+cell = "burn_by_service"
+title = "Mean budget burn"
+bar = { label_column = "service", value_column = "burn_pct" }

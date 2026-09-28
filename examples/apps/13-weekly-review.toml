@@ -1,0 +1,164 @@
+# MANAGER / EXEC — the weekly business review, with the numbers that must not move fenced off
+# from the ones that should.
+#
+# The mechanic worth the whole page: `company_revenue` and `company_accounts` read the source
+# directly. When someone in the room narrows to one region, those two are not recomputed —
+# they are not even looked at. The company number stays on screen, unchanged and demonstrably
+# untouched, while everything beside it re-slices. Run `dagpane explain` and read the
+# "never looked at" line: that is the guarantee, in a terminal, before anyone is in the room.
+
+[app]
+title = "Weekly business review"
+subtitle = "26 weeks, four regions, three segments"
+
+[[source]]
+name = "weekly"
+csv = "../data/weekly_metrics.csv"
+
+[[input]]
+name = "region"
+label = "Region"
+select = { options = ["all", "north", "south", "east", "west"], default = "all" }
+
+[[input]]
+name = "segment"
+label = "Segment"
+select = { options = ["all", "smb", "mid-market", "strategic"], default = "all" }
+
+[[input]]
+name = "from_week"
+label = "From week"
+slider = { min = 1.0, max = 26.0, step = 1.0, default = 1.0 }
+
+[[cell]]
+name = "scoped"
+from = "weekly"
+[[cell.step]]
+filter = { column = "week_index", op = "ge", param = "from_week" }
+[[cell.step]]
+filter = { column = "region", op = "eq", param = "region", skip_when = "all" }
+[[cell.step]]
+filter = { column = "segment", op = "eq", param = "segment", skip_when = "all" }
+
+[[cell]]
+name = "revenue"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "revenue", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "new_accounts"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "new_accounts", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "churned"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "churned_accounts", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "tickets"
+from = "scoped"
+[[cell.step]]
+group_by = { agg = [{ column = "support_tickets", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "per_week"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["week_index"], agg = [
+  { column = "revenue", agg = "sum", as = "revenue" },
+] }
+[[cell.step]]
+sort = { column = "week_index" }
+
+[[cell]]
+name = "by_region"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["region"], agg = [
+  { column = "revenue", agg = "sum", as = "revenue" },
+  { column = "new_accounts", agg = "sum", as = "new_accounts" },
+] }
+[[cell.step]]
+sort = { column = "revenue", descending = true }
+
+[[cell]]
+name = "by_segment"
+from = "scoped"
+[[cell.step]]
+group_by = { by = ["segment"], agg = [
+  { column = "revenue", agg = "sum", as = "revenue" },
+  { column = "accounts", agg = "mean", as = "mean_accounts" },
+] }
+[[cell.step]]
+sort = { column = "revenue", descending = true }
+
+# ── the fence ─────────────────────────────────────────────────────────────────────────
+# Both read `weekly`. No control on this page is upstream of them, so no control on this
+# page can make them wrong, slow, or briefly blank.
+
+[[cell]]
+name = "company_revenue"
+from = "weekly"
+[[cell.step]]
+group_by = { agg = [{ column = "revenue", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[cell]]
+name = "company_new_accounts"
+from = "weekly"
+[[cell.step]]
+group_by = { agg = [{ column = "new_accounts", agg = "sum", as = "total" }] }
+[[cell.step]]
+scalar = { column = "total" }
+
+[[pane]]
+cell = "revenue"
+metric = { label = "Revenue in view", prefix = "$", decimals = 0 }
+
+[[pane]]
+cell = "new_accounts"
+metric = { label = "New accounts" }
+
+[[pane]]
+cell = "churned"
+metric = { label = "Churned" }
+
+[[pane]]
+cell = "tickets"
+metric = { label = "Support tickets" }
+
+[[pane]]
+cell = "company_revenue"
+metric = { label = "Company revenue, 26w", prefix = "$", decimals = 0 }
+
+[[pane]]
+cell = "company_new_accounts"
+metric = { label = "Company new accounts, 26w" }
+
+[[pane]]
+cell = "per_week"
+title = "Revenue by week"
+line = { x_column = "week_index", y_column = "revenue" }
+
+[[pane]]
+cell = "by_region"
+title = "By region"
+bar = { label_column = "region", value_column = "revenue" }
+
+[[pane]]
+cell = "by_segment"
+title = "By segment"
+table = { max_rows = 5 }

@@ -1,0 +1,71 @@
+{
+  "machine": {
+    "host": "vm",
+    "cpus": 4
+  },
+  "when": "2026-09-18T16:15:01.471Z",
+  "app": "/tmp/tmp.tBbm3zlvuM/agg/agg.toml",
+  "csv_bytes": 7936950,
+  "settle_ms": 700,
+  "samples_per_rung": 5,
+  "rungs": [
+    {
+      "sessions": 0,
+      "rss": 13582336,
+      "pss": 11490304
+    },
+    {
+      "sessions": 1,
+      "rss": 23949312,
+      "pss": 21857280
+    },
+    {
+      "sessions": 2,
+      "rss": 24551424,
+      "pss": 22459392
+    },
+    {
+      "sessions": 4,
+      "rss": 34746368,
+      "pss": 32654336
+    },
+    {
+      "sessions": 8,
+      "rss": 35876864,
+      "pss": 33784832
+    },
+    {
+      "sessions": 16,
+      "rss": 36990976,
+      "pss": 34898944
+    },
+    {
+      "sessions": 32,
+      "rss": 39272448,
+      "pss": 37180416
+    },
+    {
+      "sessions": 64,
+      "rss": 43732992,
+      "pss": 41640960
+    },
+    {
+      "sessions": 128,
+      "rss": 52658176,
+      "pss": 50566144
+    },
+    {
+      "sessions": 256,
+      "rss": 70479872,
+      "pss": 68387840
+    },
+    {
+      "sessions": 512,
+      "rss": 106074112,
+      "pss": 103982080
+    }
+  ],
+  "marginal_rss_bytes_per_session": 148359.7267177437,
+  "marginal_pss_bytes_per_session": 148359.7267177437,
+  "fixed_rss_bytes": 13582336
+}

@@ -54,10 +54,66 @@ pub enum PaneKind {
         /// The column holding each point's y. Must be numeric.
         y_column: String,
     },
+    /// A pane this crate does not know how to draw, handed to a renderer the **client**
+    /// supplies.
+    ///
+    /// The four variants above are closed: adding a treemap meant editing this enum, [`View`],
+    /// [`render`], the manifest compiler and the client's own `switch` — five places in two
+    /// crates, and a rebuilt server binary. That is the right cost for a vocabulary the
+    /// runtime has to understand, and the wrong cost for a drawing.
+    ///
+    /// This variant is the seam. The engine does what it is actually good at — decide which
+    /// rows exist, decide whether anything moved, and put the answer on the wire — and hands
+    /// the drawing to a named function the page registered. A new visualisation costs **one
+    /// JavaScript function and one manifest stanza**, and no Rust at all.
+    ///
+    /// What this crate still guarantees: the renderer's data is typed and schema-carrying,
+    /// truncation is reported rather than hidden, and a pane whose *view* did not change is
+    /// still absent from the patch. A custom renderer cannot make the product claim untrue,
+    /// because it never touches the path that decides what goes on the wire.
+    Custom {
+        /// The renderer's name, as the client registered it. Not resolved here: this crate
+        /// has no opinion about what draws a `"sankey"`, and a server that refused to start
+        /// because a browser had not loaded a script yet would be checking the wrong thing in
+        /// the wrong process.
+        renderer: String,
+        /// Which columns to send, in this order. `None` sends every column.
+        ///
+        /// A **wire** economy, not a compute one. The cell still computes every column it
+        /// was written to compute; this decides how much of the answer crosses the socket. To
+        /// narrow the *computation*, put a `select` in the cell — that is what sub-node
+        /// invalidation reads.
+        #[serde(default)]
+        columns: Option<Vec<String>>,
+        /// How many rows to send, with the true height carried beside them exactly as a
+        /// [`PaneKind::Table`] carries it.
+        ///
+        /// The default is higher than a table's because the shapes differ in what they are
+        /// for: fifty rows is a page of a table and a fiftieth of a sparkline.
+        #[serde(default = "default_custom_max_rows")]
+        max_rows: usize,
+        /// Whatever the renderer wants, passed through from the manifest untouched.
+        ///
+        /// **Opaque JSON, deliberately.** Not [`Value`]: that is the engine's type, it is
+        /// internally tagged for the wire, and a renderer's colour scale is not a cell's
+        /// value. Typing this would mean every new option a drawing wants is a change to
+        /// this enum — which is the cost this variant exists to remove.
+        ///
+        /// Carried on the **pane**, which the client is sent once, and never on the
+        /// [`View`], which it is sent on every change. A renderer's configuration is static;
+        /// putting it in the view would grow every patch by a constant for no reason, and
+        /// this crate's whole argument is about what a patch weighs.
+        #[serde(default)]
+        options: std::collections::BTreeMap<String, serde_json::Value>,
+    },
 }
 
 fn default_max_rows() -> usize {
     50
+}
+
+fn default_custom_max_rows() -> usize {
+    500
 }
 
 /// A pane of the app: a cell, and how to show it. Static for the life of the process.
@@ -134,6 +190,18 @@ pub enum View {
         /// The y column's name, for the axis.
         y_label: String,
     },
+    /// Data for a renderer this crate does not know about. See [`PaneKind::Custom`].
+    ///
+    /// The renderer name travels with the data rather than being looked up from the pane id,
+    /// so a client can dispatch on the message alone — and so a pane that changed renderer
+    /// between two deploys cannot be drawn by the old one.
+    Custom {
+        /// Which registered renderer draws this.
+        renderer: String,
+        /// The cell's value, in whichever shape it has.
+        #[serde(flatten)]
+        data: CustomData,
+    },
     /// The cell is in error. A pane in error is still a pane: it keeps its place on the
     /// page and says what went wrong, rather than disappearing and taking the layout with it.
     Error {
@@ -142,6 +210,32 @@ pub enum View {
         /// The cell the failure originated in — not necessarily this pane's cell, which is
         /// the point: a user is pointed at the cause rather than at the messenger.
         cause: String,
+    },
+}
+
+/// What a custom renderer is handed, in the shape the cell's value actually has.
+///
+/// Two shapes rather than one, because a renderer for a gauge and a renderer for a treemap
+/// want different things and neither should have to unwrap the other's. A scalar wrapped in a
+/// one-by-one table would be a lie told for the sake of uniformity.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "data", rename_all = "snake_case")]
+pub enum CustomData {
+    /// The cell holds a frame: a schema, the rows sent, and the true height.
+    Table {
+        /// One header per column sent, in the order they were sent.
+        head: Vec<Head>,
+        /// The rows sent, each in the same column order. At most the pane's `max_rows`.
+        rows: Vec<Vec<Value>>,
+        /// The frame's real height, whatever was sent.
+        total_rows: usize,
+    },
+    /// The cell holds a scalar — a number, a string, a null.
+    Scalar {
+        /// The value, unformatted. A custom renderer is assumed to want the number rather
+        /// than this crate's rendering of it; [`format_scalar`] is available to a client that
+        /// wants the same text a [`View::Text`] would have carried.
+        value: Value,
     },
 }
 
@@ -197,7 +291,67 @@ pub fn render(pane: &Pane, outcome: &Outcome) -> View {
             },
             None => wrong_shape(pane, "a table", value),
         },
+        PaneKind::Custom {
+            renderer,
+            columns,
+            max_rows,
+            options: _,
+        } => match custom_view(renderer, value, columns.as_deref(), *max_rows) {
+            Ok(v) => v,
+            Err(e) => error_view(pane, e),
+        },
     }
+}
+
+/// A custom pane's data: a projection of a frame, or the scalar as it stands.
+///
+/// A named column that the frame does not have is an **error**, not an omission. A chart that
+/// silently drew three of its four series because somebody renamed a column is the failure
+/// this whole project is arranged to make impossible, and a renderer has no way to notice.
+fn custom_view(
+    renderer: &str,
+    value: &Value,
+    columns: Option<&[String]>,
+    max_rows: usize,
+) -> Result<View, CellError> {
+    let Some(t) = value.as_frame() else {
+        return Ok(View::Custom {
+            renderer: renderer.to_string(),
+            data: CustomData::Scalar {
+                value: value.clone(),
+            },
+        });
+    };
+
+    let picked: Vec<usize> = match columns {
+        Some(names) => names
+            .iter()
+            .map(|n| {
+                t.column_index(n)
+                    .ok_or_else(|| CellError::failed(format!("no column `{n}` to send")))
+            })
+            .collect::<Result<_, _>>()?,
+        None => (0..t.width()).collect(),
+    };
+
+    let schema = t.schema();
+    let shown = t.head(max_rows);
+    Ok(View::Custom {
+        renderer: renderer.to_string(),
+        data: CustomData::Table {
+            head: picked
+                .iter()
+                .map(|c| {
+                    let (name, column_type) = schema[*c].clone();
+                    Head { name, column_type }
+                })
+                .collect(),
+            rows: (0..shown.rows())
+                .map(|r| picked.iter().map(|c| shown.value_at(r, *c)).collect())
+                .collect(),
+            total_rows: t.rows(),
+        },
+    })
 }
 
 fn error_view(pane: &Pane, e: CellError) -> View {
@@ -461,6 +615,126 @@ mod tests {
                 value_label: "v".into()
             }
         );
+    }
+
+    fn custom(columns: Option<Vec<String>>, max_rows: usize) -> Pane {
+        pane(PaneKind::Custom {
+            renderer: "sankey".into(),
+            columns,
+            max_rows,
+            options: Default::default(),
+        })
+    }
+
+    #[test]
+    fn a_custom_pane_sends_a_schema_and_the_true_height() {
+        let big = Table::new(vec![Column::int("n", (0..100).map(Some).collect())]).unwrap();
+        let View::Custom {
+            renderer,
+            data:
+                CustomData::Table {
+                    head,
+                    rows,
+                    total_rows,
+                },
+        } = render(&custom(None, 10), &Outcome::ok(Value::table(big)))
+        else {
+            panic!("expected a custom table view")
+        };
+        assert_eq!(renderer, "sankey");
+        assert_eq!(head.len(), 1);
+        assert_eq!(rows.len(), 10);
+        assert_eq!(
+            total_rows, 100,
+            "a custom pane tells the truth about truncation too"
+        );
+    }
+
+    #[test]
+    fn a_custom_pane_sends_the_columns_it_named_in_the_order_it_named_them() {
+        let View::Custom {
+            data: CustomData::Table { head, rows, .. },
+            ..
+        } = render(
+            &custom(Some(vec!["v".into(), "k".into()]), 50),
+            &Outcome::ok(Value::table(t())),
+        )
+        else {
+            panic!("expected a custom table view")
+        };
+        assert_eq!(
+            head.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(),
+            vec!["v", "k"],
+            "the projection is ordered by the manifest, not by the frame"
+        );
+        assert_eq!(rows[0], vec![Value::float(1.5), Value::text("a")]);
+    }
+
+    #[test]
+    fn a_custom_pane_naming_a_column_that_is_gone_is_an_error_not_an_omission() {
+        // The failure this rules out is silent: a renderer handed three of its four series
+        // draws a chart that looks fine and is wrong, and has no way to notice.
+        let v = render(
+            &custom(Some(vec!["k".into(), "renamed".into()]), 50),
+            &Outcome::ok(Value::table(t())),
+        );
+        let View::Error { message, .. } = v else {
+            panic!("expected an error view, got {v:?}")
+        };
+        assert!(message.contains("`renamed`"), "{message}");
+    }
+
+    #[test]
+    fn a_custom_pane_over_a_scalar_hands_the_value_over_unformatted() {
+        let v = render(&custom(None, 50), &Outcome::ok(Value::float(0.82)));
+        assert_eq!(
+            v,
+            View::Custom {
+                renderer: "sankey".into(),
+                data: CustomData::Scalar {
+                    value: Value::float(0.82)
+                }
+            },
+            "a gauge wants the number, not this crate's rendering of it"
+        );
+    }
+
+    #[test]
+    fn a_custom_view_round_trips_through_the_wire_encoding() {
+        // `CustomData` is flattened into `View`, and a flattened internally-tagged enum is
+        // exactly the serde shape that silently stops round-tripping. Nothing else would
+        // catch it: the server would send bytes the client could not read back.
+        for v in [
+            render(&custom(None, 50), &Outcome::ok(Value::table(t()))),
+            render(&custom(None, 50), &Outcome::ok(Value::int(3))),
+        ] {
+            let json = serde_json::to_string(&v).unwrap();
+            assert!(json.contains("\"view\":\"custom\""), "{json}");
+            assert!(json.contains("\"renderer\":\"sankey\""), "{json}");
+            assert_eq!(
+                serde_json::from_str::<View>(&json).unwrap(),
+                v,
+                "custom views must survive the trip they exist to make: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custom_panes_options_never_reach_the_view() {
+        // Options are static and the view is sent on every change. Putting them in the view
+        // would add a constant to every patch, which is the one thing this crate argues about.
+        let mut options = std::collections::BTreeMap::new();
+        options.insert("unit".to_string(), serde_json::json!("USD"));
+        let p = pane(PaneKind::Custom {
+            renderer: "sankey".into(),
+            columns: None,
+            max_rows: 50,
+            options,
+        });
+        let json = serde_json::to_string(&render(&p, &Outcome::ok(Value::table(t())))).unwrap();
+        assert!(!json.contains("USD"), "{json}");
+        // …and they do reach the pane, which is sent once.
+        assert!(serde_json::to_string(&p).unwrap().contains("USD"));
     }
 
     #[test]

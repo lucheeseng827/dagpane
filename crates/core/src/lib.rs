@@ -67,8 +67,11 @@
 
 pub mod digest;
 pub mod error;
+pub mod expr;
 pub mod frame;
 pub mod graph;
+pub mod placement;
+pub mod reads;
 pub mod session;
 pub mod trace;
 pub mod transform;
@@ -76,7 +79,9 @@ pub mod value;
 
 pub use digest::{Digest, Digestible};
 pub use error::{BuildError, CellError, SessionError};
+pub use expr::{Expr, ExprError};
 pub use graph::{CellId, Compute, Graph, GraphBuilder, Inputs};
+pub use placement::{Cut, CutError, Placement, Split};
 pub use session::{Outcome, Session};
 pub use trace::{Step, StepOutcome, Trace};
 pub use value::{Column, ColumnData, ColumnType, Table, Value};

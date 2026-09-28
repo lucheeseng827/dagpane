@@ -6,9 +6,10 @@ looks like it is working. Nobody reports that as a bug, because nothing looks wr
 of this document is about it.
 
 The other half of the posture is one sentence and it is stated before anything else, in
-case a reader stops here: **there is no authentication in v0.1.0.** `dagpane run` binds
-`127.0.0.1` and `--host` anything else prints a warning naming the consequence. Anyone who
-can reach the address can read every pane of the app.
+case a reader stops here: **authentication is off unless you turn it on.** `dagpane run`
+binds `127.0.0.1`, `--host` anything else prints a warning naming the consequence, and
+`--auth-jwks` puts a front door on. Without that flag, anyone who can reach the address can
+read every pane of the app.
 
 ## Reporting
 
@@ -105,27 +106,100 @@ sets one gets its own slot. `sessions_over_one_graph_do_not_share_values` and
 
 These are documented, not findings. A report that one of them exists gets this section back.
 
-**No authentication, and no plan for one in v0.1.0.** There is no login, no token, no
-per-pane authorisation and no audit of who read what. The deployment answer is that
-`dagpane run` binds loopback and the CLI prints, for anything else:
+**Authentication is optional, and off is still the default.** `--auth-jwks` puts a front
+door on: tokens are verified against a JWKS the operator supplies as a file, with the issuer,
+the audience, the algorithm allowlist and the per-app rule all named on the command line.
+Without it there is no login and no authorisation, and the CLI prints, for any bind that is
+not loopback:
 
 ```
-dagpane: warning — binding 0.0.0.0:8787, which is reachable from outside this machine.
-         There is no authentication in this version: anyone who can reach that
-         address can read every pane of this app. See SECURITY.md.
+dagpane: warning — binding 0.0.0.0:8787, which is reachable from outside this machine,
+         with no authentication. Anyone who can reach that address can read every
+         pane of this app. Pass --auth-jwks to put a front door on it, or put one in
+         front. See SECURITY.md.
 ```
+
+What the door does **not** cover, stated because the gap is the interesting part:
+
+* **Per-pane authorisation.** Access is per app. A viewer who may open an app sees every
+  pane of it.
+* **An audit of who read what.** A refusal is logged with the subject; an accepted
+  connection is not.
+* **Revocation before a token expires.** There is no introspection call and no deny list —
+  again, because this process makes no outbound requests. `--auth-leeway-secs` is small and
+  the practical control is a short token lifetime at the provider.
+* **`/` itself.** The page is served without a token, because the page is where the sign-in
+  starts. It carries no data: every value arrives over the socket, which is the thing that
+  checks.
 
 The bundled `Dockerfile` needs `--host 0.0.0.0` to be useful at all, and says in its header
 to put the container behind something that authenticates before it is reachable by anyone
-you would not show the data to.
+you would not show the data to. That remains true and is now one of two answers.
 
-**Loopback is not a boundary against a browser.** The `/ws` upgrade does not check the
-`Origin` header. WebSocket connections are not subject to the same-origin policy and there
-is no preflight, so any page a viewer visits — in the same browser, on the same machine —
-can open `ws://127.0.0.1:8787/ws`, receive the `init` message, and read every pane. The
-default port is 8787 and guessing it is not a defence. An origin allowlist on the upgrade
-is the cheapest fix and it is not in v0.1.0; until it is, "it only binds loopback" means
-"only software on this machine can read it", not "only you can read it".
+**The token never goes in a URL.** It travels in `Authorization: Bearer` for anything that
+can set a header, and in a `Sec-WebSocket-Protocol` entry for a browser, which cannot. A
+query string is logged by every proxy in the path, and a credential in an access log is a
+credential — so `?t=` is refused even though it would have been the easiest thing to write.
+In the browser the token lives in `sessionStorage`: it dies with the tab, and it is never
+written to the fragment beside the saved state.
+
+**Two JWT attacks are closed by construction rather than by a check.** `alg: none` and
+`HS256` signed with the verifier's own public key are the two that have cost people their
+systems, and both rely on a verifier trusting the token's own header. `dagpane_auth::Algorithm`
+has no variant for either, so an operator cannot allowlist them; the JWKS loader skips `oct`
+keys, so there is no secret in the key set to HMAC against. `crates/auth/tests/verify.rs`
+mounts both attacks and asserts the refusal.
+
+**A refusal tells the caller almost nothing.** Wrong audience, expired, unknown key and a
+bad signature all produce the same `401` and the same sentence; only "you may not open this
+app" is distinguished, as a `403`, because that viewer has authenticated and sending them
+back to a login would be a loop that cannot succeed. The detail goes to the server log, where
+the operator is rather than where a prober is.
+
+**A viewer's control values travel in a URL.** A session is durable because the viewer
+carries it: the client keeps its input values in the page's **fragment** and hands them to
+the server on the socket's query string. Two consequences, and the first is the one that
+matters:
+
+* A **fragment** is never sent to a server, so it does not appear in an access log, a
+  referrer header or a proxy's request log. That is why the durable half lives there.
+* The **query string** on the `/ws` upgrade does carry them, and anything terminating TLS or
+  proxying in front of this can log it. If an app has a free-text input and a viewer types
+  something sensitive into it, that string can end up in a reverse proxy's log. There is no
+  mechanism here that stops it: do not put a secret in a control, and if an app's controls
+  are sensitive, turn off query logging on whatever sits in front.
+
+What a saved state **cannot** do is reach anything a `Set` could not. It goes through the
+same two predicates — the widget must accept the value, and the cell must be a source of a
+compatible type — because a resume is deliberately not a privileged path. `total` is a
+computed cell and a saved state naming it is dropped and reported, not applied;
+`crates/serve/tests/resume.rs` asserts both. The size of a saved state is capped
+(`dagpane_app::resume::MAX_ENCODED_BYTES`) and an oversized one is refused whole rather than
+truncated, so a viewer never gets half a remembered state with no way to see which half.
+
+**Loopback is a boundary against a browser page, and not against anything else.** The
+`/ws` upgrade checks `Origin` against an allowlist derived from the bound address — both
+schemes, plus `localhost` when the bind is loopback — and answers `403` otherwise. That
+closes the case this section previously said was open: a page a viewer happens to have
+open elsewhere in the same browser can no longer connect to `ws://127.0.0.1:8787/ws` and
+read every pane, because a page cannot suppress its own `Origin`.
+
+What remains true, and is why this is still listed here rather than deleted:
+
+* A request with **no** `Origin` is allowed, because that is a non-browser client — `curl`,
+  a script, the integration tests. Anything that can open a socket on the machine can still
+  read every pane. "It only binds loopback" means "only software on this machine can read
+  it", never "only you can read it".
+* `GET /` is **not** origin-checked at all. It serves a static page and no data, but it is
+  not a boundary either.
+* This is an anti-CSRF measure and not authentication. Where `--auth-jwks` is configured it
+  complements authentication and does not replace it; without that flag it is the only check
+  the socket makes.
+
+It also has a deployment consequence worth stating where operators will find it: behind a
+reverse proxy on a different hostname the browser sends that hostname, which never matches
+the bound address, so the page loads and the socket is refused. `OPERATIONS.md` has the
+verified matrix and the two supported shapes; `docs/RUNBOOK.md` §1 is the symptom.
 
 **No rate limit.** A connection is a sequential loop — read a message, run a pass, send a
 patch — so one client cannot overlap passes with itself, but nothing bounds how fast it
@@ -192,7 +266,7 @@ compared against `location.protocol` to choose `ws://` or `wss://`, and the SVG 
 that `createElementNS` requires — so a third one appearing fails the build rather than
 quietly making an air-gapped deployment render blank.
 
-`dagpane-core` has one dependency, serde. All four crates carry
+`dagpane-core` has one dependency, serde. Every crate in the workspace — all eight — carries
 `#![forbid(unsafe_code)]`, so there is no `unsafe` block in this project to review.
 `cargo-deny` (advisories, bans, licences, sources) and `cargo audit --deny warnings` run on
 every commit.
