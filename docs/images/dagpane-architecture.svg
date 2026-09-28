@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1200 620" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="dagpane-arch-title dagpane-arch-desc">
+  <title id="dagpane-arch-title">dagpane system architecture</title>
+  <desc id="dagpane-arch-desc">A manifest and its data sources compile into the app model, which declares a graph to the pure reactive core. The core's evaluated trace reaches a viewer either as a served session behind an optional auth gate, sending WebSocket patches, or as the same engine exported and compiled to WebAssembly for a server-less, inline page.</desc>
+  <defs>
+    <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;display=swap');</style>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+    <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+    <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+  </defs>
+
+  <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+  <!-- ===== Arrows first (behind boxes) ===== -->
+
+  <!-- Manifest -> app -->
+  <line x1="170" y1="304" x2="226" y2="304" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <!-- app -> core (accent: entering the engine) -->
+  <line x1="376" y1="304" x2="432" y2="304" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+  <!-- core -> serve -->
+  <line x1="582" y1="304" x2="638" y2="304" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <!-- serve -> auth -->
+  <line x1="788" y1="304" x2="844" y2="304" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <!-- auth -> Browser (link: external-facing) -->
+  <line x1="974" y1="304" x2="1030" y2="304" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+
+  <!-- Data sources -> app (link: external I/O), straight vertical, shared x -->
+  <line x1="301" y1="174" x2="301" y2="272" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+  <!-- app -> wasm, straight vertical, dashed (optional export path) -->
+  <line x1="301" y1="336" x2="301" y2="434" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+  <!-- wasm -> Browser, dashed, routes under the served path -->
+  <path d="M 376,466 H 1087 Q 1095,466 1095,458 V 336" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+  <!-- ===== Arrow labels (masked, 6-10px clear of the stroke) ===== -->
+
+  <rect x="180" y="284" width="36" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="198" y="293" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">READ</text>
+
+  <rect x="386" y="284" width="36" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="404" y="293" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">GRAPH</text>
+
+  <rect x="592" y="284" width="36" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="610" y="293" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TRACE</text>
+
+  <rect x="798" y="284" width="36" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="816" y="293" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">AUTH</text>
+
+  <rect x="984" y="284" width="36" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="1002" y="293" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PATCH</text>
+
+  <rect x="311" y="215" width="34" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="328" y="224" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">LOAD</text>
+
+  <rect x="311" y="379" width="42" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="332" y="388" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">EXPORT</text>
+
+  <rect x="700" y="446" width="42" height="12" rx="2" fill="#f5f5f5"/>
+  <text x="721" y="455" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">INLINE</text>
+
+  <!-- ===== Nodes ===== -->
+
+  <!-- Manifest (input) -->
+  <rect x="40" y="272" width="130" height="64" rx="6" fill="#f5f5f5"/>
+  <rect x="40" y="272" width="130" height="64" rx="6" fill="#4f5d75" fill-opacity="0.10" stroke="#7a8399" stroke-width="1"/>
+  <rect x="48" y="280" width="30" height="12" rx="2" fill="none" stroke="#7a8399" stroke-opacity="0.40" stroke-width="0.8"/>
+  <text x="63" y="289" fill="#7a8399" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CFG</text>
+  <text x="105" y="308" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Manifest</text>
+  <text x="105" y="324" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">.toml · cells</text>
+
+  <!-- Data sources (external) -->
+  <rect x="226" y="110" width="150" height="64" rx="6" fill="#f5f5f5"/>
+  <rect x="226" y="110" width="150" height="64" rx="6" fill="#2d3142" fill-opacity="0.03" stroke="#2d3142" stroke-opacity="0.30" stroke-width="1"/>
+  <rect x="234" y="118" width="30" height="12" rx="2" fill="none" stroke="#2d3142" stroke-opacity="0.22" stroke-width="0.8"/>
+  <text x="249" y="127" fill="#7a8399" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SRC</text>
+  <text x="301" y="146" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Data sources</text>
+  <text x="301" y="162" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">csv · http · sql</text>
+
+  <!-- app (backend/step, hub) -->
+  <rect x="226" y="272" width="150" height="64" rx="6" fill="#f5f5f5"/>
+  <rect x="226" y="272" width="150" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <rect x="234" y="280" width="30" height="12" rx="2" fill="none" stroke="#2d3142" stroke-opacity="0.40" stroke-width="0.8"/>
+  <text x="249" y="289" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">MDL</text>
+  <text x="301" y="308" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">app</text>
+  <text x="301" y="324" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">views · patch diff</text>
+
+  <!-- core (focal) -->
+  <rect x="432" y="272" width="150" height="64" rx="6" fill="#f5f5f5"/>
+  <rect x="432" y="272" width="150" height="64" rx="6" fill="#eb6c36" fill-opacity="0.08" stroke="#eb6c36" stroke-width="1"/>
+  <rect x="440" y="280" width="30" height="12" rx="2" fill="none" stroke="#eb6c36" stroke-opacity="0.50" stroke-width="0.8"/>
+  <text x="455" y="289" fill="#eb6c36" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ENG</text>
+  <text x="507" y="308" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">core</text>
+  <text x="507" y="324" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">graph · digest</text>
+
+  <!-- serve (backend/step) -->
+  <rect x="638" y="272" width="150" height="64" rx="6" fill="#f5f5f5"/>
+  <rect x="638" y="272" width="150" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <rect x="646" y="280" width="30" height="12" rx="2" fill="none" stroke="#2d3142" stroke-opacity="0.40" stroke-width="0.8"/>
+  <text x="661" y="289" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SRV</text>
+  <text x="713" y="308" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">serve</text>
+  <text x="713" y="324" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">axum · sessions · ws</text>
+
+  <!-- auth (optional, dashed) -->
+  <rect x="844" y="272" width="130" height="64" rx="6" fill="#f5f5f5"/>
+  <rect x="844" y="272" width="130" height="64" rx="6" fill="#2d3142" fill-opacity="0.02" stroke="#2d3142" stroke-opacity="0.35" stroke-width="1" stroke-dasharray="4,3"/>
+  <rect x="852" y="280" width="30" height="12" rx="2" fill="none" stroke="#2d3142" stroke-opacity="0.22" stroke-width="0.8"/>
+  <text x="867" y="289" fill="#7a8399" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">JWT</text>
+  <text x="909" y="308" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">auth</text>
+  <text x="909" y="324" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">JWKS · optional</text>
+
+  <!-- Browser (viewer / external) -->
+  <rect x="1030" y="272" width="130" height="64" rx="6" fill="#f5f5f5"/>
+  <rect x="1030" y="272" width="130" height="64" rx="6" fill="#4f5d75" fill-opacity="0.10" stroke="#7a8399" stroke-width="1"/>
+  <rect x="1038" y="280" width="30" height="12" rx="2" fill="none" stroke="#7a8399" stroke-opacity="0.40" stroke-width="0.8"/>
+  <text x="1053" y="289" fill="#7a8399" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">EXT</text>
+  <text x="1095" y="308" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Browser</text>
+  <text x="1095" y="324" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">viewer</text>
+
+  <!-- wasm (optional, dashed, exported engine) -->
+  <rect x="226" y="434" width="150" height="64" rx="6" fill="#f5f5f5"/>
+  <rect x="226" y="434" width="150" height="64" rx="6" fill="#2d3142" fill-opacity="0.02" stroke="#2d3142" stroke-opacity="0.35" stroke-width="1" stroke-dasharray="4,3"/>
+  <rect x="234" y="442" width="34" height="12" rx="2" fill="none" stroke="#2d3142" stroke-opacity="0.22" stroke-width="0.8"/>
+  <text x="251" y="451" fill="#7a8399" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">WASM</text>
+  <text x="301" y="470" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">wasm</text>
+  <text x="301" y="486" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">no server needed</text>
+
+  <!-- ===== Legend strip ===== -->
+  <line x1="40" y1="558" x2="1160" y2="558" stroke="#2d3142" stroke-opacity="0.10" stroke-width="0.8"/>
+  <text x="40" y="574" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+
+  <rect x="40" y="590" width="14" height="10" rx="2" fill="#eb6c36" fill-opacity="0.08" stroke="#eb6c36" stroke-width="1"/>
+  <text x="60" y="598" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Focal / engine</text>
+
+  <rect x="185" y="590" width="14" height="10" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="205" y="598" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Backend / step</text>
+
+  <rect x="330" y="590" width="14" height="10" rx="2" fill="#2d3142" fill-opacity="0.03" stroke="#2d3142" stroke-opacity="0.30" stroke-width="1"/>
+  <text x="350" y="598" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">External data</text>
+
+  <rect x="470" y="590" width="14" height="10" rx="2" fill="#4f5d75" fill-opacity="0.10" stroke="#7a8399" stroke-width="1"/>
+  <text x="490" y="598" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Person-facing</text>
+
+  <rect x="615" y="590" width="14" height="10" rx="2" fill="#2d3142" fill-opacity="0.02" stroke="#2d3142" stroke-opacity="0.35" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="635" y="598" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Optional path</text>
+
+  <line x1="780" y1="595" x2="808" y2="595" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+  <text x="816" y="598" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">External I/O</text>
+
+  <line x1="930" y1="595" x2="958" y2="595" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+  <text x="966" y="598" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Enters the engine</text>
+
+  <line x1="1090" y1="595" x2="1118" y2="595" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+  <text x="1126" y="598" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Export</text>
+</svg>
