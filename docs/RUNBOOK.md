@@ -3,8 +3,8 @@
 Symptom first. `OPERATIONS.md` is the companion for deciding how to run this; reach for this
 file when it is already running and something is wrong.
 
-Every command here is one you can paste, and every quoted output was produced by
-`dagpane 0.1.1` on this tree rather than written from memory.
+Every command here is one you can paste, and every quoted output was produced by `dagpane`
+built from this tree rather than written from memory.
 
 ---
 
@@ -17,7 +17,7 @@ $ curl -s -o /dev/null -w '%{http_code}\n' \
     -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
     -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
     -H "Origin: https://THE-HOSTNAME-USERS-TYPE" \
-    https://THE-HOSTNAME-USERS-TYPE/ws       # 101 = healthy.  403 = read §1.  Anything else = §2
+    https://THE-HOSTNAME-USERS-TYPE/ws       # 101 = healthy.  403 = §1 (§15 under dagpane host).  404 under dagpane host = §15.  Anything else = §2
 $ dagpane explain /path/to/app.toml --set SOME_INPUT=VALUE    # does an interaction still work?
 ```
 
@@ -27,7 +27,7 @@ is the one that catches the most common production failure in this version.
 | what you see | go to |
 |---|---|
 | page loads, controls do nothing | [§1](#1-the-page-loads-and-the-controls-do-nothing) |
-| nothing is listening | [§2](#2-nothing-is-listening-even-though-it-printed-a-url) |
+| nothing is listening, whether or not a URL was printed | [§2](#2-it-stopped-at-start-up-before-printing-a-url) |
 | process will not start | [§3](#3-the-process-refuses-to-start) |
 | one pane shows an error, the rest are fine | [§4](#4-one-pane-shows-an-error-and-the-rest-of-the-page-is-fine) |
 | every pane is empty or wrong | [§5](#5-every-pane-is-empty-or-shows-zero) |
@@ -38,6 +38,9 @@ is the one that catches the most common production failure in this version.
 | the process vanished during a deploy | [§10](#10-the-process-vanished-during-a-deploy) |
 | the wrong people can read it | [§11](#11-the-wrong-people-can-read-it) |
 | a number looks suspiciously unchanged | [§12](#12-a-number-did-not-change-and-i-do-not-know-if-that-is-a-bug) |
+| the log says a connection was dropped | [§13](#13-the-log-says-a-connection-was-dropped) |
+| the log says a ping went unanswered | [§14](#14-the-log-says-a-ping-went-unanswered) |
+| dagpane host answers 404 for every app | [§15](#15-dagpane-host-answers-404-for-every-app) |
 
 ---
 
@@ -54,15 +57,24 @@ this app does not accept WebSocket connections from https://panels.example.com;
 open it at its own address
 ```
 
-**Cause.** The `/ws` upgrade checks the browser's `Origin` against an allowlist derived from
-**the address the process bound**, and nothing else. A proxy, ingress or load balancer on a
-real hostname means the browser sends that hostname, which never matches the bound address. It
-is an anti-CSRF measure, it is working as designed, and there is no flag to change it.
+**Cause.** The `/ws` upgrade checks the browser's `Origin` against an allowlist. Under
+`dagpane run` that allowlist is derived from **the address the process bound**, and nothing
+else; under `dagpane serve` it is too, unless `--origin` replaces it. A proxy, ingress or load
+balancer on a real hostname means the browser sends that hostname, which never matches the
+bound address. It is an anti-CSRF measure and it is working as designed. `run` has no flag to
+change it; `serve` has `--origin`.
 
-**If the process was started with `--host 0.0.0.0`, this fires unconditionally.** The allowlist
-is derived from the bound address literally, so `0.0.0.0:8787` allows exactly
-`http://0.0.0.0:8787` — which no browser ever sends. Every containerised deployment hits this,
-proxy or not, because `--host 0.0.0.0` is what makes a container reachable at all. Verified:
+Under `dagpane host` the check is different — the `Origin` is compared with the request's own
+`Host`, not with the bound address — so the fixes below do not apply and rewriting `Origin` does
+not help: a `403` there means the proxy is not forwarding the hostname users type as `Host`,
+and [§15](#15-dagpane-host-answers-404-for-every-app) has the fix.
+
+**If the process bound a wildcard with no `--origin` — `run --host 0.0.0.0`, or `serve` at
+its default bind — this fires unconditionally.** The derived allowlist is the bound address
+literally, so `0.0.0.0:8787` allows exactly `http://0.0.0.0:8787` — which no browser ever
+sends. Every containerised deployment without `--origin` hits this, proxy or not, because a
+wildcard bind is what makes a container reachable at all, and it is where `serve` binds by
+default. `serve` warns about it at start-up; `run` does not. Verified:
 
 ```console
 $ # process bound 0.0.0.0:8813, reached over plain localhost, no proxy anywhere
@@ -72,15 +84,30 @@ $ curl ... -H 'Origin: http://127.0.0.1:8813' http://127.0.0.1:8813/ws     # the
 403
 ```
 
-There will be **nothing in the server log** about this. Nothing is logged per connection.
+There will be **nothing in the server log** about the refused upgrades, so under `run`, and
+under `serve` once its start-up warning has scrolled away, nothing says why.
 
 **Fix — pick one.**
+
+* **Under `serve`, pass `--origin` with the URL users type** — scheme, host and port, no
+  trailing slash, once per name the app is published at:
+
+  ```sh
+  dagpane serve app.toml --origin https://panels.example.com
+  ```
+
+  The declared origins **replace** the derived allowlist rather than extend it, so the address
+  the process bound stops being allowed, and nothing in front has to rewrite `Origin`. A value
+  no browser would send — no scheme, a trailing slash, a path — is refused at start-up with the
+  fix named.
+
+Under `run`, which has no `--origin`:
 
 * **Reach it at the address it bound — which requires that address to be loopback.**
   `ssh -L 8787:127.0.0.1:8787 host`, then open `http://127.0.0.1:8787`. This works only if the
   remote process bound `127.0.0.1`. Tunnelling to a process bound `0.0.0.0` still sends
   `Origin: http://127.0.0.1:8787` against an allowlist holding only `http://0.0.0.0:8787`, so
-  it is still refused — a wildcard bind needs the proxy below.
+  it is still refused — a wildcard bind needs the proxy below, or `serve --origin` above.
 * **Make the proxy allowlist the incoming `Origin`, then rewrite it** to the bound address.
   Rewriting unconditionally forwards every origin as the allowed one and hands back exactly
   the CSRF the check exists to stop, so both halves are needed:
@@ -112,37 +139,43 @@ deployment. A `200` on the page proves nothing about whether the app works.
 
 ---
 
-## 2. Nothing is listening, even though it printed a URL
+## 2. It stopped at start-up, before printing a URL
 
-**Confirm.** The process printed its banner and a URL, then exited or sat there while the port
-refused connections:
+**Confirm.** The process printed its banner and its settings, then an error naming an address,
+and exited without printing a URL:
 
 ```
 dagpane: Funnel explorer — 11 cells, 7 panes
-dagpane: http://127.0.0.1:8805
-dagpane: Address already in use (os error 98)
+dagpane: heartbeat 25s — keep the idle timeout in front of this above that
+dagpane: writes    30s per frame beyond what a 128 kbit/s link needs — a client that stops reading, or falls that far behind, is dropped
+dagpane: answers   30s per ping beyond what a 128 kbit/s link needs — a client that stops reading, or goes, is dropped
+dagpane: 127.0.0.1:8805: Address already in use (os error 98)
 ```
 
-**Cause.** The banner and the URL are printed **before the bind is attempted**, so that URL
-line is not evidence that anything is listening. The real answer is the line after it. Common
-ones:
+**Cause.** The URL is printed only once its port is bound — `run`'s URL, `serve`'s app and
+probe addresses, `host`'s list of apps — so a process that printed one is listening on that
+port, and one that stopped before it could not bind. The last line names the address and why.
+Common ones:
 
 | message | meaning |
 |---|---|
 | `Address already in use (os error 98)` | something already holds that port |
-| `Cannot assign requested address (os error 99)` | `--host` names an address this machine does not have |
+| `Cannot assign requested address (os error 99)` | `--host` or `--bind` names an address this machine does not have |
 | `Permission denied (os error 13)` | a port below 1024 without the capability to bind it |
 
-**Fix.** `ss -ltnp \| grep :PORT` to find the holder; change `--port`, or stop the other
-process. For a wrong `--host`, use `0.0.0.0` to bind everything or the address the interface
-actually has — and read the no-auth warning that a non-loopback bind prints.
+`dagpane` 0.1.1 and earlier print the URL before the bind is attempted, so their logs can show a
+URL and then this error, with nothing listening.
 
-**Prevent.** Check both. The process does exit non-zero on a bind failure (verified: `1` on
-`Address already in use`), so ordinary restart-on-failure handling is doing its job — but the
-printed URL is not evidence of anything, and a port held by *another* process leaves you with
-something answering on it that is not this app. So keep the exit-status handling and add a
-readiness check on the port itself: an HTTP probe against `/` in Kubernetes,
-`ExecStartPost`/`systemd-notify` or a simple `curl` gate elsewhere.
+**Fix.** `ss -ltnp \| grep :PORT` to find the holder; change `--port`, or stop the other
+process. `--port 0` takes any free port, and the URL says which. For a wrong address, use
+`0.0.0.0` to bind everything or the address the interface actually has — and read the no-auth
+warning that a non-loopback bind prints.
+
+**Prevent.** The process exits non-zero on a bind failure (`1` on `Address already in use`), so
+ordinary restart-on-failure handling is doing its job. A port held by *another* process still
+leaves something answering there that is not this app, so make the readiness check ask the app
+rather than the port: an HTTP probe against `/` in Kubernetes — `/readyz` on the probe port for
+`serve` and `host` — and a `curl` gate elsewhere.
 
 ---
 
@@ -297,13 +330,23 @@ $ ps -o lstart= -p $(pgrep -f 'dagpane run')
 $ stat -c '%y %n' /path/to/*.csv
 ```
 
-If the file is newer than the process, the process is serving the older data.
+If the file is newer than the process, the process is serving the older data — unless the
+source is scheduled, which `dagpane check app.toml` says in one line per source
+(`sales: re-read every 300 s …`).
 
-**Cause.** **Not a bug.** Sources are loaded once, at start-up, and shared immutably across
-every session. There is no file watcher and no hot reload. Replacing the CSV under a running
-process changes nothing that anybody sees.
+**Cause.** One of two, and the console says which.
 
-**Fix.** Restart the process. Prefer `SIGINT` — see §10.
+* **The source names no `refresh_secs`.** Not a bug: it was read when the app compiled and
+  nothing re-reads it. Replacing the CSV under a running process changes nothing anybody sees.
+* **It does, and the schedule is not applying what it reads.** Every refusal and failure is a
+  line on stderr, repeated each interval: `refresh of … — …; keeping the rows it had`. The usual
+  one is a change of columns — a refresh changes rows, never their shape — and the line names
+  both shapes. A schedule also only runs while somebody is viewing the app; the first viewer
+  after a quiet spell checks at once.
+
+**Fix.** For new rows in place, name `refresh_secs` on the source. For a refused change of
+columns, redeploy — the app was checked against the old shape. Otherwise restart the process;
+on 0.1.1, with `SIGINT` — see §10.
 
 **Prevent.** Run the refresh loop rather than a bare `aws s3 sync` at the live directory:
 `examples/bucket/serve.sh` does `sync → check → swap → restart`, only restarts when the content
@@ -341,22 +384,36 @@ never lands there in the first place.
 ## 10. The process vanished during a deploy
 
 **Confirm.** The process exited on a stop or a rolling update, viewers saw the page drop rather
-than settle, and the exit was "killed by signal 15".
+than settle, and the exit was "killed by signal 15" — or, in a container, the stop took the
+whole grace period and the exit code was `137`.
 
-**Cause.** Signal handling, verified:
+**Cause.** From 0.2.0 `dagpane` handles both signals, in every mode. Verified by signalling a
+running 0.2.0 under `run`, `serve` and `host`:
 
 | signal | behaviour | exit |
 |---|---|---|
 | `SIGINT` | graceful — stops accepting, in-flight requests finish | `0` |
-| `SIGTERM` | **not handled** — immediate termination | killed by signal 15 |
+| `SIGTERM` | graceful, identically | `0` |
 
-**systemd and Kubernetes both send `SIGTERM` by default**, and the published image sets no
-`STOPSIGNAL`, so the default path is the abrupt one.
+Under `serve` and `host` either signal runs the drain first. Every mode then closes each open
+socket with `1001`, *going away*, and the page's banner reads "Reconnecting — the server this
+page was on is stopping" while it goes back. If nothing answers — a single instance restarting
+— it then falls to "Disconnected" and backs off until something does, which is expected. A
+page that goes **straight** to "Disconnected" was cut off instead: by a `SIGKILL`, a binary
+that predates the close, or a socket still open when the 2 s after the listener closed ran
+out (the log says how many).
 
-**Fix.** Nothing is lost — a session holds no work, only control positions, which reset to the
-manifest defaults on reconnect. Viewers reconnect and get a fresh first render.
+So the symptom means a binary that predates the fix: **0.1.1 handles `SIGINT` only**, and that
+includes the `mancube/dagpane:0.1.1` image. **systemd and Kubernetes both send `SIGTERM` by
+default**, so on 0.1.1 the default path is the abrupt one — and in that image the binary is
+PID 1, where an unhandled `SIGTERM` is not a termination but *ignored*: the stop waits out its
+grace period and ends in `SIGKILL`.
 
-**Prevent.** Ask for the graceful signal explicitly:
+**Fix.** Nothing is lost — a session holds no work, only control positions, and the page
+carries those to its next connection. Viewers reconnect to the view they left.
+
+**Prevent.** Run 0.2.0 or later. CI requires `docker stop` to exit `0` on every image it
+builds, and on the image it publishes, before it is pushed. On 0.1.1, ask for the graceful signal explicitly:
 
 ```ini
 [Service]
@@ -368,8 +425,9 @@ TimeoutStopSec=15
 STOPSIGNAL SIGINT
 ```
 
-A `preStop` hook cannot change which signal is sent, so in Kubernetes this has to be baked into
-an image of your own.
+For the `mancube/dagpane:0.1.1` image itself, `docker run --stop-signal SIGINT` does the same.
+A `preStop` hook cannot change which signal is sent, so in Kubernetes on 0.1.1 this has to be
+baked into an image of your own. Both are harmless, and unnecessary, on 0.2.0.
 
 ---
 
@@ -466,6 +524,137 @@ using.
 graphs, 2 400 interactions, each asserted both for correctness against a full recompute and for
 economy against the structural closure (`crates/core/tests/oracle.rs`). A stale number on a page
 that looks fine is the one failure mode this project is built not to have.
+
+---
+
+## 13. The log says a connection was dropped
+
+```
+dagpane: dropped a connection to sales: a frame waited 30.1s to be written, so its client had stopped reading or fallen behind
+```
+
+**What it means.** A frame — an answer, a refresh, a ping — could not be written within its
+allowance, 30 s plus the time a 128 kbit/s link needs for the frame, so the client was not
+reading, or had fallen too far behind what it was sent, and the server let the connection go
+rather than hold its session (and, for a scheduled source, the rows it had) for as long as the
+client liked. `OPERATIONS.md`, *A connection that stops reading*.
+
+**Usually.** A tab whose process is wedged, a laptop that slept mid-frame, or a proxy that
+stopped forwarding. A line now and then is the deadline doing its job; the bundled page
+reconnects on its own if it is ever reading again.
+
+**Many lines, for clients you know to be real.** Either they read more slowly than 128 kbit/s
+— raise `--write-timeout-seconds` (on `run`, `serve` or `host`), or send fewer rows — or they
+are sent more than their link carries, refreshes of a large table landing faster than they can
+be read. A longer timeout only keeps those connected further behind; refresh less often, or
+send fewer rows.
+
+**Many lines, from clients you do not know.** Something is opening connections and not
+reading them. The deadline bounds what each one holds; how many there are is the proxy's to
+limit.
+
+---
+
+## 14. The log says a ping went unanswered
+
+```
+dagpane: dropped a connection to sales: a ping went 30.0s unanswered, so its client had stopped reading or gone
+```
+
+**What it means.** A ping was not answered within its allowance — 30 s, plus the time a
+128 kbit/s link needs for everything the connection wrote since the client last answered one —
+so the client had stopped reading or was no longer there, and the server let the connection go
+rather than hold its session until TCP noticed: a quarter of an hour for a client that stopped
+acknowledging, and never for one whose kernel still does. `OPERATIONS.md`, *A connection that
+stops reading*.
+
+**Usually.** A laptop shut or a phone off the network with the page still open: nothing told
+the server, and nothing would have for a quarter of an hour. Or a phone that put its browser
+in the background, which can suspend the page and its answers with it. A desktop browser
+answers pings without the page's script, so a background tab or a busy page is not the cause,
+and neither is a busy server: an answer that arrived while it was busy is read before anyone
+is dropped. When the device wakes, or the page is opened again, the bundled page reconnects on
+its own.
+
+**Many lines, for clients you know to be real.** Something between them and this process is
+not passing pings or their answers through — a proxy that ends the WebSocket itself and does
+not forward its control frames — or their links stall for longer than the allowance. Raise
+`--ping-timeout-seconds` (on `run`, `serve` or `host`), or set it to `0` and go back to the
+cost described above.
+
+**Many lines, from clients you do not know.** Something is opening connections and abandoning
+them. The deadline bounds how long each one is held; how many there are is the proxy's to
+limit.
+
+---
+
+## 15. dagpane host answers 404 for every app
+
+**Confirm.** The page at the hostname users type is a `404`, and its body says the *name* is
+the problem rather than the app:
+
+```console
+$ curl -s -H 'Host: sales.example.com' http://127.0.0.1:8787/
+no app is served at sales.example.com: this server does not answer to that name
+```
+
+stderr names the domain it was under, once:
+
+```
+dagpane: refused Host "sales.example.com": no domain this host answers under contains it, so every name under "example.com" gets 404 (logged once per domain). If example.com is a domain you control and publish these apps under, pass --domain example.com
+```
+
+and the `names` line the process printed at start-up says exactly which names it does answer:
+
+```
+dagpane: names     <app>.localhost — e.g. sales.localhost; any other name, a bare <app> or an address gets 404
+```
+
+A body that stops at `no app is served at sales.example.com`, with nothing after it, is a
+different problem: the name is one it answers, and there is no `sales.toml` — or the file's
+name is not a DNS label, which start-up reported as skipped. And do not wait for the stderr
+line: it is written once per domain, and at most 32 times per process for domains, addresses
+and bare names together, so on a process that has been up a while, or been probed, it may
+already have been spent. The body is the confirmation that does not run out.
+
+**Cause.** `dagpane host` answers a name only if it is exactly one label — the app — in front
+of a domain it was given: `<app>.localhost` always, and `<app>.<domain>` for each `--domain`.
+Every other name is refused before anything is read, because whoever controls a name's DNS can
+point it at this machine, and a page served under that name then sends its own name as both
+`Host` and `Origin` (`OPERATIONS.md`, *The constraint that catches everyone*). Three ways to get
+here:
+
+| what you see | what happened |
+|---|---|
+| no `--domain` on the command line; `names` lists only `<app>.localhost` | the proxy forwards the public hostname, and its domain was never declared. A process bound beyond loopback warned about exactly this at start-up |
+| `--domain sales.example.com`; `names` lists `<app>.sales.example.com` | the domain was set to one app's full hostname, so that app answers at `sales.sales.example.com` and nothing answers at `sales.example.com`. Start-up warned, and named the fix |
+| the refused `Host` is an address, and stderr says `never by address` | the proxy sends its upstream's address as `Host` — nginx's `proxy_pass http://127.0.0.1:8787` with no `proxy_set_header Host`, or a balancer that rewrites it. A container's or Service's bare name (`Host: dagpane`) is the same mistake, logged as `never by a bare name`. The upgrade probe answers `403` here, not `404`: the `Origin` check runs first, and the `Host` is not the name in `Origin` — go by the page's `404` |
+
+**Fix.** Pass the domain the apps sit **under** — the parent of their hostnames, not one app's
+hostname — and restart:
+
+```sh
+dagpane host ./apps --domain example.com     # sales.toml answers at sales.example.com
+```
+
+If the proxy sends an address or its upstream's name, make it forward the hostname the user
+typed: `proxy_set_header Host $host;` in nginx, or, behind eggrd, which sets `Host` from its
+upstream URL, make that URL's hostname the public one (`docs/PUBLIC-HTTPS.md`). Then the upgrade
+probe from **First five minutes**, with `Origin: https://sales.example.com` sent to
+`https://sales.example.com/ws`, should answer `101`.
+
+**Do not "fix" this by declaring whatever the log names.** The name in a refused `Host` came
+from whoever sent the request, which is why the line says *if you control it*: declare a domain
+whose DNS is yours. Never reach for a shared wildcard service (`localtest.me` and `lvh.me`,
+which answer every name with loopback; `nip.io` and `sslip.io`, which answer with the address
+the name spells) or a public suffix (`duckdns.org`, `github.io`, `co.uk`) to get
+a name that resolves — declaring a domain trusts every name directly under it, and under those
+it is somebody else's DNS that answers. The process refuses a single label such as `com` at
+start-up; it cannot know which multi-label domains are public.
+
+**Prevent.** Read the `names` line at every start-up — it is the one statement of what the
+process answers to — and gate the deploy on the upgrade probe at the hostname users type, not on
+`GET /` against the bound address.
 
 ---
 

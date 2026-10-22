@@ -42,12 +42,18 @@ carries the fuller version with download figures.
   comemo                           https://github.com/typst/comemo
     0.5.1, published 2026-01-29. MIT OR Apache-2.0. Typst's memoization engine.
 
-    Taken: nothing, in v0.1.0. It is recorded here because it is the idea this project most
-    owes and has not paid. `#[track]` makes a type's *accesses* observable and `#[memoize]`
-    reuses a cached result when only untouched parts of an argument changed; applied to a
-    table that is column-level provenance — a cell reading 3 of 200 columns not
-    invalidating when column 47 moves. dagpane invalidates at whole-value granularity:
-    change one cell of a `Table` and everything reading that table recomputes.
+    Taken, in 0.2.0: the idea. `#[track]` makes a type's *accesses* observable and
+    `#[memoize]` reuses a cached result when only untouched parts of an argument changed;
+    applied to a table that is column-level provenance, and dagpane now invalidates that
+    way — a manifest cell reading 3 of 200 columns does not recompute when column 47 moves.
+    A `filter` or `sort` over an input's own column and rows also records its question and
+    its answer — the rows it kept, the order it produced — which is comemo's constrained
+    memoization applied to a frame. ADR-0006 has the design. Not taken: the mechanism and
+    the cache. dagpane records one claim per pipeline step rather than observing every
+    access, because an insert per value read would cost more than the recomputation it
+    saves, and comemo's global cache with coarse eviction would be wrong for a server
+    holding many sessions. v0.1.0 and 0.1.1 took nothing and invalidated at whole-value
+    granularity: change one cell of a `Table` and everything reading that table recomputed.
 
   Shiny                            https://shiny.posit.co
     R, 2012. Posit. py-shiny 1.6.0 in 2026.

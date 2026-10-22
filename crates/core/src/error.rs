@@ -173,6 +173,11 @@ pub enum SessionError {
     /// A cell id from a different graph. Ids are indices, so using one across graphs would
     /// silently read the wrong cell rather than fail.
     ForeignCell(CellId),
+    /// [`crate::Session::rebase`] was offered a graph that is not this session's with new
+    /// starting values. A session's slots are positions in its graph, so they can move only
+    /// onto a graph with the same cells, edges, declared types and computations — which is
+    /// exactly what [`crate::Graph::with_sources`] builds, and nothing else is.
+    OtherGraph,
 }
 
 impl fmt::Display for SessionError {
@@ -191,6 +196,10 @@ impl fmt::Display for SessionError {
             SessionError::ForeignCell(id) => {
                 write!(f, "cell id {} does not belong to this graph", id.index())
             }
+            SessionError::OtherGraph => f.write_str(
+                "that graph is not this session's with new starting values, so the session \
+                 cannot move onto it",
+            ),
         }
     }
 }

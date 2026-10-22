@@ -2,7 +2,7 @@
 # Build the module and drive it in a real WebAssembly engine.
 #
 # `cargo test -p dagpane-wasm` tests `engine.rs` on the host, which is where the logic is. It
-# does NOT test the four `extern "C"` exports, the hand-written length prefix or the
+# does NOT test the five `extern "C"` exports, the hand-written length prefix or the
 # JavaScript that has to agree with both — and a hand-rolled ABI goes wrong exactly there.
 # `benches/wasm-engines/README.md` learnt the same lesson from the other side: a `cargo check`
 # is not a measurement.

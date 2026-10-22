@@ -248,13 +248,13 @@ cheaper than a line removed from a README after someone else removes it for you.
 **About the reactive graph**
 
 * ❌ *"The first true reactive dependency graph for data apps."* Shiny, 2012. Observable's runtime. marimo.
-* ❌ *"Recomputes only the transitive closure of what changed"* offered as a differentiator. That sentence describes marimo exactly. The differentiator is what counts as *"what changed"* — and in v0.1.0 that answer is "a cell's value", which is smaller than a rerun but is not smaller than a cell.
+* ❌ *"Recomputes only the transitive closure of what changed"* offered as a differentiator. That sentence describes marimo exactly. The differentiator is what counts as *"what changed"* — and in v0.1.0 that answer is "a cell's value", which is smaller than a rerun but is not smaller than a cell. In 0.2.0, for a manifest or SQL cell, it is the columns its steps read — and for some filters and sorts, only the rows they kept or the order they produced (ADR-0006).
 * ❌ Listing *"salsa"* and *"the rust-analyzer red-green algorithm"* as two prior arts. They are one codebase, published by rust-analyzer's own maintainer. See §5.
 * ❌ *"Built on Adapton."* Its last release was 2019-12-22 and it does 435 downloads a quarter. Cite the papers.
 
 **About WASM and client-side compute**
 
-* ❌ *"dagpane runs in the browser."* It does not. `cargo check -p dagpane-core --target wasm32-unknown-unknown` exits 0, CI runs it, and that is the entire claim. There is no `crates/wasm`, no wasm-bindgen, no client-side compute, and nothing has ever executed in a browser. The check is a real constraint on the core — no filesystem, no clock, no threads — and nothing more.
+* ❌ *"dagpane runs in the browser"*, unqualified. Through 0.1.1 it did not: `cargo check -p dagpane-core --target wasm32-unknown-unknown` was the entire claim. 0.2.0 ships `crates/wasm` and `dagpane export`, which writes a folder of static files whose page runs the whole graph as WebAssembly, with no wasm-bindgen; CI drives an exported bundle in Node's WebAssembly engine (`crates/wasm/tests/run.sh`). What it leaves out is everything a server was doing — no front door, no scheduled refresh, no HTTP or SQL sources (ADR-0007) — and placement *per cell*: `place = "client"` is checked and reported, and nothing serves a split yet (ADR-0008). Say "an exported app runs in the browser", not "dagpane does".
 * ❌ *"Rust/WASM means a smaller download than Python/WASM."* False for anything shipping a SQL engine: `duckdb-eh.wasm` is 34.25 MB uncompressed (jsDelivr, 1.33.1-dev57.0, 2026-06-22) against shinylive's ~13 MB Pyodide base.
 * ❌ *"Polars in the browser."* Polars does not build for `wasm32-unknown-unknown`; `pola-rs/polars#16729` (2024-06-04) and `#19211` (2024-10-12) are both open.
 * ❌ *"First to run the same engine on server or client."* Perspective 5.3.1 (2026-09-04) ships exactly that, Apache-2.0, OpenJS Foundation, with a memory64 build past the 4 GB wall.
@@ -279,7 +279,7 @@ follows is an intellectual debt ledger, and it is a real one.
 | prior art | state as of 2026-09-08 | taken | not taken |
 |---|---|---|---|
 | **salsa** — *and this is also "the rust-analyzer red-green algorithm"; they are the same codebase, published by rust-analyzer's maintainer Lukas Wirth, and presenting them as two entries is an error* | 0.28.2, published 2026-08-03; Apache-2.0 OR MIT; 7,957,243 lifetime / 2,254,440 downloads in 90 days; self-described *"(experimental)"* | **Backdating** — stop propagating when a recomputed value equals the previous one. dagpane's digest comparison is that idea at cell granularity, and it is the single mechanism that makes an over-declared edge cost one recomputation instead of a cascade. `crates/core/src/session.rs` is where it lives. | The **demand-driven pull** discipline and the global revision counter. dagpane pushes dirty marks over the structural closure and evaluates eagerly in ascending `height`; salsa validates lazily on demand. dagpane also did not take salsa's compile-time query set — this graph is built at run time from a manifest — nor **durability tiers**, which would be the right answer to "a 600-row CSV source should never be revalidated because a slider moved" and are not built. |
-| **comemo** (Typst's engine) | 0.5.1, 2026-01-29; MIT OR Apache-2.0; 2,763,162 lifetime / 1,121,750 in 90 days | **Nothing, in v0.1.0.** Recorded here because it is the idea this project most owes and has not paid: `#[track]` makes a type's *accesses* observable and `#[memoize]` reuses a cached result when only untouched parts of an argument changed. Applied to a table, that is column-level provenance — a cell reading 3 of 200 columns not invalidating when column 47 moves. | All of it, for now. dagpane invalidates at whole-value granularity: change one cell of a `Table` and every cell reading that table recomputes. comemo's global cache with coarse eviction would also be wrong for a multi-session server even if the mechanism were adopted. This is the gap POSITIONING.md's condition 3 is about, and it is not closed. |
+| **comemo** (Typst's engine) | 0.5.1, 2026-01-29; MIT OR Apache-2.0; 2,763,162 lifetime / 1,121,750 in 90 days | **Nothing in v0.1.0 or 0.1.1; in 0.2.0, the idea.** `#[track]` makes a type's *accesses* observable and `#[memoize]` reuses a cached result when only untouched parts of an argument changed. Applied to a table, that is column-level provenance — a cell reading 3 of 200 columns not invalidating when column 47 moves — and 0.2.0 invalidates that way (ADR-0006, which names comemo as the prior art). A `filter` or a `sort` over an input's own column and rows goes one step further and records its question and its answer — the rows it kept, the order it produced — which is comemo's constrained memoization applied to a frame. | The mechanism and the cache. comemo observes every access; dagpane records one claim per pipeline step, worked out from the nine verbs, because an insert per value read would cost more than the recomputation it saves. A compute that makes no claim — a Rust closure, unless it writes one — is still compared whole. comemo's global cache with coarse eviction would be wrong for a multi-session server; a dagpane session's slots are its cache and go with it. |
 | **Shiny's reactive graph (R, 2012)** — and py-shiny 1.6.0 | py-shiny 1.6.0, 2026; 259,860 dl/30d | The **origin of the whole idea** in a data-app framework, and the credit belongs here rather than to marimo. Also the demonstration that a reactive graph is worth *inspecting*: Shiny 1.6.0's OpenTelemetry export is the ancestor of `dagpane explain`. | **Read-time dependency capture**, which is Shiny's actual mechanism and leptos's — the reader is recorded when a value is read, so the graph is exact and needs no analysis. The dossier this module was built from recommended it explicitly. dagpane went the other way, on purpose: read-time capture means the graph exists only after a run, so a cycle is a run-time surprise, the graph cannot be printed before it executes, and it cannot be built once and shared immutably across sessions. ADR-0001 records that decision and the cost it accepts — an over-declared edge — rather than pretending there is none. |
 | **Observable's runtime** | Framework 1.13.4, last npm publish 2026-03-02 | The **topologically-sorted cell dataflow** shape. dagpane's ascending-`height` pass is the same family of answer to the same glitch problem: evaluate in an order where every input is final before its consumer runs. | Framework's build-time data-loader model, which is a different product — snapshots computed once at build, not recomputed per interaction. |
 | **Adapton** | 0.3.31, last published 2019-12-22; 435 downloads in 90 days; MPL-2.0; dead | The **papers** — the Demanded Computation Graph, and **nominal matching**: naming allocations so a re-execution reuses the same node identity instead of allocating a fresh one. | The crate, which would be a finding in any review. And the mechanism, which v0.1.0 does not need: dagpane's graph is built once and never changes shape at run time, so node identity is trivially stable. The problem nominal Adapton names arrives the moment a manifest can add or remove cells while a session is live, and that is the day to read the papers properly. |
@@ -310,8 +310,9 @@ any head-to-head.
 
 **"Perspective already ships symmetric client/server compute."** Yes — 5.3.1, 2026-09-04,
 Apache-2.0, OpenJS Foundation, with a memory64 build past 4 GB. dagpane has not built engine
-placement and must not imply it has. `cargo check --target wasm32-unknown-unknown` is a
-constraint on the core, not a browser story.
+placement and must not imply it has: `place = "client"` is checked and reported, and nothing
+serves a split (ADR-0008). What 0.2.0 has is `dagpane export`, which runs a whole app in the
+page — the engine on one side, which is not placement.
 
 **"Four Rust attempts already failed at this."** True: 599 downloads across 90 days between
 `rustview`, `venus`, `GORBIE` and the `streamlit` crate. `rustview` is specifically the
@@ -334,11 +335,12 @@ author who knows SQL will hit its edges. Past them, the author is writing a
 come from the resolved parse tree and never from scanning the text, and a control is written
 `:name`. That is a defensible position and the ceiling above it is still real.
 
-**"v0.1.0 has no authentication."** It did not; 0.1.1 has an optional one. `--auth-jwks`
-verifies OIDC id tokens against a JWKS file, so the process still makes no outbound request,
-and without it `dagpane run` binds 127.0.0.1 and `--host` anything else prints a warning. The
-narrower claim is the one worth holding onto: access is per **app** and never per pane, an
-accepted connection is not logged, and a token cannot be revoked before it expires.
+**"v0.1.0 has no authentication."** It did not, and neither did 0.1.1; 0.2.0 adds an
+optional one (`CHANGELOG.md`, 0.2.0). `--auth-jwks` verifies OIDC id tokens against a JWKS
+file, so the process still makes no outbound request, and without it `dagpane run` binds
+127.0.0.1 and `--host` anything else prints a warning. The narrower claim is the one worth
+holding onto: access is per **app** and never per pane, an accepted connection is not logged,
+and a token cannot be revoked before it expires.
 
 Sessions are still per-connection: closing the tab discards one, and there is no store, no
 eviction, no TTL and no server-side resumption token. The viewer's own control values ride in

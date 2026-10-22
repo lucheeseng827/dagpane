@@ -45,11 +45,17 @@
 # positions, which reset to their manifest defaults. Set INTERVAL against how often the data
 # genuinely moves, not as fast as the bucket will answer.
 #
-# ── No authentication ──────────────────────────────────────────────────────────────────
+# ── No authentication, and loopback ────────────────────────────────────────────────────
 #
-# There is none in this version. HOST defaults to loopback. If you set it to 0.0.0.0 to put
-# this in a container, the thing in front of it has to authenticate, or the bucket's contents
-# are readable by anyone who can route to the port. See SECURITY.md.
+# `dagpane run` authenticates only when given `--auth-jwks`, and this script does not give it.
+# HOST defaults to loopback, which is the shape this is for: reached over an SSH tunnel at
+# http://127.0.0.1:<port>, or through a proxy on the same machine. `run` allows a browser only
+# from the origin of the address it bound, so any proxy on another name has to allowlist the
+# browser's Origin and then rewrite it to http://<HOST>:<port>, or the page loads with dead
+# controls — OPERATIONS.md has that proxy, for the loopback HOST. Set HOST=0.0.0.0 and
+# whatever is in front also has to authenticate, or the bucket's contents are readable by
+# anyone who can route to the port; and a tunnel no longer helps, because no browser sends
+# http://0.0.0.0:<port>. SECURITY.md has the rest.
 set -eu
 
 SRC="${1:?usage: serve.sh <bucket-uri> [manifest-name]}"

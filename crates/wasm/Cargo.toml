@@ -1,7 +1,7 @@
 # Explicit fields, no `workspace = true` inheritance — same reason as the other crates.
 [package]
 name = "dagpane-wasm"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/dagpane"
@@ -32,7 +32,7 @@ crate-type = ["cdylib", "rlib"]
 # backends are observably identical, so this is a size knob and never a behaviour one — and
 # in a browser the size knob is the whole argument. `BENCHMARKS.md` has what Arrow weighs
 # compiled for wasm32 (1.6 MiB raw) against what this crate weighs without it.
-dagpane-app = { path = "../app", version = "0.1.1", default-features = false }
-dagpane-core = { path = "../core", version = "0.1.1" }
+dagpane-app = { path = "../app", version = "0.2.0", default-features = false }
+dagpane-core = { path = "../core", version = "0.2.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

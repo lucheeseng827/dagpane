@@ -135,39 +135,49 @@ pub fn front_door(args: &AuthArgs) -> Result<Option<Arc<Auth>>, String> {
     })))
 }
 
-/// What to print at start-up about who can reach this.
-///
-/// The `--host` warning is not deleted when a front door exists — it is **replaced**, because
-/// binding a public address is still a thing an operator should see confirmed, and because
-/// "there is a door" and "the door is the one you meant" are different claims.
-pub fn describe(addr: &std::net::SocketAddr, auth: Option<&Auth>, apps: &str) {
-    match auth {
-        Some(auth) => {
-            let access = match &auth.policy.access {
-                Access::AnyApp => "any valid token opens it".to_string(),
-                Access::Claim(name) => format!("a token's `{name}` must list it"),
-            };
-            println!(
-                "dagpane: authenticated — {} key(s), issuer {}, audience {}; {access}",
-                auth.jwks.len(),
-                auth.policy.issuer,
-                auth.policy.audience,
-            );
-            if auth.login.is_none() {
-                println!(
-                    "         no browser sign-in configured: a token has to arrive from \
-                     something in front"
-                );
-            }
-        }
-        None if addr.ip().is_loopback() => {}
-        None => {
-            eprintln!(
-                "dagpane: warning — binding {addr}, which is reachable from outside this \
-                 machine,\n         with no authentication. Anyone who can reach that \
-                 address can read every\n         pane of {apps}. Pass --auth-jwks to put a \
-                 front door on it, or put one in\n         front. See SECURITY.md."
-            );
-        }
+/// What to print at start-up about the front door: the policy that loaded, which is the only
+/// confirmation that it is the policy meant. Printed with the other settings, before anything is
+/// bound; with no front door there is nothing to say until the address is, and
+/// [`open_warning`] says it.
+pub fn describe(auth: Option<&Auth>) {
+    let Some(auth) = auth else {
+        return;
+    };
+    let access = match &auth.policy.access {
+        Access::AnyApp => "any valid token opens it".to_string(),
+        Access::Claim(name) => format!("a token's `{name}` must list it"),
+    };
+    println!(
+        "dagpane: authenticated — {} key(s), issuer {}, audience {}; {access}",
+        auth.jwks.len(),
+        auth.policy.issuer,
+        auth.policy.audience,
+    );
+    if auth.login.is_none() {
+        println!(
+            "         no browser sign-in configured: a token has to arrive from something in \
+             front"
+        );
     }
+}
+
+/// The warning for a listener others can reach with no front door, naming the address it
+/// bound — so asked for port 0 it names the port the kernel picked — or nothing.
+///
+/// It is not dropped when a front door exists so much as **replaced** by [`describe`]'s line,
+/// because binding a public address is still a thing an operator should see confirmed, and
+/// because "there is a door" and "the door is the one you meant" are different claims.
+pub fn open_warning(
+    bound: std::net::SocketAddr,
+    auth: Option<&Auth>,
+    apps: &str,
+) -> Option<String> {
+    (auth.is_none() && !bound.ip().is_loopback()).then(|| {
+        format!(
+            "dagpane: warning — binding {bound}, which is reachable from outside this \
+             machine,\n         with no authentication. Anyone who can reach that address can \
+             read every\n         pane of {apps}. Pass --auth-jwks to put a front door on it, \
+             or put one in\n         front. See SECURITY.md."
+        )
+    })
 }

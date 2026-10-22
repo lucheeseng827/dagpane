@@ -12,6 +12,7 @@
 //! dp_free(ptr, len)                          give any buffer back, whoever allocated it
 //! dp_open(ptr, len)        -> ptr            compile the app; the reply is its `init` frame
 //! dp_send(ptr, len)        -> ptr            one ClientMessage in, one ServerMessage out
+//! dp_deliver(ptr, len)     -> ptr            a split app's server message in, its patch out
 //! ```
 //!
 //! One length prefix rather than a second call for the length: a `dp_last_len()` would be a
@@ -26,8 +27,9 @@
 //!
 //! # The unsafe
 //!
-//! This module is the only place in the tree that is not `#![forbid(unsafe_code)]`, and the
-//! blocks below are the entire list. Each one turns a `(ptr, len)` pair the host chose into a
+//! This module is the only place in the tree that uses `unsafe` — `crates/wasm` is the one
+//! crate without `#![forbid(unsafe_code)]`, for its sake — and the blocks below are the entire
+//! list. Each one turns a `(ptr, len)` pair the host chose into a
 //! slice or a `Vec`, which is exactly the obligation a linear-memory ABI cannot avoid and must
 //! therefore state:
 //!

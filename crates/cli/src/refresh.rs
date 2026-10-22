@@ -41,15 +41,9 @@ pub fn run(app: Arc<App>, force: bool) -> Report {
     }
 }
 
-#[cfg(feature = "arrow-sources")]
-fn source_builder() -> Box<dyn dagpane_core::frame::FrameBuilder> {
-    Box::new(dagpane_frame_arrow::ArrowFrameBuilder::new())
-}
-
-#[cfg(not(feature = "arrow-sources"))]
-fn source_builder() -> Box<dyn dagpane_core::frame::FrameBuilder> {
-    Box::new(dagpane_core::frame::TableBuilder::new())
-}
+// The compile's own choice of representation, so a refresh can never load rows the app would
+// not have loaded itself — see `dagpane_app::source_builder`.
+use dagpane_app::source_builder;
 
 /// What the command found out.
 #[derive(Debug)]

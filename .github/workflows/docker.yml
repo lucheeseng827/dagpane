@@ -16,14 +16,20 @@
 # scan, so the image can only contain what survived them. The gate is not a promise made
 # about the image, it is the image's build context.
 #
-# A sibling learned this the expensive way: its 0.2.0 image was built while the mirror
-# sync was blocked, so the published container was made from source the public could not
-# read.
+# A sibling project learned this the expensive way: its own 0.2.0 image — its version, not
+# dagpane's — was built while the mirror sync was blocked, so the published container was
+# made from source the public could not read.
 #
 # ── Triggers ──────────────────────────────────────────────────────────────────────────
 #
-#   push tag `v*`      -> build and push mancube/dagpane:<version> and :latest
-#   workflow_dispatch  -> build only; set push=true to publish
+#   push tag `v*`      -> build, verify, push mancube/dagpane:<version> and :latest, then
+#                         pull <version> back and require the image that was verified
+#   workflow_dispatch  -> build and verify only; set push=true to publish
+#
+# Verify means the steps below the build, against the image this run built: `--version`
+# names the version, `check` passes, and the browser-shaped and SIGTERM smoke that .github/workflows/ci.yml
+# runs. Nothing is pushed until all of them pass, so a failed check publishes nothing. Only
+# the push itself and the pull-back after it can fail once something is public.
 #
 # The `v*` tag is created by the monorepo's sync when a `dagpane-oss-v*` tag is pushed
 # there. It uses a personal access token rather than GITHUB_TOKEN, so the tag genuinely
@@ -59,7 +65,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to build (e.g. 0.1.0). Must match Cargo.toml."
+        description: "Version to build (e.g. 0.2.0). Must match Cargo.toml."
         required: true
       push:
         description: "Push to Docker Hub (false = build only)"
@@ -122,8 +128,10 @@ jobs:
           [ "$WS" = "$V" ] || { echo "::error::version '$V' != workspace version '$WS'"; exit 1; }
           echo "Tag and Cargo.toml agree on $V."
 
-      # A `latest` that silently moves backwards is worse than no `latest`. Only a version
-      # at or above the one the tag already points at may claim it.
+      # Every release tag that is not a prerelease moves :latest. Nothing here compares it with
+      # the version :latest holds: releases are cut in order from one line, so the most recent
+      # is the highest. A maintenance branch would break that, and would need the comparison —
+      # a `latest` that silently moves backwards is worse than no `latest`.
       - name: Decide whether this version may move :latest
         id: tags
         env:
@@ -166,39 +174,143 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build, and push on a tag
+      # Built into this runner's own Docker and never pushed by this step: everything below
+      # runs against this exact image first, and only an image that passed all of it is
+      # published. Pushing first and checking after left a broken `:X` and `:latest` in the
+      # registry whenever a check failed. One architecture (see the header) is what lets
+      # `load` hold the whole result.
+      - name: Build the candidate
         id: build
         uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
         with:
           context: .
           file: ./Dockerfile
           platforms: ${{ env.PLATFORMS }}
-          push: ${{ steps.cfg.outputs.push == 'true' }}
-          load: ${{ steps.cfg.outputs.push != 'true' }}
+          push: false
+          load: true
           tags: ${{ steps.tags.outputs.list }}
-          # A plain multi-arch manifest; the attestation manifest some runtimes choke on
-          # buys nothing for a scratch image that is one static binary.
+          # A plain manifest; the attestation manifest some runtimes choke on buys nothing
+          # for a scratch image that is one static binary.
           provenance: false
 
-      # ci.yml proves the Dockerfile builds on every push. This proves the artifact that
-      # is about to be published, or was just published, is the binary it claims to be —
-      # a build that succeeds and produces a binary that cannot run is a real outcome.
-      - name: The published image is the binary, and the binary works
+      # ci.yml proves the Dockerfile builds on every push. This proves the image about to be
+      # published is the binary it claims to be — a build that succeeds and produces a binary
+      # that cannot run is a real outcome — before any registry has it.
+      - name: The candidate is the binary, and the binary works
         env:
           V: ${{ steps.cfg.outputs.version }}
-          PUSH: ${{ steps.cfg.outputs.push }}
         run: |
           set -euo pipefail
           REF="${IMAGE}:${V}"
-          if [ "$PUSH" = "true" ]; then
-            # Pull it back rather than trusting the local layer cache: this asserts what
-            # the registry actually serves, which is what a user gets.
-            docker pull --platform linux/amd64 "$REF"
-          fi
           # scratch: no shell and no examples inside, so the app is mounted — which is
           # also how anybody would really run this.
-          docker run --rm "$REF" --version
+          #
+          # And it names the version it is published as. The gate above reads Cargo.toml's
+          # first version line, which no crate inherits; the binary reports its own crate's.
+          said="$(docker run --rm "$REF" --version)"
+          echo "$said"
+          [ "$said" = "dagpane ${V}" ] || { echo "::error::${REF} says '${said}', not 'dagpane ${V}'"; exit 1; }
           docker run --rm -v "$PWD/examples:/app:ro" "$REF" check /app/sales.toml
+
+      # The same step runs against the image built for every CI run, in .github/workflows/ci.yml.
+      # Keep the two `run:` bodies identical; only REF differs. Here REF is the candidate
+      # this run built, before any registry has it.
+      - name: The candidate serves a browser, and stops on SIGTERM
+        env:
+          REF: ${{ env.IMAGE }}:${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          # A browser-shaped upgrade, which `--version` and `check` never were. The documented
+          # `docker run` served a page whose socket refused every browser (the bound address
+          # was the only origin, and a browser never names 0.0.0.0), and nothing caught it,
+          # because the image was only ever asked those two questions.
+          cleanup() {
+            rc=$?
+            [ "$rc" = 0 ] || docker logs dagpane-smoke || true
+            docker rm -f dagpane-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run -d --name dagpane-smoke -p 8787:8787 -p 9787:9787 \
+            -v "$PWD/examples:/app:ro" "$REF" \
+            serve /app/sales.toml --origin http://localhost:8787 --drain-seconds 1
+
+          ready=""
+          for _ in $(seq 100); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+              http://127.0.0.1:9787/readyz || true)
+            if [ "$code" = 200 ]; then ready=1; break; fi
+            sleep 0.2
+          done
+          [ -n "$ready" ] || { echo "::error::/readyz never answered 200"; exit 1; }
+
+          # --max-time because a successful upgrade holds the socket open: curl may then exit
+          # 28 having already printed 101, so the status is read and the exit code is not.
+          upgrade() {
+            curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+              -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+              -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+              -H "Origin: $1" http://127.0.0.1:8787/ws || true
+          }
+          expect() {
+            got=$(upgrade "$2")
+            echo "Origin $2 -> $got"
+            [ "$got" = "$1" ] || { echo "::error::Origin $2 got $got, expected $1"; exit 1; }
+          }
+          expect 101 http://localhost:8787   # the origin it was given
+          expect 403 https://evil.example    # any other page
+          expect 403 http://0.0.0.0:8787     # the bind's own: --origin replaces it, not adds
+
+          # And it stops on the signal every supervisor sends. The binary is PID 1 on scratch,
+          # where SIGTERM has no default action: unhandled, `docker stop` waits out its whole
+          # grace period and then SIGKILLs, which shows as exit code 137 rather than 0.
+          # In milliseconds, and under the 5 s default drain, so a binary that ignored
+          # --drain-seconds fails here too rather than passing on a rounded-down second.
+          start=$(date +%s%N)
+          docker stop -t 10 dagpane-smoke >/dev/null
+          took=$(( ($(date +%s%N) - start) / 1000000 ))
+          code=$(docker inspect -f '{{.State.ExitCode}}' dagpane-smoke)
+          echo "docker stop: ${took} ms, exit ${code}"
+          [ "$code" = 0 ] || { echo "::error::exit ${code} after docker stop: SIGTERM went unhandled"; exit 1; }
+          [ "$took" -le 4000 ] || { echo "::error::docker stop took ${took} ms with a 1 s drain"; exit 1; }
+
+      # Only now, and only what passed: every tag the candidate carries — the version, and
+      # :latest when the step above let it move — goes up from the image that was checked.
+      - name: Publish the candidate
+        if: steps.cfg.outputs.push == 'true'
+        env:
+          TAGS: ${{ steps.tags.outputs.list }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker push "$tag"
+          done <<< "$TAGS"
+
+      # And the registry serves what was checked. The local copy is untagged first — every
+      # tag, or the one left behind keeps the image here and the pull downloads nothing — so
+      # what is compared and then run is the registry's bytes, not the runner's.
+      - name: The registry serves the image that was checked
+        if: steps.cfg.outputs.push == 'true'
+        env:
+          V: ${{ steps.cfg.outputs.version }}
+          TAGS: ${{ steps.tags.outputs.list }}
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}:${V}"
+          checked="$(docker image inspect --format '{{.Id}}' "$REF")"
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker image rm "$tag"
+          done <<< "$TAGS"
+          docker pull --platform linux/amd64 "$REF"
+          served="$(docker image inspect --format '{{.Id}}' "$REF")"
+          [ "$served" = "$checked" ] || {
+            echo "::error::${REF} in the registry is ${served}, not the ${checked} that was checked"
+            exit 1
+          }
+          said="$(docker run --rm "$REF" --version)"
+          [ "$said" = "dagpane ${V}" ] || { echo "::error::${REF} says '${said}', not 'dagpane ${V}'"; exit 1; }
+          echo "${REF} is ${served}, says '${said}'."
 
       - name: Summary
         env:
@@ -206,7 +318,7 @@ jobs:
           PUSH: ${{ steps.cfg.outputs.push }}
         run: |
           if [ "$PUSH" = "true" ]; then
-            echo "Pushed and verified \`${IMAGE}:${V}\` (${PLATFORMS})." >> "$GITHUB_STEP_SUMMARY"
+            echo "Verified, then pushed \`${IMAGE}:${V}\` (${PLATFORMS})." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "Dry run: built and verified \`${IMAGE}:${V}\` (${PLATFORMS}); not pushed." >> "$GITHUB_STEP_SUMMARY"
           fi

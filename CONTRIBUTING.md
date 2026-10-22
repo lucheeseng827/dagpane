@@ -3,7 +3,7 @@
 ## The short version
 
 ```console
-$ cargo test --workspace                       # everything. 122 tests on this checkout
+$ cargo test --workspace                       # everything. 609 tests on this checkout
 $ cargo test -p dagpane-core                   # the whole reactive semantics, no browser
 $ cargo test -p dagpane-serve --test socket    # the real wire, over a real socket
 $ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
@@ -60,8 +60,8 @@ a test.
   dependency, serde. The banned list in CI is `tokio`, `axum`, `hyper`, `reqwest`, `ureq`,
   `std-async` and `futures`. This is what makes `cargo test -p dagpane-core` a complete test of the reactive
   semantics with nothing listening on anything, and it is what keeps
-  `cargo check -p dagpane-core --target wasm32-unknown-unknown` passing — which is the
-  entire WASM claim and is worth exactly what it costs.
+  `cargo check -p dagpane-core --target wasm32-unknown-unknown` passing — which through 0.1.1
+  was the entire WASM claim, and is now the floor `crates/wasm` builds on.
 * **Neither `crates/app` nor `crates/host` depends on a server.** No `tokio`, no `axum`, no
   `hyper` in either. The patch protocol has to be testable with no socket in the process, and
   so does the rule `host` carries — the graph is shared, the session is not. A runtime in
@@ -76,13 +76,17 @@ a test.
   resolves — because some other crate's default feature can satisfy every manifest and still
   turn the client on. Dev-dependencies are exempt: `crates/serve` uses a WebSocket *client* to
   test its own wire.
-* **The bundled client fetches nothing and pastes no markup.** No `script src=`, no
-  `@import`, no `fetch(`, no `importScripts`, no CDN host, no `insertAdjacentHTML`, no
-  `document.write` — and a unit test in `crates/serve/src/lib.rs` also enumerates every
-  `http`-prefixed string in the file and asserts there are exactly the two that belong
-  there. CI repeats a subset of that as a grep, because a grep fails before a compile does.
-* **Every crate carries `#![forbid(unsafe_code)]`.** There is no `unsafe` block in this
-  project and there is no reason for the first one to arrive without a discussion.
+* **The bundled client fetches nothing it was not told to and pastes no markup.** No
+  `script src=`, no `@import`, no `importScripts`, no CDN host, no `insertAdjacentHTML`, no
+  `document.write` — and a unit test in `crates/serve/src/lib.rs` lists the two `fetch`es
+  and the two `import`s the page is allowed, enumerates every `http`-prefixed string in the
+  file, and asserts there are exactly the ones that belong there, so a new one fails it. CI
+  repeats a subset of that as a grep, because a grep fails before a compile does.
+* **Every crate but `crates/wasm` carries `#![forbid(unsafe_code)]`** — eight of nine — and
+  in that crate only `abi.rs` uses `unsafe`: the WebAssembly boundary, where a pointer and a
+  length from the page become a slice. It is compiled only for `wasm32` and states the
+  contract its callers must keep. There is no other `unsafe` in this project, and there is no
+  reason for the next one, there or anywhere, to arrive without a discussion.
 
 ## If you change the counts
 

@@ -89,6 +89,8 @@ pub enum Command {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[command(flatten)]
+        liveness: LivenessArgs,
+        #[command(flatten)]
         auth: AuthArgs,
     },
 
@@ -149,15 +151,8 @@ pub enum Command {
         /// and every rollout pays it per replica.
         #[arg(long, value_name = "SECONDS", default_value_t = 5)]
         drain_seconds: u64,
-        /// Seconds between pings on a connection that has gone quiet. `0` sends none.
-        ///
-        /// A load balancer reclaims a connection it has seen no bytes on — 60 seconds by
-        /// default for an AWS ALB, an nginx `proxy_read_timeout` and most ingress
-        /// controllers. **A dashboard nobody is clicking is the ordinary case, not an idle
-        /// one**, so without this the page goes quiet after a minute of being read, with no
-        /// error anywhere to say why. Raise the balancer's timeout as well, not instead.
-        #[arg(long, value_name = "SECONDS", default_value_t = 25)]
-        heartbeat_seconds: u64,
+        #[command(flatten)]
+        liveness: LivenessArgs,
         #[command(flatten)]
         auth: AuthArgs,
     },
@@ -195,9 +190,11 @@ pub enum Command {
 
     /// Serve every app in a directory from one process, routed by the `Host` header.
     ///
-    /// `sales.toml` becomes the app `sales`, reachable at any name whose first label is
-    /// `sales` — `sales.example.com`, `sales.localhost:8787`, or a bare `Host: sales`. One
-    /// process, one port, one compiled graph per app however many viewers, and an explicit
+    /// `sales.toml` becomes the app `sales`, reachable at `sales.localhost` and, for each
+    /// `--domain example.com`, at `sales.example.com` — exactly one label in front of a
+    /// declared domain. Any other name, a bare `Host: sales` and an IP address get 404 before
+    /// anything is read, because a `Host` header is whatever a DNS-rebinding page makes it.
+    /// One process, one port, one compiled graph per app however many viewers, and an explicit
     /// byte budget deciding which apps stay resident.
     ///
     /// Editing a manifest on disk changes its digest, so the next request compiles the new
@@ -218,17 +215,32 @@ pub enum Command {
         /// serves several apps at once.
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+        /// A domain these apps are published under: with `--domain example.com`, `sales.toml`
+        /// also answers at `sales.example.com`. Repeatable. `*.example.com` means the same;
+        /// either way it is exactly one label, the app, in front of it.
+        ///
+        /// **Without it every app answers only at `<app>.localhost`**, so a proxy forwarding a
+        /// real hostname gets 404 for every app, and stderr names the refused domain once.
+        /// Name a zone whose DNS you control: this trusts every name directly under it. Never a
+        /// shared wildcard service (`localtest.me`, `lvh.me`, `nip.io`, `sslip.io`) or a
+        /// public suffix (`duckdns.org`, `github.io`, `co.uk`). `.local` is refused: any machine
+        /// on the network answers for it.
+        #[arg(long = "domain", value_name = "DOMAIN")]
+        domains: Vec<String>,
         /// How many megabytes of loaded source data to hold across every app. Past it, the
         /// least recently opened app is evicted; an app larger than the whole budget is
         /// refused rather than admitted at every other app's expense.
+        ///
+        /// What viewers hold is not in it, and it can be the larger term: a viewer of a
+        /// pipeline that keeps rows holds about those rows again. `/healthz` on the admin port
+        /// reports it per app, beside this budget. Nothing is evicted or refused on it.
         #[arg(long, default_value_t = 512)]
         budget_mb: u64,
         /// How many minutes an app may go unopened before the idle sweep drops it.
         ///
         /// The sweep runs at half this, so an app leaves somewhere between this and one and a
         /// half times it. `0` turns the sweep off, and then an app leaves residency only on a
-        /// redeploy or under budget pressure — which is what every release before this one
-        /// did, whatever this flag said.
+        /// redeploy or under budget pressure.
         #[arg(long, default_value_t = 60)]
         idle_minutes: u64,
         /// The probe listener's port. Not the app port, and **not one to publish** — see
@@ -241,12 +253,56 @@ pub enum Command {
         /// Seconds to answer `/readyz` with `503` before the listener closes.
         #[arg(long, value_name = "SECONDS", default_value_t = 5)]
         drain_seconds: u64,
-        /// Seconds between pings on a connection that has gone quiet. `0` sends none.
-        #[arg(long, value_name = "SECONDS", default_value_t = 25)]
-        heartbeat_seconds: u64,
+        #[command(flatten)]
+        liveness: LivenessArgs,
         #[command(flatten)]
         auth: AuthArgs,
     },
+}
+
+/// What keeps a connection alive and what gives up on it, shared by `run`, `serve` and `host`:
+/// how often a quiet connection is pinged, how long a frame may take to be written, and how long
+/// a ping may go unanswered.
+///
+/// One group rather than three copies, so the three commands cannot disagree about a default
+/// or a flag's name, and so one function turns it into what the server takes. The defaults are
+/// the server's own, so a flag left out asks for exactly what the server would choose.
+#[derive(Clone, Copy, Debug, clap::Args)]
+pub struct LivenessArgs {
+    /// Seconds between pings on a connection that has gone quiet. `0` sends none.
+    ///
+    /// A load balancer reclaims a connection it has seen no bytes on — 60 seconds by
+    /// default for an AWS ALB, an nginx `proxy_read_timeout` and most ingress
+    /// controllers. **A dashboard nobody is clicking is the ordinary case, not an idle
+    /// one**, so without this the page goes quiet after a minute of being read, with no
+    /// error anywhere to say why. Raise the balancer's timeout as well, not instead.
+    #[arg(long, value_name = "SECONDS", default_value_t = dagpane_serve::HEARTBEAT.as_secs())]
+    pub heartbeat_seconds: u64,
+    /// Seconds one frame may take to be written, beyond what a 128 kbit/s link needs for
+    /// it, before its connection is dropped. `0` waits forever.
+    ///
+    /// A client that stops reading — a wedged tab, a proxy that stopped forwarding, or a
+    /// client doing it on purpose — leaves a connection that has something to send it
+    /// waiting in that send, holding its session and, for a scheduled source, the rows it
+    /// had when it stopped. A client reading over a slow link is given the time each frame
+    /// needs on top, so one large frame does not get it taken for one that stopped; a
+    /// client sent more than its link carries can still fall far enough behind to be
+    /// dropped the same way.
+    #[arg(long, value_name = "SECONDS", default_value_t = dagpane_serve::WRITE_TIMEOUT.as_secs())]
+    pub write_timeout_seconds: u64,
+    /// Seconds a client has to answer a ping, beyond what a 128 kbit/s link needs for what
+    /// it was sent since its last answer, before its connection is dropped. `0` waits
+    /// forever, and with `--heartbeat-seconds 0` there is no ping to answer.
+    ///
+    /// The case the write deadline cannot see: a client that has stopped reading on a
+    /// connection with nothing to send it, or gone without a word — a laptop shut, a phone
+    /// off the network, a NAT that forgot the connection. No write waits on it, the pings
+    /// keep the balancer's idle timeout from firing, and TCP takes a quarter of an hour to
+    /// give up on a peer that stopped acknowledging, and never on one whose kernel still
+    /// does. A desktop browser answers pings with no JavaScript involved, so a page in a
+    /// background tab, or busy in its script, keeps answering.
+    #[arg(long, value_name = "SECONDS", default_value_t = dagpane_serve::PING_TIMEOUT.as_secs())]
+    pub ping_timeout_seconds: u64,
 }
 
 /// The front door's flags, shared by `run` and `host`.

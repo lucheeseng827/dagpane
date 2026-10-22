@@ -85,7 +85,7 @@ in it is a lower bound on what the server could have done** — including the ba
 saturated row is not evidence about anything except that the rig ran out of machine.
 
 **One machine, and a shared one.** The committed result carries its `machine` block. A
-figure that feeds a pricing model needs a dedicated host with a known neighbour, and the
+figure that sizes a deployment needs a dedicated host with a known neighbour, and the
 absolute apps-per-core number from a shared container is not that. The *ratios* survive
 better than the absolutes: all four runtimes take the same noise.
 

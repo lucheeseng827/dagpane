@@ -12,7 +12,10 @@ use std::time::Duration;
 use dagpane_host::{AppId, Budget, Host, MemAppSource};
 use dagpane_serve::lifecycle::State;
 use dagpane_serve::{Fleet, Lifecycle};
+use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message;
 
 fn manifest(title: &str) -> String {
     format!(
@@ -123,8 +126,12 @@ async fn start(idle_after: Duration, drain: Duration) -> Fixture {
         listener,
         admin_listener,
         None,
-        // No timer: these tests count HTTP answers, not frames.
-        None,
+        // No timer and no deadline: these tests count HTTP answers, not frames.
+        dagpane_serve::Liveness {
+            heartbeat: None,
+            write_timeout: None,
+            ping_timeout: None,
+        },
         Arc::clone(&lifecycle),
     ));
     for _ in 0..200 {
@@ -248,11 +255,51 @@ async fn a_draining_fleet_is_unready_while_it_is_still_serving() {
 }
 
 #[tokio::test]
+async fn a_draining_fleet_tells_its_viewers_it_is_going_away_once_the_drain_ends() {
+    // `tests/replica.rs` has the reasoning; this is the same stop under `serve_host_replica`,
+    // whose sockets `axum` stops tracking at the upgrade just the same — and two viewers on
+    // two apps, because what is closed is every connection, not every connection to one app.
+    let drain = Duration::from_millis(300);
+    let f = start(Duration::from_secs(3600), drain).await;
+    let mut alpha = viewer(f.apps, "alpha.test").await;
+    let mut beta = viewer(f.apps, "beta.test").await;
+
+    f.lifecycle.request_stop();
+    let asked = tokio::time::Instant::now();
+    for (name, socket) in [("alpha", &mut alpha), ("beta", &mut beta)] {
+        let closed = tokio::time::timeout(drain + dagpane_serve::CLOSE_GRACE, async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Close(frame))) => break frame.map(|f| u16::from(f.code)),
+                    Some(Ok(_)) => continue,
+                    None | Some(Err(_)) => break None,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{name}'s viewer was never closed"));
+        assert_eq!(closed, Some(dagpane_serve::GOING_AWAY), "{name}");
+        assert!(
+            asked.elapsed() >= drain,
+            "{name} was closed inside the drain"
+        );
+        // Answered, as a browser answers it.
+        assert!(socket.next().await.is_none(), "{name}");
+    }
+
+    let done = tokio::time::timeout(dagpane_serve::CLOSE_GRACE, f.joined).await;
+    assert!(
+        matches!(done, Ok(Ok(Ok(())))),
+        "the fleet did not return once its viewers had closed: {done:?}"
+    );
+}
+
+#[tokio::test]
 async fn the_sweep_drops_an_app_nobody_opened() {
-    // `Host::sweep_idle` has existed since `crates/host` did and **nothing in the shipped
-    // binary had ever called it**, so `--idle-minutes` configured a sweep that never ran and
-    // an app left residency only on a redeploy or under budget pressure. `OPERATIONS.md` said
-    // so in its own list of gaps. This is that caller, running.
+    // `Host::sweep_idle` existed from the day `crates/host` did and **nothing in the binary
+    // called it** until `dagpane_serve::sweep_idle` did, so `--idle-minutes` configured a sweep
+    // that never ran and an app left residency only on a redeploy or under budget pressure. No
+    // release had `host` before 0.2.0, which ships with the caller. This is that caller, running.
     //
     // Mutation check: not spawning the sweep leaves the app resident and fails this.
     let f = start(Duration::from_millis(150), Duration::from_millis(50)).await;
@@ -342,6 +389,246 @@ async fn two_deployments_of_one_app_are_two_digests_and_then_one() {
         apps[0]["manifest"].as_str().unwrap(),
         first,
         "a redeploy reported the digest it replaced"
+    );
+
+    f.lifecycle.request_stop();
+    f.joined.await.unwrap().unwrap();
+}
+
+// ── what the viewers hold ─────────────────────────────────────────────────────────────────
+
+/// A pipeline whose one cell keeps rows, so a viewer holds something of their own. The
+/// fixture's other apps aggregate to a scalar, and a viewer of those correctly holds nothing —
+/// true, and useless for telling a report that works from one that always says zero.
+const ROW_KEEPING: &str = r#"
+[app]
+title = "Rows"
+[[source]]
+name = "sales"
+csv = "rows.csv"
+[[input]]
+name = "min_amount"
+slider = { min = 0.0, max = 1000.0, step = 10.0, default = 0.0 }
+[[cell]]
+name = "kept"
+from = "sales"
+[[cell.step]]
+filter = { column = "amount", op = "ge", param = "min_amount" }
+[[pane]]
+cell = "kept"
+table = { max_rows = 10 }
+"#;
+
+/// Its own CSV, and two thousand rows of it: at the fixture's forty, the arrays' fixed
+/// bookkeeping is most of what a viewer holds, and filtering rows away barely moves the total.
+fn publish_rows(f: &Fixture, title: &str) {
+    let mut text = String::from("region,amount\n");
+    for i in 0..2_000 {
+        text.push_str(&format!("r{},{}.0\n", i % 4, (i % 17) * 10));
+    }
+    std::fs::write(f.dir.path().join("rows.csv"), text).unwrap();
+    f.source.publish(
+        "rows.test",
+        &AppId::parse("rows").unwrap(),
+        ROW_KEEPING.replace("\"Rows\"", &format!("\"{title}\"")),
+        f.dir.path(),
+    );
+}
+
+async fn viewer(
+    addr: SocketAddr,
+    name: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+    // tungstenite sets `Host` from the URL's authority, so the app is chosen by name while the
+    // connection goes to the address — which is what a proxy in front of this does.
+    let request = format!("ws://{name}/ws").into_client_request().unwrap();
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut socket, _) = tokio_tungstenite::client_async(request, stream)
+        .await
+        .unwrap();
+    // `init` is sent after the first pass is recorded, so once it arrives the host knows.
+    loop {
+        match socket.next().await.expect("socket closed early").unwrap() {
+            Message::Text(text) => {
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(frame["type"], "init", "{frame}");
+                return socket;
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// The server learns a socket closed when its next read fails, which is not synchronous with
+/// the client dropping it.
+async fn until_sessions(admin: SocketAddr, count: u64) -> serde_json::Value {
+    for _ in 0..200 {
+        let h = health(admin).await;
+        if h["sessions"] == count {
+            return h;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("never reached {count} sessions: {}", health(admin).await);
+}
+
+fn entry<'a>(health: &'a serde_json::Value, list: &str, app: &str) -> &'a serde_json::Value {
+    health[list]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["app"] == app)
+        .unwrap_or_else(|| panic!("{app} is not in {list}: {health}"))
+}
+
+#[tokio::test]
+async fn a_fleet_reports_what_its_viewers_hold_and_stops_when_they_leave() {
+    let f = start(Duration::from_secs(3600), Duration::from_millis(50)).await;
+    publish_rows(&f, "Rows");
+    assert_eq!(health(f.admin).await["sessions"], 0);
+
+    let socket = viewer(f.apps, "rows.test").await;
+    let during = health(f.admin).await;
+    assert_eq!(during["sessions"], 1);
+    let rows = entry(&during, "apps", "rows");
+    assert_eq!(rows["sessions"], 1);
+    let held = rows["session_bytes"].as_u64().unwrap();
+    assert!(
+        held > 0,
+        "a viewer holding 2 000 rows holds nothing? {during}"
+    );
+    assert_eq!(during["session_bytes"], held);
+    // Reported beside the budget's figure, never folded into it.
+    let sources: u64 = during["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["bytes"].as_u64().unwrap())
+        .sum();
+    assert_eq!(during["resident_bytes"], sources);
+
+    // Move the slider so most rows fall away. The figure follows the pass, not the connect:
+    // a host that recorded only the first render would go on reporting every row.
+    let mut socket = socket;
+    use futures_util::SinkExt;
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type": "set", "seq": 1,
+                "values": {"min_amount": {"kind": "float", "v": 140.0}}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    loop {
+        if let Message::Text(text) = socket.next().await.expect("open").unwrap() {
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(frame["type"], "patch", "{frame}");
+            break;
+        }
+    }
+    let filtered = entry(&health(f.admin).await, "apps", "rows")["session_bytes"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        filtered < held / 2,
+        "after filtering most rows away the viewer still holds {filtered} of {held}"
+    );
+
+    drop(socket);
+    let after = until_sessions(f.admin, 0).await;
+    assert_eq!(after["session_bytes"], 0);
+    assert_eq!(entry(&after, "apps", "rows")["sessions"], 0);
+
+    f.lifecycle.request_stop();
+    f.joined.await.unwrap().unwrap();
+}
+
+/// What the budget cannot see, made visible. A redeploy evicts the old version at once and
+/// `resident_bytes` stops counting it, but a viewer still on it holds its graph — and through
+/// the graph, its sources.
+#[tokio::test]
+async fn a_viewer_on_a_redeployed_version_is_reported_until_they_leave() {
+    let f = start(Duration::from_secs(3600), Duration::from_millis(50)).await;
+    publish_rows(&f, "Rows");
+    let socket = viewer(f.apps, "rows.test").await;
+    let old = entry(&health(f.admin).await, "apps", "rows")["manifest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    publish_rows(&f, "Rows v2");
+    // A fresh request resolves the new digest and evicts the old one.
+    assert_eq!(get(f.apps, "/", "rows.test").await.0, 200);
+
+    let h = health(f.admin).await;
+    let resident = entry(&h, "apps", "rows");
+    assert_ne!(resident["manifest"], old.as_str(), "{h}");
+    assert_eq!(resident["sessions"], 0, "nobody is on the new version yet");
+    let held = entry(&h, "held_after_eviction", "rows");
+    assert_eq!(held["manifest"], old.as_str());
+    assert_eq!(held["sessions"], 1);
+    assert!(
+        held["bytes"].as_u64().unwrap() > 0,
+        "its sources are still alive: {h}"
+    );
+
+    drop(socket);
+    let after = until_sessions(f.admin, 0).await;
+    assert!(
+        after["held_after_eviction"].as_array().unwrap().is_empty(),
+        "{after}"
+    );
+
+    f.lifecycle.request_stop();
+    f.joined.await.unwrap().unwrap();
+}
+
+/// The rollback version of the same gap, and the one a key alone cannot see. Deploy, roll
+/// back, and the original manifest is the original key again — compiled again, with a second
+/// copy of its sources — while a viewer who never reloaded is still on the first copy. Booked
+/// by key, they would be counted as a viewer of the reloaded copy, and the copy they actually
+/// hold would be in neither list.
+#[tokio::test]
+async fn a_viewer_who_sat_through_a_rollback_is_on_the_copy_they_opened() {
+    let f = start(Duration::from_secs(3600), Duration::from_millis(50)).await;
+    publish_rows(&f, "Rows");
+    let stayed = viewer(f.apps, "rows.test").await;
+    let original = entry(&health(f.admin).await, "apps", "rows")["manifest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Deploy, then roll back to the very same bytes, each opened once.
+    publish_rows(&f, "Rows v2");
+    assert_eq!(get(f.apps, "/", "rows.test").await.0, 200);
+    publish_rows(&f, "Rows");
+    assert_eq!(get(f.apps, "/", "rows.test").await.0, 200);
+
+    let h = health(f.admin).await;
+    let resident = entry(&h, "apps", "rows");
+    assert_eq!(
+        resident["manifest"],
+        original.as_str(),
+        "a rollback is the original key: {h}"
+    );
+    assert_eq!(
+        resident["sessions"], 0,
+        "nobody has opened the reloaded copy: {h}"
+    );
+    let held = entry(&h, "held_after_eviction", "rows");
+    assert_eq!(held["manifest"], original.as_str());
+    assert_eq!(held["sessions"], 1);
+    assert_eq!(
+        held["bytes"], resident["bytes"],
+        "a second copy of the same sources: {h}"
+    );
+
+    drop(stayed);
+    let after = until_sessions(f.admin, 0).await;
+    assert!(
+        after["held_after_eviction"].as_array().unwrap().is_empty(),
+        "{after}"
     );
 
     f.lifecycle.request_stop();

@@ -36,6 +36,17 @@
 //! hit, it is one viewer reading another viewer's inputs. `tests/isolation.rs` is the
 //! adversarial version of that sentence.
 //!
+//! # What a viewer holds
+//!
+//! The budget is written in source bytes, because the sources are what a second *app* adds.
+//! What a second *viewer* adds is what their pipeline materialises on top of the sources they
+//! share, and the host counts that too — without budgeting it. Every session handed out comes
+//! with a [`SessionLease`]; the connection records what its session holds after each pass,
+//! and [`Host::sessions`] reports every live one, including viewers still holding an app the
+//! budget has already let go of. Nothing is evicted or refused on it: evicting an app frees
+//! nothing its viewers hold, so limiting them would mean refusing viewers, which is a policy
+//! this crate does not have.
+//!
 //! # What is not here
 //!
 //! No socket, no runtime, no clock beyond [`std::time::Instant`]. Multiplexing is a decision
@@ -54,8 +65,8 @@ pub mod host;
 pub mod key;
 pub mod source;
 
-pub use budget::{Budget, Footprint};
+pub use budget::{Budget, Footprint, SessionFootprint, SharedBaseline};
 pub use error::HostError;
-pub use host::{AppSlot, EvictReason, Eviction, Host};
-pub use key::{manifest_digest, AppId, AppKey, InvalidAppId};
+pub use host::{AppSlot, EvictReason, Eviction, Host, LiveSession, Reload, SessionLease};
+pub use key::{manifest_digest, AppId, AppKey, Domain, InvalidAppId, InvalidDomain};
 pub use source::{normalise_host, AppSource, DirAppSource, ManifestBytes, MemAppSource};

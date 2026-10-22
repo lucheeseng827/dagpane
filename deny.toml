@@ -66,15 +66,19 @@ deny = [
     # A data-app runtime that can phone home is not one anybody self-hosts. `.github/workflows/ci.yml` also
     # greps for these, because a lockfile pin is not a policy; this is the policy.
     { name = "reqwest" },
-    { name = "ureq" },
+    # Except where the policy puts it: `crates/connect`'s opt-in `http` source, which
+    # `[graph] all-features` above makes this check see. A plain ban here failed every run
+    # from the day that source landed; `wrappers` keeps the ban for every other crate, and the
+    # `invariants` job keeps the feature off by default and out of cli, serve and app.
+    { name = "ureq", wrappers = ["dagpane-connect"] },
     { name = "isahc" },
     { name = "surf" },
     # `openssl-sys` would put a C build and a system library into a binary that is meant to be
     # a single static musl artefact. rustls is the answer if TLS is ever needed.
     { name = "openssl-sys" },
 ]
-# tokio-tungstenite is a dev-dependency of `dagpane-serve` only — it is the WebSocket *client*
-# the socket tests use. It must never become a normal dependency.
+# tokio-tungstenite is a dev-dependency of `dagpane-serve` and `dagpane-cli` only — it is the
+# WebSocket *client* their socket tests use. It must never become a normal dependency.
 skip = []
 
 [sources]

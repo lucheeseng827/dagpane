@@ -81,20 +81,11 @@ client (`crates/serve/src/client.html`) builds every node with `createElement` a
 markup. A unit test asserts the file contains no `insertAdjacentHTML` and no
 `document.write`, and CI greps for the same strings before a compile.
 
-Two `innerHTML` assignments exist, both in the stats bar, and a way past either is a
-finding:
-
-* `showStats` concatenates the `PassStats` counters, which are `usize` and `u64` in the
-  wire type. A route by which a non-number reaches one of those fields on the wire is in
-  scope.
-* the `rejected` branch concatenates `escapeHtml(msg.message)`, which round-trips the
-  string through a detached node's `textContent`.
-
-**The guard test is weaker than it reads, and this document says so rather than leaving it
-to be discovered.** `the_client_never_writes_server_text_as_markup` asserts
-`!CLIENT.contains(".innerHTML = ") || CLIENT.contains("escapeHtml")` — the second clause is
-satisfied by the helper existing anywhere in the file, so a *new* unescaped `innerHTML`
-assignment would not fail it. Reviewing an added `innerHTML` is a human job today.
+The client touches `innerHTML` nowhere — the stats bar and a `rejected` message are built
+the same way as everything else — and `the_client_never_writes_server_text_as_markup` fails on
+any line that names `.innerHTML`, so adding one fails a test rather than waiting for a
+reviewer. That was already so in 0.1.1. A way to get server text parsed as markup anyway is a
+finding.
 
 **One viewer's value reaching another viewer's page.** A session is a vector of value slots
 beside a shared, immutable `Arc<Graph>`; sources are shared by `Arc` and a session that
@@ -128,13 +119,23 @@ What the door does **not** cover, stated because the gap is the interesting part
 * **Revocation before a token expires.** There is no introspection call and no deny list —
   again, because this process makes no outbound requests. `--auth-leeway-secs` is small and
   the practical control is a short token lifetime at the provider.
+* **A connection that outlives its token.** A token is checked when the socket opens, and
+  not again. A page open when its token expires keeps what it was sent and can go on moving
+  controls over the rows it holds until it closes. What it is not sent is *new* data: when a
+  scheduled refresh reads new rows, a connection whose token has expired is closed with code
+  `4401` instead, and the bundled page asks the viewer to sign in again. A short token
+  lifetime bounds which data a viewer can see, not how long a page stays open.
 * **`/` itself.** The page is served without a token, because the page is where the sign-in
   starts. It carries no data: every value arrives over the socket, which is the thing that
-  checks.
+  checks. Under `dagpane host` the request does more than serve a file — it compiles the app
+  its name routes to if that app is not resident, and may evict others to make room, before
+  any token is asked for. *`dagpane host` and DNS rebinding*, below, says what bounds that.
 
-The bundled `Dockerfile` needs `--host 0.0.0.0` to be useful at all, and says in its header
-to put the container behind something that authenticates before it is reachable by anyone
-you would not show the data to. That remains true and is now one of two answers.
+The bundled `Dockerfile`'s header runs the image as `dagpane serve` with an `--origin`, and
+`serve` binds every interface by default, because inside a container that is the only useful
+choice — so the warning above is printed unless `--auth-jwks` is passed. The header names both
+answers: pass `--auth-jwks`, or put something that authenticates in front, before the container
+is reachable by anyone you would not show the data to.
 
 **The token never goes in a URL.** It travels in `Authorization: Bearer` for anything that
 can set a header, and in a `Sec-WebSocket-Protocol` entry for a browser, which cannot. A
@@ -177,12 +178,13 @@ computed cell and a saved state naming it is dropped and reported, not applied;
 (`dagpane_app::resume::MAX_ENCODED_BYTES`) and an oversized one is refused whole rather than
 truncated, so a viewer never gets half a remembered state with no way to see which half.
 
-**Loopback is a boundary against a browser page, and not against anything else.** The
-`/ws` upgrade checks `Origin` against an allowlist derived from the bound address — both
-schemes, plus `localhost` when the bind is loopback — and answers `403` otherwise. That
-closes the case this section previously said was open: a page a viewer happens to have
-open elsewhere in the same browser can no longer connect to `ws://127.0.0.1:8787/ws` and
-read every pane, because a page cannot suppress its own `Origin`.
+**Loopback is a boundary against a browser page, and not against anything else.** For a
+single app (`run`, and `serve` without `--origin`) the `/ws` upgrade checks `Origin` against an
+allowlist derived from the bound address — both schemes, plus `localhost` when the bind is
+loopback — and answers `403` otherwise. That closes the case this section previously said was
+open: a page a viewer happens to have open elsewhere in the same browser can no longer
+connect to `ws://127.0.0.1:8787/ws` and read every pane, because a page cannot suppress its
+own `Origin`.
 
 What remains true, and is why this is still listed here rather than deleted:
 
@@ -190,8 +192,9 @@ What remains true, and is why this is still listed here rather than deleted:
   a script, the integration tests. Anything that can open a socket on the machine can still
   read every pane. "It only binds loopback" means "only software on this machine can read
   it", never "only you can read it".
-* `GET /` is **not** origin-checked at all. It serves a static page and no data, but it is
-  not a boundary either.
+* `GET /` is **not** origin-checked at all. For a single app it serves a static page and no
+  data, but it is not a boundary either; under `dagpane host` it also compiles the app its
+  name routes to, which *`dagpane host` and DNS rebinding*, below, bounds.
 * This is an anti-CSRF measure and not authentication. Where `--auth-jwks` is configured it
   complements authentication and does not replace it; without that flag it is the only check
   the socket makes.
@@ -199,7 +202,124 @@ What remains true, and is why this is still listed here rather than deleted:
 It also has a deployment consequence worth stating where operators will find it: behind a
 reverse proxy on a different hostname the browser sends that hostname, which never matches
 the bound address, so the page loads and the socket is refused. `OPERATIONS.md` has the
-verified matrix and the two supported shapes; `docs/RUNBOOK.md` §1 is the symptom.
+verified matrix and the supported shapes, and `docs/RUNBOOK.md` §1 is the symptom. The shape
+that needs no rewrite is `dagpane serve --origin <the URL users type>`: the declared origins
+replace the derived allowlist, so the proxy forwards `Origin` as the browser sent it. `run` has
+no `--origin`, and its two shapes are a loopback tunnel or a proxy that allowlists `Origin` and
+then rewrites it. Under `dagpane host` the socket compares `Origin` with the `Host` header
+instead, so most of that trap goes, and another takes its place: the name has to be declared.
+Behind a proxy that forwards `sales.example.com`, every app answers `404` until the process is
+started with `--domain example.com`.
+
+**`dagpane host` and DNS rebinding.** `dagpane host DIR` serves every manifest in a directory
+on one port and picks the app by the `Host` header. Until ADR-0012 (October 2026) it picked by
+the **first label of any name** — `sales.example.com`, `sales.localhost`, a bare `sales` and
+`sales.<anything>` all reached `sales.toml` — and its socket's `Origin` check asked only that
+`Origin` name the same host as `Host`. Together those let a page the viewer merely opened read
+every pane. A page at `http://sales.attacker.example:8787` whose owner then points that name at
+`127.0.0.1` — DNS rebinding — is still, to the browser, talking to its own name: it sends
+`sales.attacker.example:8787` as `Host` and `http://sales.attacker.example:8787` as `Origin`,
+the two agree, and the first label routed it to `sales`. `GET /` for that name compiled the
+app as well, and could evict others to fit it. `run` and `serve` were never open to this,
+because their allowlist is the bound address or `serve`'s declared `--origin`s, and a rebound
+page's `Origin` is its own name. No release had the hole: `dagpane host` first shipped in
+0.2.0, with the rule below. But `main` was public with it before that, so a build from `main`
+from before `--domain` existed has the hole.
+
+**The rule now: a name is answered only if it is exactly one label in front of a declared
+domain** — `<app>.localhost` always, and `<app>.<d>` for each `--domain d`. One trailing dot is
+ignored, so `sales.localhost.` is `sales.localhost`. Membership is exact equality on everything
+after the first dot, never a suffix test, so `salesexample.com`,
+`sales.localhost.attacker.example`, `x.sales.localhost`, a bare `sales`, `localhost` itself and
+an address (`127.0.0.1`, `[::1]`) are all refused. A refused name is answered `404` with
+`no app is served at <name>: this server does not answer to that name`, and nothing is read,
+compiled or evicted for it: the check is the first thing `DirAppSource::resolve`
+(`crates/host/src/source.rs`) does, and `Host::open` and `Host::open_session` resolve before
+they do anything else. (At `/ws` the `Origin` check and any token check come first, and neither
+touches an app.) A declared name with no manifest behind it, such as `nobody.localhost`, still
+gets `no app is served at <name>`, so the two refusals point at different fixes.
+
+The boundary is the contract on `AppSource::resolve`, and it binds every source, not only the
+directory one: **a source must answer only names its operator declared.** An exact table, as
+`MemAppSource` keeps, is bounded by construction; a pattern — a label, a suffix, a fallback app
+— must be bounded to declared names and refuse before any I/O. A name answered that nobody
+declared, or a manifest read, compiled or evicted for a refused one, is a finding.
+`docs/adr/0012-a-name-is-served-only-where-it-was-declared.md` records why the check lives in
+the source and not beside it.
+
+**`--domain` is how `host` is published under a name.** `dagpane host DIR --domain example.com`
+makes `sales.toml` answer at `sales.example.com` as well; the flag repeats, and `localhost` is
+always answered in addition. Case, one trailing dot and a leading `*.` are accepted as spellings
+of the same domain — `*.example.com` is `example.com`, and either means exactly one label in
+front of it. Anything else is refused at start-up, with the fix or the reason named, before
+anything is bound or any `http://` printed: a URL, a comma-separated list, a path, an IP
+address, a port, a leading dot, any other `*`, a non-ASCII name (write its punycode form), an
+invalid label, a name over 253 bytes, a numeric last label (which a browser reads as an IPv4
+address), a name ending in `.local`, and a single label other than `localhost`, `internal` or
+`test`. So `--domain com` and `--domain uk` are refused because anyone can register a name
+directly under a top-level domain, and `--domain local` or `--domain <machine>.local` — what
+`hostname` prints on a Mac — because `.local` is multicast DNS, which any machine on the network
+may answer for. A forgotten `--domain` shows as every app answering
+`404`; stderr names the refused domain once, with the flag that would declare it when it could
+be one, and writes at most 32 such lines in all, so whoever chooses the names cannot choose how
+much is written.
+
+**Declaring a domain trusts every name directly under it**, because whoever controls a name's
+DNS can point it at this machine. Name a zone whose DNS you control. Never declare a shared
+wildcard service whose DNS somebody else answers — `localtest.me`, `lvh.me`, `nip.io`,
+`sslip.io` — nor a public suffix such as `duckdns.org`, `github.io` or `co.uk`, under which
+strangers register names: either reopens this hole for every name beneath it. The parser
+refuses a top-level domain; it cannot recognise a multi-label public suffix, so that part of the
+rule is this paragraph and not a check.
+
+**Why `localhost` is always answered.** Chrome and Firefox resolve `*.localhost` to loopback
+themselves (RFC 6761 §6.3), without asking DNS, so no DNS answer can send a `.localhost` name
+anywhere else and a rebinding page cannot arrive under one. A client that forwards `.localhost`
+names to network DNS loses that, and a front door (`--auth-jwks`) removes the dependence on it.
+It is a guarantee about where a `.localhost` name leads, not about who serves pages there: any
+local server can, which is what the next paragraph is about.
+
+**The `Origin` check at the host socket is CSRF defence, not the rebinding defence.** `Origin`'s
+scheme must be `http` or `https` and its host must equal the request's `Host` name, as before —
+and a rebound page passes that by construction, which is why the boundary is the name. One thing
+is new: **under `localhost` the port must agree as well.** When the name is `localhost` or ends
+in `.localhost` and the `Host` header carries a port, the `Origin`'s port — the one it names, or
+80 or 443 by its scheme — must equal it. A browser resolves `sales.localhost` to loopback
+whoever is serving it, so any other local server — a dev server on `:3000`,
+`python -m http.server` — serves pages at `sales.localhost:3000`, and with ports ignored such a
+page could open `sales.localhost:8787`'s socket and read every pane. Before ADR-0012 it
+could; that was reproduced against the built binary. Two limits, both deliberate:
+
+* **When `Host` carries no port, only the name is compared**, because there is nothing to agree
+  with. A proxy forwarding nginx's `$host` drops the port, and a browser leaves it out at its
+  scheme's default — so the rule protects `<app>.localhost:<port>`, the URL `dagpane host`
+  prints on any port but 80, and not a `.localhost` name served on port 80 or 443, or through
+  such a proxy.
+* **Names under a `--domain` stay port-blind**, because behind a proxy the `Origin` carries the
+  public port and `Host` carries this process's: eggrd sends `Host: sales.example.com:8787` with
+  `Origin: https://sales.example.com`. Any port of a declared name is trusted — one more reason
+  to declare only a zone whose DNS is yours.
+
+An absent `Origin` is still allowed: that is a non-browser client, and a page cannot suppress
+the header.
+
+What this does not cover, stated because the gaps are the interesting part:
+
+* **The probe listener has no `Host` check**, and `dagpane host` binds it on every interface by
+  default (`--admin-bind 0.0.0.0`, port 9787). A rebinding page aimed at that port can read
+  `/healthz` — the resident apps' names, their manifest digests, byte and session counts — though
+  no pane data. Keep the port unreachable from browsers: the start-up line already says not to
+  publish it, and `--admin-bind 127.0.0.1` keeps it from browsers on other machines but not from
+  one on this machine.
+* **`GET /` still compiles before any token.** Under `host`, serving the page opens the app —
+  compiling it if it is not resident, evicting others if the budget needs the room — and a token
+  is checked only at `/ws`. The rule above confines that to the directory's apps under declared
+  names; anyone who can reach the port and send one of those names can still make the process
+  compile and evict. `/auth`, which tells the page whether a token is needed, answers any name
+  too, and holds no app data.
+* **A token is checked against the `Host`'s first label**, not against the app the source routed
+  to. Under `DirAppSource` the two are the same label by construction; a source that routed a
+  name to a differently named app would make them differ.
 
 **No rate limit.** A connection is a sequential loop — read a message, run a pass, send a
 patch — so one client cannot overlap passes with itself, but nothing bounds how fast it
@@ -207,7 +327,19 @@ sends, how much work each pass costs, or how many connections exist. `refresh` s
 every pane of the app and costs no recomputation, which makes it the cheapest message to
 send and one of the more expensive to answer. There is also no configured limit on inbound
 message size: the upgrade is taken with the WebSocket layer's defaults and this document
-states no byte figure because the code sets none.
+states no byte figure because the code sets none. How slowly a client *reads* is bounded
+whether or not it is being sent something, with both deadlines on as they are by default: a
+frame not written within its allowance — `--write-timeout-seconds`, 30 s by default, plus what
+a 128 kbit/s link needs for the frame — drops its connection, so a connection stuck sending to
+a client that stopped reading holds its session, and under a scheduled refresh the rows it had,
+for no longer than that. On a connection with nothing to send, where no write waits, a ping not
+answered within its own allowance — `--ping-timeout-seconds`, 30 s by default, plus what that
+link needs for everything sent since the last answer — drops it the same way, and so does a
+client that has gone without a word; only a Pong echoing the ping counts, which a client can
+send only after reading everything before it, and the ping's payload is keyed per connection so
+it cannot be echoed by counting. Neither bounds a client that does read: it answers pings and
+is kept, like any viewer, however little it asks for. How many connections one client may hold
+is the proxy's to limit, beside the rate limit.
 
 **A text input is unbounded.** `WidgetKind::Text` accepts any string of any length; the
 session holds it for the life of the connection and every cell downstream recomputes over
@@ -238,7 +370,7 @@ cell written against the Rust API is the author's own code.
 
 **No security headers.** `GET /` returns the client page and nothing else — no
 `Content-Security-Policy`, no `X-Frame-Options`. A CSP would be a cheap second layer behind
-the `textContent` discipline above, and it is not in v0.1.0.
+the `textContent` discipline above, and it is not in 0.2.0.
 
 ## What is not a finding
 
@@ -254,19 +386,34 @@ the `textContent` discipline above, and it is not in v0.1.0.
 
 ## The dependency surface
 
-**There is no HTTP client anywhere in the build, and CI greps for one.** A data-app runtime
-that can phone home is not one anybody self-hosts, and that should be checkable from
-`cargo tree` rather than from this paragraph. The grep exempts dev-dependencies, because
-`crates/serve` uses a WebSocket *client* to test its own wire.
+**There is no HTTP client and no database driver in a default build, and CI checks for
+both.** A data-app runtime that can phone home is not one anybody self-hosts, and that should
+be checkable from `cargo tree` rather than from this paragraph. Through 0.1.1 there was none
+anywhere. From 0.2.0 one crate may hold them, `crates/connect` — `ureq` behind its `http`
+feature, `postgres` behind `sql`, both off by default — and CI fails if either appears in any
+other manifest, is not optional there, or is resolved by a default build of `dagpane-cli`,
+`dagpane-serve` or `dagpane-app`. The published image is a default build. The check exempts
+dev-dependencies, because `crates/serve` uses a WebSocket *client* to test its own wire.
 
-**The bundled client fetches nothing at run time.** It is one file compiled into the
-binary: no `<script src=`, no stylesheet `href`, no `@import`, no `fetch(`. A unit test
-enumerates every string in it beginning `http` and asserts there are exactly two — `https:`,
-compared against `location.protocol` to choose `ws://` or `wss://`, and the SVG namespace
-that `createElementNS` requires — so a third one appearing fails the build rather than
-quietly making an air-gapped deployment render blank.
+**The bundled client fetches nothing it was not told to.** It is one file compiled into the
+binary: no `<script src=`, no stylesheet `href`, no `@import`, no `importScripts`. Through
+0.1.1 it made no request but its socket; 0.2.0's front door, custom panes and `export` added
+four, and `the_client_is_one_self_contained_file` lists them and fails on any other. Two
+`fetch`es: `/auth`, on the server that served the page, and the token endpoint of a browser
+sign-in the operator configured. Two `import`s: a renderer script the manifest declared —
+resolved against the page, and refused by `compile_renderers` if it is absolute, climbs with
+`..` or contains a `:` — and `./dagpane.js` beside a page `dagpane export` wrote. The same
+test enumerates every string beginning `http` and asserts there are exactly four: two in the
+message a page opened from `file://` shows, naming `http://` and `python3 -m http.server`;
+`https:`, compared against `location.protocol` to choose `ws://` or `wss://`; and the SVG
+namespace that `createElementNS` requires. A new one fails the build rather than quietly
+making an air-gapped deployment render blank.
 
-`dagpane-core` has one dependency, serde. Every crate in the workspace — all eight — carries
-`#![forbid(unsafe_code)]`, so there is no `unsafe` block in this project to review.
-`cargo-deny` (advisories, bans, licences, sources) and `cargo audit --deny warnings` run on
-every commit.
+`dagpane-core` has one dependency, serde. Eight of the workspace's nine crates carry
+`#![forbid(unsafe_code)]`. The ninth, `crates/wasm`, does not, and its `abi.rs` is the one
+place in the tree with `unsafe` in it: the WebAssembly boundary an exported page calls, where
+a pointer and a length from the page become a slice — one private `unsafe fn` and four
+`unsafe extern "C"` exports, with the contract the caller must keep stated at the top of the
+file. That module is compiled only for `wasm32`, so it is in an exported bundle's
+`dagpane.wasm` and not in the `dagpane` binary or the image. `cargo-deny` (advisories, bans,
+licences, sources) and `cargo audit --deny warnings` run on every commit.

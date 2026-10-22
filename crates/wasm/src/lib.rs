@@ -56,7 +56,7 @@
 
 pub mod engine;
 
-// The ABI is wasm32-only. Building it for the host would export four `extern "C"` symbols
+// The ABI is wasm32-only. Building it for the host would export five `extern "C"` symbols
 // from every test binary that links this crate, for a calling convention nothing on the host
 // uses — and it is the one module here that needs `unsafe`, so keeping it off every other
 // target is worth the `cfg`.

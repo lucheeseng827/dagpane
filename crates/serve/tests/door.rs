@@ -69,11 +69,10 @@ impl Idp {
     }
 
     fn token(&self, apps: &[&str]) -> String {
-        let exp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 300;
+        self.token_until(apps, unix_now() + 300)
+    }
+
+    fn token_until(&self, apps: &[&str], exp: u64) -> String {
         let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
         header.kid = Some("k1".into());
         encode(
@@ -86,6 +85,13 @@ impl Idp {
         )
         .unwrap()
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn policy(access: Access) -> Policy {
@@ -121,6 +127,7 @@ async fn start(auth: Option<Arc<Auth>>) -> (tempfile::TempDir, SocketAddr) {
                 // socket they hold open is a frame they would have to skip past.
                 // `tests/heartbeat.rs` is where the heartbeat is checked.
                 heartbeat: None,
+                ..Default::default()
             },
         )
         .await;
@@ -363,4 +370,196 @@ async fn the_auth_endpoint_is_reachable_without_a_token_and_carries_only_public_
     let (status, body) = get(open, "/auth", None).await;
     assert_eq!(status, 200);
     assert!(body.contains("\"required\":false"), "{body}");
+}
+
+// ── a connection that outlives its token ──────────────────────────────────────────────────
+//
+// A token is checked when a connection opens. Before scheduled refreshes, a connection that
+// outlived its token could only go on seeing what it already had: new data meant a restart, and
+// a restart meant coming back through the door. A refresh brings new data to an open socket, so
+// the door's promise has to be kept there as well — new rows go to a connection whose token
+// still holds, and one whose token has run out is closed with a code its page can act on.
+
+/// `door`, over data that is re-read every second.
+const LIVE: &str = r#"
+[app]
+title = "Door"
+
+[[source]]
+name = "sales"
+csv = "sales.csv"
+refresh_secs = 1
+
+[[cell]]
+name = "total"
+from = "sales"
+[[cell.step]]
+group_by = { agg = [{ column = "amount", agg = "sum", as = "t" }] }
+[[cell.step]]
+scalar = { column = "t" }
+
+[[pane]]
+id = "total"
+cell = "total"
+metric = { label = "Total" }
+"#;
+
+fn sales(rows: usize) -> String {
+    let mut text = String::from("region,amount\n");
+    for i in 0..rows {
+        text.push_str(&format!("r{},{}.0\n", i % 4, i * 10));
+    }
+    text
+}
+
+type Socket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+/// What a socket said next: a frame of the app's, or a close and its code.
+#[derive(Debug)]
+enum Said {
+    Frame(serde_json::Value),
+    Closed(Option<(u16, String)>),
+}
+
+async fn said(socket: &mut Socket) -> Said {
+    loop {
+        match socket.next().await {
+            Some(Ok(Message::Text(text))) => {
+                return Said::Frame(serde_json::from_str(&text).unwrap())
+            }
+            Some(Ok(Message::Close(frame))) => {
+                return Said::Closed(frame.map(|f| (u16::from(f.code), f.reason.to_string())))
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(_)) | None => return Said::Closed(None),
+        }
+    }
+}
+
+/// Through the door on `host` with `token`, past the opening frame.
+async fn open_as(addr: SocketAddr, host: &str, token: &str) -> Socket {
+    let mut request = format!("ws://{host}/ws").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut socket, _) = tokio_tungstenite::client_async(request, stream)
+        .await
+        .expect("a token that has not expired is admitted");
+    match said(&mut socket).await {
+        Said::Frame(init) if init["type"] == "init" => socket,
+        other => panic!("expected the opening frame, got {other:?}"),
+    }
+}
+
+/// A door that allows no leeway, so a token is refused the second after its `exp`.
+fn strict(idp: &Idp) -> Arc<Auth> {
+    let mut policy = policy(Access::AnyApp);
+    policy.leeway_seconds = 0;
+    Arc::new(Auth {
+        jwks: idp.jwks(),
+        policy,
+        login: None,
+    })
+}
+
+/// The same check whichever front door the app is behind: two viewers, one whose token outlives
+/// the test and one whose token expires before the data moves.
+async fn only_the_viewer_whose_token_holds_is_sent_new_rows(
+    addr: SocketAddr,
+    host: &str,
+    dir: &std::path::Path,
+    idp: &Idp,
+) {
+    let now = unix_now();
+    let lasting = idp.token(&["door"]);
+    let ending = idp.token_until(&["door"], now + 1);
+    let mut kept = open_as(addr, host, &lasting).await;
+    let mut closed = open_as(addr, host, &ending).await;
+
+    // Two whole seconds past `exp`, and only then is there anything new to send.
+    let target = std::time::UNIX_EPOCH + Duration::from_secs(now + 3);
+    if let Ok(left) = target.duration_since(std::time::SystemTime::now()) {
+        tokio::time::sleep(left + Duration::from_millis(50)).await;
+    }
+    std::fs::write(dir.join("sales.csv"), sales(40)).unwrap();
+
+    let within = Duration::from_secs(5);
+    match tokio::time::timeout(within, said(&mut kept)).await {
+        Ok(Said::Frame(frame)) => assert_eq!(frame["type"], "reloaded", "{frame}"),
+        other => panic!("the viewer whose token holds was not sent the new rows: {other:?}"),
+    }
+    match tokio::time::timeout(within, said(&mut closed)).await {
+        Ok(Said::Closed(Some((code, reason)))) => {
+            assert_eq!(code, dagpane_serve::TOKEN_EXPIRED);
+            assert_eq!(reason, "token expired");
+        }
+        other => panic!("a connection that outlived its token was not closed: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_rows_are_not_sent_to_a_connection_that_has_outlived_its_token() {
+    let idp = Idp::new();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("door.toml"), LIVE).unwrap();
+    std::fs::write(dir.path().join("sales.csv"), sales(10)).unwrap();
+    let app = Arc::new(dagpane_app::load(&dir.path().join("door.toml")).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let auth = strict(&idp);
+    tokio::spawn(async move {
+        let _ = dagpane_serve::serve_on_with(
+            app,
+            listener,
+            Options {
+                app_name: "door".into(),
+                auth: Some(auth),
+                origins: Vec::new(),
+                heartbeat: None,
+                ..Default::default()
+            },
+        )
+        .await;
+    });
+    let host = addr.to_string();
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    only_the_viewer_whose_token_holds_is_sent_new_rows(addr, &host, dir.path(), &idp).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn under_host_too_a_connection_that_has_outlived_its_token_is_closed_not_refreshed() {
+    use dagpane_host::{AppId, Budget, Host, MemAppSource};
+    let idp = Idp::new();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("sales.csv"), sales(10)).unwrap();
+    let source = Arc::new(MemAppSource::new());
+    source.publish(
+        "door.test",
+        &AppId::parse("door").unwrap(),
+        LIVE.to_string(),
+        dir.path(),
+    );
+    let host = Arc::new(Host::new(
+        source,
+        Budget::new(64 << 20, Duration::from_secs(3600)),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let auth = strict(&idp);
+    tokio::spawn(async move {
+        let _ = dagpane_serve::serve_host_on_with(host, listener, Some(auth)).await;
+    });
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    only_the_viewer_whose_token_holds_is_sent_new_rows(addr, "door.test", dir.path(), &idp).await;
 }

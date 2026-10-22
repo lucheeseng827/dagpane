@@ -849,6 +849,134 @@ fn changing_one_column_agrees_with_a_full_recompute_and_wakes_only_its_readers()
     );
 }
 
+/// The same corpus, with the data arriving the way a scheduled refresh delivers it: as a new
+/// graph each time, which the live session moves onto.
+///
+/// Two claims the column test above does not cover. **Correctness against a later viewer**: a
+/// session that sat through every refresh must agree, cell for cell, with one opened on the
+/// newest graph — which is what a viewer who arrives after the refresh is. And **economy
+/// unchanged**: moving onto a graph is staging the replaced sources and nothing more, so a
+/// cell that reads none of the rewritten column still does not run. A refresh that rewrote a
+/// source with the data it already had builds no graph at all, and that case is in the corpus
+/// on purpose.
+#[test]
+fn a_refresh_delivered_as_a_new_graph_agrees_with_a_later_viewer_and_wakes_only_readers() {
+    let mut interactions = 0usize;
+    let mut unchanged = 0usize;
+    let mut woken = 0usize;
+
+    for seed in 1..=60u64 {
+        let mut rng = Lcg(seed.wrapping_mul(0xD1B54A32D192ED03).wrapping_add(29));
+        // Taken apart so that nothing in this test holds a graph the live session has left:
+        // the memory assertion below is about the session, and a `ColGraph` kept whole would
+        // pin the first graph for the length of the seed.
+        let ColGraph {
+            graph,
+            sources,
+            cells,
+            depends,
+            constrained,
+        } = generate_columnar(&mut rng);
+        let mut graph = graph;
+
+        let mut salts: Vec<Salts> = sources.iter().map(|_| vec![0i64; WIDE]).collect();
+        let mut live = Session::new(Arc::clone(&graph));
+        live.refresh();
+
+        for _ in 0..8 {
+            let which = rng.below(salts.len());
+            let column = rng.below(WIDE);
+            // One rewrite in four puts back exactly what was there: a file touched and not
+            // changed, which must not even build a graph.
+            let bump = if rng.below(4) == 0 {
+                0
+            } else {
+                1 + rng.below(4) as i64
+            };
+            salts[which][column] = salts[which][column].wrapping_add(bump);
+            interactions += 1;
+
+            let next = graph
+                .with_sources([(sources[which].as_str(), frame_of(&salts[which]))])
+                .expect("a generated source takes a generated frame");
+            let Some(next) = next else {
+                assert_eq!(bump, 0, "seed {seed}: new data built no graph");
+                unchanged += 1;
+                continue;
+            };
+            assert_ne!(bump, 0, "seed {seed}: identical data built a graph");
+            let next = Arc::new(next);
+            let previous = Arc::downgrade(&graph);
+            graph = Arc::clone(&next);
+            live.rebase(next).expect("a graph built from this one");
+            let trace = live.commit();
+
+            // ── correctness, against a viewer who opened on the new graph ──────────────
+            let mut later = Session::new(Arc::clone(&graph));
+            later.refresh();
+            for name in &cells {
+                assert_eq!(
+                    live.get(name).unwrap(),
+                    later.get(name).unwrap(),
+                    "seed {seed}: `{name}` differs between a session that moved onto the \
+                     refreshed graph and one opened on it\n  trace: {}",
+                    trace.summary()
+                );
+            }
+            // ── memory: the live session let the previous graph go ─────────────────────
+            assert!(
+                previous.upgrade().is_none(),
+                "seed {seed}: the session still holds the graph it moved off"
+            );
+
+            // ── economy, exactly as for a column set directly ──────────────────────────
+            let moved = (which, column);
+            for step in &trace.steps {
+                if !matches!(
+                    step.outcome,
+                    dagpane_core::trace::StepOutcome::Evaluated { .. }
+                ) {
+                    continue;
+                }
+                let reads_it = depends
+                    .iter()
+                    .find(|(n, _)| *n == step.cell)
+                    .map(|(_, d)| d.contains(&moved))
+                    .unwrap_or(true)
+                    || constrained
+                        .iter()
+                        .find(|(n, _)| *n == step.cell)
+                        .map(|(_, c)| c.contains(&moved))
+                        .unwrap_or(false);
+                assert!(
+                    reads_it,
+                    "seed {seed}: `{}` evaluated after a refresh rewrote column {column} of \
+                     `{}`, but it reads none of that column\n  trace: {}",
+                    step.cell,
+                    sources[which],
+                    trace.summary()
+                );
+                woken += 1;
+            }
+        }
+    }
+
+    assert_eq!(interactions, 480);
+    // About a quarter by construction. Zero would mean the corpus never exercised the case an
+    // unchanged refresh takes, and every one would mean it never exercised anything else.
+    assert!(
+        (60..=180).contains(&unchanged),
+        "{unchanged} of 480 refreshes found identical data"
+    );
+    // Measured at 211 (and 116 identical refreshes above), so this floor is about half of
+    // what the corpus does — low enough not to flap on a generator tweak, high enough that a
+    // corpus where moving onto a graph stopped waking anything fails here.
+    assert!(
+        woken > 100,
+        "only {woken} cells ever woke — the corpus is inert"
+    );
+}
+
 // ── the cut ────────────────────────────────────────────────────────────────────────────
 //
 // `crates/core/src/placement.rs` argues that a graph split across a wire stays glitch-free

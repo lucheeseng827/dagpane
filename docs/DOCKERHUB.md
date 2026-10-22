@@ -13,10 +13,11 @@ container and nothing for it to fetch at run time.
 
 ## Read this before you expose it
 
-**Authentication is optional, and off unless you turn it on.** `dagpane run` binds loopback
-by default and warns when told to bind anything else. Inside a container, "anything else" is
-the only useful choice, which is why every example below passes `--host 0.0.0.0` — so the
-warning applies to every containerised deployment.
+**Authentication is optional, and off unless you turn it on** (0.1.1 has none at all).
+`dagpane run` binds loopback by default and warns when told to bind anything else;
+`dagpane serve`, below, binds every interface by default and gives the same warning. Inside
+a container, "anything else" is the only useful choice — so unless you pass `--auth-jwks`,
+the warning applies to every containerised deployment.
 
 Two answers, and you need one of them before the port is reachable by anyone you would not
 show the data to. Whoever can open the page can move every input in the app and read every
@@ -24,30 +25,46 @@ value it computes.
 
 1. **Put something that authenticates in front of it.** Unchanged, still supported, and the
    right answer where a proxy already does this.
-2. **Use the built-in front door:** mount a JWKS file and pass `--auth-jwks` with
-   `--auth-issuer`, `--auth-audience` and either `--auth-apps-claim` or `--auth-any-app`. The
-   process verifies OIDC id tokens against that file and makes **no outbound request**, so
-   there is no discovery call to fail at start-up and an air-gapped host works. Access is per
-   app, never per pane, and a token cannot be revoked before it expires.
+2. **Use the built-in front door** (0.2.0 and later): mount a JWKS file and pass
+   `--auth-jwks` with `--auth-issuer`, `--auth-audience` and either `--auth-apps-claim` or
+   `--auth-any-app`. The process verifies OIDC id tokens against that file and makes **no
+   outbound request**, so there is no discovery call to fail at start-up and an air-gapped
+   host works. Access is per app, never per pane, and a token cannot be revoked before it
+   expires.
 
 ## Run it
 
 Run these from the directory holding your app manifest and its data.
 
 ```sh
-docker pull mancube/dagpane:0.1.1
+docker pull mancube/dagpane:0.2.0
 
 # what version is in here
-docker run --rm mancube/dagpane:0.1.1 --version
+docker run --rm mancube/dagpane:0.2.0 --version
 
 # check an app without running it, and print the graph it would build
-docker run --rm -v "$PWD:/app:ro" mancube/dagpane:0.1.1 check /app/your-app.toml
-docker run --rm -v "$PWD:/app:ro" mancube/dagpane:0.1.1 graph /app/your-app.toml
+docker run --rm -v "$PWD:/app:ro" mancube/dagpane:0.2.0 check /app/your-app.toml
+docker run --rm -v "$PWD:/app:ro" mancube/dagpane:0.2.0 graph /app/your-app.toml
 
-# serve it
+# serve it to a browser on this machine
 docker run --rm -p 8787:8787 -v "$PWD:/app:ro" \
-  mancube/dagpane:0.1.1 run /app/your-app.toml --host 0.0.0.0
+  mancube/dagpane:0.2.0 serve /app/your-app.toml --origin http://localhost:8787
 ```
+
+`serve` binds every interface, which is what a container needs, and the socket behind the
+page accepts a browser only from the origins you pass with `--origin`. Without one it would
+accept only the bound address — here `http(s)://0.0.0.0:8787`, an origin no browser sends —
+and the page would load with dead controls; with one, nothing in front has to rewrite
+`Origin`.
+
+Behind a proxy or on a real hostname, pass `--origin https://<the name your users type>`
+instead, once per name.
+
+**0.1.1 cannot serve a browser from a container on its own.** It has no `serve`; as
+`run --host 0.0.0.0` its socket accepts a browser only from `http(s)://0.0.0.0:8787`, so the
+page loads with `200`, the socket is refused with `403`, and nothing in the log says why. Use
+0.2.0, or on 0.1.1 a proxy in front that allowlists `Origin` and then rewrites it to
+`http://0.0.0.0:8787`.
 
 The app is mounted rather than baked in. There is no shell in the image and no example inside
 it, so a bind mount is both the only way and the way you would really run this. Read-only is
@@ -104,7 +121,8 @@ interaction, never aggregated into a headline.
 
 | Tag | What it is |
 | --- | --- |
-| `0.1.1` | The release. Immutable once published. |
+| `0.2.0` | The current release. Immutable once published. |
+| `0.1.1` | The previous release: no `serve`, no authentication, and it stops gracefully on `SIGINT` only, so `docker stop` waits for `SIGKILL` unless the container was started with `--stop-signal SIGINT`. Immutable. |
 | `latest` | The most recent non-prerelease. Moves. Pin the version for anything that matters. |
 
 There is no `0.1.0` image. That release's build failed on a static-linking assertion that
@@ -138,7 +156,8 @@ read.
 
 https://github.com/lucheeseng827/dagpane
 
-`ARCHITECTURE.md` explains the engine, the four architecture decision records cover the
-choices that constrain it, and `SECURITY.md` covers the authentication gap above in full.
+`ARCHITECTURE.md` explains the engine, the twelve architecture decision records in `docs/adr`
+cover the choices that constrain it, and `SECURITY.md` covers authentication in full: the
+optional front door, and what it does not cover.
 
 Apache-2.0.

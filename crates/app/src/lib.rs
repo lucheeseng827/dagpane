@@ -42,8 +42,10 @@ pub use dagpane_connect::{
     file::FileFormat, BytesSource, SchemaSource, Source, SourceError, Version,
 };
 
-pub use manifest::{compile, compile_with, load, Manifest, ManifestError, Renderer, Sources};
-pub use refresh::{Refresh, RefreshOutcome, SourceRefresh};
+pub use manifest::{
+    compile, compile_with, load, source_builder, Manifest, ManifestError, Renderer, Sources,
+};
+pub use refresh::{Reading, Refresh, RefreshOutcome, SourceRefresh};
 pub use resume::{Dropped, ResumeError};
 pub use session::AppSession;
 pub use view::{render, CustomData, Pane, PaneKind, View};
@@ -125,7 +127,7 @@ pub struct BoundSource {
     /// against on its first tick.
     pub loaded_version: dagpane_connect::Version,
     /// How often a scheduled refresh should re-read it, from the manifest. Nothing in this
-    /// crate owns a clock, so nothing in this crate acts on it.
+    /// crate owns a clock, so nothing in this crate acts on it — `dagpane-serve` does.
     pub refresh_secs: Option<u64>,
 }
 
@@ -140,5 +142,66 @@ impl App {
     /// inside a table, say — which is exactly why panes have their own identity.
     pub fn panes_for<'a>(&'a self, cell: &'a str) -> impl Iterator<Item = &'a Pane> + 'a {
         self.panes.iter().filter(move |p| p.cell == cell)
+    }
+
+    /// This app over refreshed data: the same manifest, cells, controls and panes, with what
+    /// [`refresh::read`] brought back as the sources' rows.
+    ///
+    /// The graph is [`Graph::with_sources`], so every computation and every source that was
+    /// not re-read is shared with this app rather than rebuilt, the new rows are weighed once,
+    /// and a session over this app can move onto the new one with [`AppSession::rebase`] —
+    /// which a session over an app compiled again from the same manifest cannot, because
+    /// nothing can show that two compiles built the same computations. A split app's halves
+    /// are rebuilt from the new graph, sharing it the same way.
+    ///
+    /// `None` when every value is the data its source already holds: a file rewritten with
+    /// its old bytes is read, and then nothing is built and no viewer is touched.
+    ///
+    /// # Errors
+    ///
+    /// The [`dagpane_core::SessionError`] a session would give for setting one of the values,
+    /// and no app is built. Unreachable for a [`refresh::Reading`] of this app.
+    pub fn with_sources(
+        &self,
+        reading: &refresh::Reading,
+    ) -> Result<Option<App>, dagpane_core::SessionError> {
+        let values = reading
+            .values
+            .iter()
+            .map(|(cell, value)| (cell.as_str(), value.clone()));
+        let Some(graph) = self.graph.with_sources(values)? else {
+            return Ok(None);
+        };
+        let graph = Arc::new(graph);
+        Ok(Some(App {
+            title: self.title.clone(),
+            subtitle: self.subtitle.clone(),
+            split: self
+                .split
+                .as_ref()
+                .map(|_| Arc::new(graph.split(&self.cut))),
+            graph,
+            widgets: self.widgets.clone(),
+            panes: self.panes.clone(),
+            sources: self
+                .sources
+                .iter()
+                .map(|bound| BoundSource {
+                    // The version of the rows this app holds, so that a schedule starting
+                    // from it compares against them rather than against the compile's.
+                    loaded_version: reading
+                        .versions
+                        .get(&bound.cell)
+                        .copied()
+                        .unwrap_or(bound.loaded_version),
+                    ..bound.clone()
+                })
+                .collect(),
+            renderers: self.renderers.clone(),
+            cut: self.cut.clone(),
+            // The page's boot block describes the sources' columns, which a refresh is not
+            // allowed to change — see `refresh::read` — so it is the same block.
+            client_half: self.client_half.clone(),
+        }))
     }
 }

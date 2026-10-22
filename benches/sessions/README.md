@@ -2,11 +2,13 @@
 
 Two rigs and one question, split the way an operator meets it: a viewer who is **holding** a
 socket and a viewer who is **using** it are two different costs, and only the first of them was
-ever measured here.
+ever measured here. A third rig checks the process rather than the viewer: `dagpane host` now
+prices what each viewer holds, and `ledger.sh` holds that figure against the kernel's.
 
 ```sh
-./benches/sessions/run.sh     # held:  what it costs to have a viewer
-./benches/sessions/busy.sh    # busy:  what it costs while they drag a slider
+./benches/sessions/run.sh     # held:   what it costs to have a viewer
+./benches/sessions/busy.sh    # busy:   what it costs while they drag a slider
+./benches/sessions/ledger.sh  # ledger: what the process says they hold, against the kernel
 ```
 
 `run.sh` is the original rig and `ROADMAP.md` §7's first item. `busy.sh` is the exclusion that
@@ -499,7 +501,60 @@ says should know it rests on one `writeFile` with nothing watching it.
 
 ---
 
-## What neither of them says
+## Part three — what the process says they hold
+
+The first two rigs price a viewer from outside the process. `dagpane host` now prices one from
+inside it: each viewer's connection holds a lease, records what its session's frames hold after
+every pass — each allocation once, the app's own sources excluded — and `/healthz` reports it per
+app. **A figure a process computes about itself is a claim**, and `ledger.sh` is the measurement
+that could falsify it.
+
+### The method
+
+The held rig's, deliberately — its ladder, its settle, its five samples a rung and its slope from
+`lib.mjs` — so the kernel's half of the answer is the number part one would have produced. Three
+things differ, each for a reason:
+
+* **`dagpane host`, not `run`.** The ledger lives in the host; `run` serves one app and prices
+  nothing. A host routes on `Host`, and Node's built-in `WebSocket` sends the URL's own authority
+  whatever it is told, so the rig upgrades its sockets by hand over `node:http`.
+* **The app is opened once and closed before rung 0.** A host compiles an app on its first
+  request, so without that the first rung would weigh the sources as well as the first viewer.
+* **The ledger is read at every rung, and checked.** Its session count must equal the rung's
+  before it is recorded, and at the end it must be exactly its per-viewer figure times the
+  viewers — every viewer here is the same viewer, so a lease that leaked or a viewer counted
+  twice would bend the line.
+
+### What it found
+
+| app | kernel (RSS slope) | ledger | not in the ledger |
+|---|---:|---:|---:|
+| 600 rows, keeps rows | 175 kB | 24 kB | **151 kB** |
+| 200 000 rows, keeps rows | 7 197 kB | 7 034 kB | **162 kB** |
+| 200 000 rows, aggregates only | 146 kB | 1.3 kB | **145 kB** |
+
+**The two instruments are not meant to agree, and the way they disagree is the finding.** The
+ledger counts frames. A connection also costs a socket's buffers, a task, a slot vector and the
+panes a frame is rendered into, and none of those is a frame. So the right test is not whether
+the columns match — it is whether **the gap stays put while the ledger moves**, and it does:
+145–162 kB across three apps whose ledgers span more than three orders of magnitude.
+Everything that varies with the pipeline is on the ledger's side of the line, and what is left
+is part one's floor, found again from the other side. The kernel's column is part one measured
+again under `host` — 175, 7 197 and 146 kB against part one's 179, 7 248 and 145 — so the two
+rigs agree about the viewer as well as about the floor.
+
+The ledger was exactly linear at every rung of all three ramps.
+
+### What it does not say
+
+* **Idle viewers only**, like part one. The busy term of part two is transient allocator state,
+  not frames a session holds, and the ledger does not see it.
+* **The frames, not the process.** A ledger figure is what a viewer's frames hold beyond the
+  sources; for a memory limit, add the per-connection floor above and the busy term.
+
+---
+
+## What none of them says
 
 * **One machine, shared, and cloud.** The ratios survive that; the absolutes are for ordering
   decisions, not for a cost model. `results/` records the host beside every run.
@@ -509,8 +564,9 @@ says should know it rests on one `writeFile` with nothing watching it.
   protocol-level with a measured floor, and `benches/fleet/`, which drives real browsers. The
   neighbour's wait above is the one latency question those cannot ask: what a viewer who is
   doing nothing experiences while their neighbours are busy.
-* **Nothing about a fleet.** Every figure here is one `dagpane run` holding one app. What a busy
-  app does to a *different* app in the same `dagpane host` process is not measured, and the
+* **Nothing about a fleet.** Every figure here is one process holding one app — `dagpane run`
+  for the first two rigs, a `dagpane host` holding a single app for the third. What a busy app
+  does to a *different* app in the same `dagpane host` process is not measured, and the
   mechanism above says it is unlikely to be nothing.
 
 ## Running them
@@ -518,10 +574,11 @@ says should know it rests on one `writeFile` with nothing watching it.
 ```sh
 ./benches/sessions/run.sh
 ./benches/sessions/busy.sh
+./benches/sessions/ledger.sh
 ```
 
 Each builds the binary if it is not there, generates the 200 000-row fixtures into a temporary
-directory — `fixtures.sh`, shared, so both rigs weigh the same two apps — and writes a JSON per
+directory — `fixtures.sh`, shared, so every rig weighs the same two apps — and writes a JSON per
 ramp into `results/`.
 
 **What is in a result file.** Every run records its own provenance: the argv it spawned with,

@@ -20,7 +20,301 @@ anywhere and no number here supports it.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-22
+
+An app served to other people, and a manifest that can say more.
+
+0.1.1 had one way to serve an app: `dagpane run`, for a person at a terminal, on loopback.
+0.2.0 adds `dagpane serve`, one replica of many — it binds every interface, answers `/healthz`
+and `/readyz` on a port of its own, drains before it stops, and takes `--origin` for the
+address a browser opens — and `dagpane host`, which serves every manifest in a directory from
+one process, routed by the `Host` header, with a byte budget for the source data it loads. Any
+of the three can sit behind an optional OIDC front door: `--auth-jwks` and its flags, and a
+PKCE sign-in in the bundled page, with keys read from a file so that the door makes no outbound
+request. Sources go past a CSV read once at start-up: `dagpane-connect` reads a file, a URL or
+a Postgres query, the last two behind cargo features that are off by default; `refresh_secs` is
+acted on while anybody is viewing, and `dagpane refresh` re-reads the sources and prints what
+that cost. `dagpane export` writes a folder of static files whose page runs the engine as
+WebAssembly, with no server behind it. The manifest gains derived columns, joins, SQL cells
+that lower to the same steps, custom panes drawn by a JavaScript function, and
+`place = "client"`, which is checked and reported and not yet served. The engine invalidates
+per column, so a cell sleeps through a change to a column it did not read. And a connection is
+kept alive and let go on purpose: a quiet one is pinged every 25 s, and a client that stops
+reading is dropped.
+
+**`mancube/dagpane:0.2.0` is the first published image that serves a browser through a
+published port**, and `:latest` moves to it. 0.1.1 has only `run`, and a `run` bound to
+`0.0.0.0` in a container allows a browser's socket only from `http(s)://0.0.0.0:8787`, so a
+browser at `http://localhost:8787` got the page and dead controls. In a 0.2.0 container,
+`serve … --origin http://localhost:8787` answers that browser and stops gracefully on
+`SIGTERM` as PID 1, and CI asks every image a browser's question before it is published
+(*Fixed*, below).
+
+### Upgrading from 0.1.1
+
+Eleven changes can stop something that worked on 0.1.1. Three reach a manifest, a client or a
+script around the binary; the other eight reach only Rust code built against these crates.
+The entries below that describe them say **Breaking**.
+
+- **`check` refuses two kinds of manifest that 0.1.1 compiled, and so does every command that
+  compiles one.** A step that cannot work on the table it is handed — a column that is not
+  there at that point, or an aggregate over a type it has no meaning for — and a cell with
+  steps whose `from` is not a table: a control, or a cell that ends in `count` or `scalar`.
+  `check`, `graph`, `explain` and `run` now exit `1` naming the cell; 0.1.1's `check` printed
+  `ok`, and the cell failed at run time instead. So these manifests were already broken, with
+  two exceptions that worked well enough to miss: a `filter` with `skip_when` on a misspelled
+  column showed nothing wrong while its control sat on the skip value, and a broken cell that
+  no pane shows and no cell reads failed silently while everything else was served. Both now
+  stop the app at start-up. **To upgrade:** run 0.2.0's `dagpane check` on every manifest
+  first, fix the column it names (it suggests the nearest one), delete a cell nothing reads,
+  and take the steps off a cell that reads a control — with none, such a cell is now an alias
+  of the control.
+
+- **A WebSocket client that stops reading is dropped.** The server pings a quiet connection
+  every 25 s (`--heartbeat-seconds`), and drops one whose ping goes unanswered for 30 s
+  (`--ping-timeout-seconds`) or whose frame cannot be written within 30 s
+  (`--write-timeout-seconds`), each deadline plus the time a 128 kbit/s link needs. All three
+  are on by default under `run`, as under `serve` and `host`; 0.1.1 sent no pings and had no
+  deadlines. A browser answers pings in the transport and is unaffected. A script that holds
+  `/ws` open without reading it, or whose library answers a ping only while it reads, is let
+  go. **To upgrade:** keep reading the socket, so that the library answers each ping; or pass
+  `--ping-timeout-seconds 0 --write-timeout-seconds 0` to keep the pings and turn both
+  deadlines off, adding `--heartbeat-seconds 0` for no pings at all, as in 0.1.1. Keep any
+  proxy's idle timeout above the heartbeat.
+
+- **`run` prints more before its URL.** Its liveness settings — `dagpane: heartbeat 25s …`,
+  `dagpane: writes …` and `dagpane: answers …` — now come between the title and the URL, so
+  the URL is no longer the second line of stdout, and under `--auth-jwks` an `authenticated —`
+  line comes first. The URL is printed once its port is bound, with the port the kernel picked
+  under `--port 0`; a bind that fails names the address; and the warning for a non-loopback
+  bind, still on stderr, is reworded and comes after the bind. **To upgrade:** find the URL by
+  matching `^dagpane: http://`, not by line number, and stop matching 0.1.1's *There is no
+  authentication in this version*.
+
+- **`dagpane_core::frame::Frame` has a required method, `memory_size`**, and a defaulted one,
+  `allocations`, so a `Frame` implemented against 0.1.1 does not compile. **To upgrade:** add
+  `memory_size`, reporting the bytes the frame's buffers hold; a backend whose frames share
+  buffers should override `allocations` as well.
+
+- **`ArrowFrame::memory_size` is the `Frame` trait's method now, not an inherent one**, so a
+  call needs the trait in scope. It also reports less for a CSV source's dictionary columns,
+  which are no longer built at Arrow's default capacity (*Fixed*, below). **To upgrade:** add
+  `use dagpane_core::frame::Frame;` where you call it.
+
+- **`dagpane_app::App` has five more public fields** — `sources`, `renderers`, `cut`, `split`
+  and `client_half` — so a struct literal written against 0.1.1 does not compile. **To
+  upgrade:** build an `App` with `dagpane_app::compile` or `load`; by hand, take
+  `let cut = dagpane_core::Cut::whole(&graph);` before the literal — it borrows the graph the
+  literal moves — and add `sources: vec![], renderers: vec![], cut, split: None,
+  client_half: None`.
+
+- **Public enums have new variants, and none of them is `#[non_exhaustive]`:**
+  `SessionError::OtherGraph`; `ManifestError::{Renderer, Placement, Step, NotATable, Sql}`;
+  `PaneKind::Custom` and `View::Custom`; `ServerMessage::Reloaded`. An exhaustive `match` on
+  any of them does not compile. **To upgrade:** add the arms, or a wildcard arm.
+
+- **`dagpane_core::Inputs` is no longer `Send` or `Sync`.** It carries the cell's read log —
+  the record of which columns a compute looked at, which is what per-column invalidation runs
+  on — and that log is a `RefCell`. A compute that moved `inputs` into another thread, or
+  shared it with one (`std::thread::scope`, rayon), compiled against 0.1.1 and does not now.
+  **To upgrade:** take what each thread needs out of `inputs` first — `inputs.get(i)` and
+  `inputs.by_name(..)` return a `&Value` that outlives the borrow of `inputs` — and share
+  those.
+
+- **`ServerMessage::Init` has four more fields — `renderers`, `client_half`, `frontier` and
+  `dropped` — and `ServerMessage::Patch` one, `frontier`.** Rust that builds either variant,
+  or destructures one without `..`, does not compile. Each new field is left out of the JSON
+  when empty and defaults when absent, so for an app 0.1.1 could run, and a client that sends
+  no saved state, the messages carry the fields they did. **To upgrade:** add `..` to
+  patterns, build `init` with `AppSession::init_message`, and give a hand-built `Patch` an
+  empty `frontier`.
+
+- **The manifest's Rust types changed shape, though every TOML key 0.1.1 read is read the same
+  way.** `SourceSpec.csv` is an `Option<PathBuf>` and `CellSpec.from` an `Option<String>`,
+  because a source may now be `file`, `http` or `sql` and a cell may be `sql`; and `AppMeta`,
+  `SourceSpec`, `InputSpec`, `CellSpec`, `StepSpec` and `PaneSpec` have new public fields.
+  **To upgrade:** use `Some(..)` where you build `csv` or `from` and match on it where you read
+  it; end a literal of `InputSpec`, `StepSpec` or `PaneSpec` with `..Default::default()`, and
+  name the new fields in one of `AppMeta`, `SourceSpec` or `CellSpec`, which have no
+  `Default`.
+
+- **`dagpane_serve::serve` and `serve_on` keep their signatures and change behaviour.** They
+  stop on `SIGTERM` as well as Ctrl-C, so the future returns `Ok(())` where under 0.1.1 the
+  signal ended the process, or was ignored by it as PID 1; they apply the default liveness
+  settings above; they close every socket with `1001` and wait up to 2 s for it; and they
+  answer `GET /auth` and a declared renderer's path beside `/` and `/ws`. Only a program that
+  embeds the server sees this. **To upgrade:** expect the future to resolve on `SIGTERM`, and
+  for no pings and no deadlines, as in 0.1.1, call `serve_with` or `serve_on_with` with
+  `Options { heartbeat: None, write_timeout: None, ping_timeout: None, ..Default::default() }`.
+
+Outside these eleven, the command line and the manifest keep everything 0.1.1 had. Every 0.1.1
+command line is still accepted — `check`, `graph --format`, `explain --set` and `--json`,
+`run --port` and `--host` — with the same defaults, so `run` still binds `127.0.0.1:8787`, and
+with the same exit codes: `0`, `1` with `dagpane: <message>` on stderr, and `2` for a usage
+error. Every manifest key 0.1.1 read means what it meant, `csv = "…"` and `from = "…"`
+included, and an unknown key is still refused. `explain --json` gains one key,
+`interaction.changed_column`, which is `null` under `--set`.
+
 ### Added
+
+- **`dagpane run` takes `--heartbeat-seconds`, like `serve` and `host`, and a test now shows
+  each liveness flag reaching the server.** 0.1.1's `run` sent no pings at all; on `main`,
+  once the heartbeat landed, `run` pinged every 25 s with no way to change it. The three
+  flags — `--heartbeat-seconds`, `--write-timeout-seconds` and
+  `--ping-timeout-seconds` — are now one group that all three commands share, defaulting to the
+  server's own `HEARTBEAT`, `WRITE_TIMEOUT` and `PING_TIMEOUT` rather than copies of them. One
+  function turns the group into the server's `Liveness`, so the three commands cannot disagree
+  about a name, a default or what `0` means, and `run` prints the heartbeat line `serve` and
+  `host` print. Nothing tested that a flag got past parsing: what each setting does was tested
+  from `Options` inward, and the step from the command line to `Options` was not.
+  `crates/cli/tests/liveness.rs` starts `run`, `serve` and `host` for real, with the three flags
+  at three different numbers, and checks each over real sockets by something only its own
+  number produces: how often a client that reads is pinged, and the allowance the server
+  reports when it drops a client that stopped reading on a quiet connection, and one that asked
+  for more than it read. Unit tests hold the rest: each flag parsed into its own setting, every
+  field of `Options` passed on, the front door included, and every start-up line in each of
+  its states. Eighteen mutations of the wiring and the start-up lines, all but one caught; six
+  are caught by the socket tests alone, among them each command serving the defaults in place
+  of what it was given, and `run` pinging at 25 s again. The one that survives turns a `0` back
+  into the default on its way to the server. What `0` does is checked as far as the start-up
+  line and the `Liveness` it parses to, because telling "off" from a 30 s default over a socket
+  takes more than 30 s per command.
+
+- **A ping that goes unanswered drops its connection, so a client that stopped reading on a
+  quiet connection, or went, no longer keeps it for good.** The write deadline catches a
+  connection stuck sending. On a quiet one — an idle dashboard with no scheduled source — no
+  write ever waits, the heartbeat's pings keep the proxy's idle timeout from firing, and TCP
+  gives up on a client only once it stops acknowledging, after a quarter of an hour, and never
+  on one whose kernel still does: measured against a Linux client, that kernel grew its buffer
+  to fit the pings and compacted them at its ceiling, a month's worth with none refused. Every
+  ping now carries a sequence number and must be answered — by a Pong echoing it, which a
+  client can send only after reading everything before it — within `--ping-timeout-seconds` on
+  `run`, `serve` and `host`, 30 s by default and `0` for none, **plus the time a 128 kbit/s link
+  needs for everything written since the last answer**, so a client reading a large frame
+  slowly is not taken for one that stopped. A ping that misses it drops the connection, with a
+  line on stderr naming the app — but not before whatever the client has sent is read, so an
+  answer that landed while the server was busy writing to it or computing, or short of workers,
+  still counts. The deadline and the heartbeat are asked of the clock before every frame, their
+  timers only waited on: a client that never reads but keeps sending never lets the connection
+  wait, and a loop that never waits leaves the runtime's timers behind — measured, an overdue
+  ping went unseen through hundreds of thousands more frames, another second on an idle machine
+  and four on a busy one. The clock can be ahead of what the runtime has read of the socket, so
+  the runtime takes a turn before an overdue ping is believed. After a ping a connection waits on
+  its socket and its timers together, rather than pinging again at once, and a heartbeat under a
+  millisecond is a millisecond, so one due again before its ping is written cannot crowd the
+  socket out. Each ping's payload is offset by a key drawn per connection, so a client that has
+  stopped reading cannot answer by counting. A desktop browser answers pings with no JavaScript
+  involved: measured in Chromium, a busy script, a frozen page and a background tab all kept
+  answering, and only stopping the browser's processes drew a drop. **Breaking** for a client
+  that holds `/ws` open without reading it, which 0.1.1 neither pinged nor dropped.
+  `crates/serve/tests/unanswered.rs` stalls a real client on a quiet connection and requires the
+  server to let it go under `run` and `host` while a client that reads is kept; refuses
+  unsolicited pongs and pongs that count the pings; drops a client that never reads within half a
+  second of its deadline, and not before it, while it is still flooding the server, on each of
+  five connections in turn, and pings one that floods and reads on time; reads an 8.7 MB opening
+  frame at about 1.5 MB/s under a one-second deadline, checks that thirty pings queued behind it,
+  and requires the connection kept; keeps four clients whose answers land while the server is
+  busy writing them megabytes, and one whose answer lands, twice, behind a Pong that answers
+  nothing, while a pass holds the server's only thread; and waits out the stall with the deadline
+  off as the control. Unit tests hold the ledger, including the case the slow reader found —
+  pings written behind a backlog keep their time when an earlier one is answered. Eight
+  mutations, each caught. A ninth, lifting the cap on how many frames are read for an overdue
+  answer, survived while the deadline waited on its timer, the flood having outpaced the server
+  unseen; with the clock asked, it is caught, and so are seventeen more of the loop around it.
+  Six survive: the wait after a ping, needed only when a ping takes longer than the heartbeat to
+  write; a turn of the runtime before every look rather than the first, which only costs time; a
+  yield in its place, the same on the one-thread runtimes the tests use and weaker on the
+  many-thread one production runs; and three that change nothing a client can see.
+  `OPERATIONS.md` *A connection that stops reading*, `docs/RUNBOOK.md` §14.
+
+- **A connection stuck sending to a client that has stopped reading is dropped.** A connection
+  is a sequential loop, so a frame it cannot write stops everything behind it, and nothing
+  bounded how long it could wait: a wedged tab, a proxy that stopped forwarding, or a client
+  doing it on purpose held its session for as long as it liked — and, since scheduled
+  refreshes, the rows it had when it stopped, which every other viewer had moved off. Every
+  frame the server sends (opening frame, answers, `reloaded`, pings, closes) now has an
+  allowance — `--write-timeout-seconds` on `run`, `serve` and `host`, 30 s by default and `0`
+  for none, **plus the time a 128 kbit/s link needs for the frame's bytes**, so a client reading
+  a large frame slowly is not taken for one that stopped — and a frame that misses it drops the
+  connection, with a line on stderr naming the app. A client sent more than its link carries
+  can still fall far enough behind to be dropped the same way, and reconnects onto the newest
+  state. A client that stops reading and is sent nothing never makes a write wait, so it is
+  not caught here; the ping deadline above is what catches it. **Breaking** for a client that
+  stops reading what it is sent, which 0.1.1 waited on with no deadline.
+  `crates/serve/tests/deadline.rs` stalls a real client and requires the server to let it go
+  under `run` and `host` while a client that reads is answered throughout, reads an 8.7 MB
+  frame at about 1.5 MB/s and requires it whole, and waits out the same stall with the
+  deadline off as the control; a unit test holds the allowance itself, up to a deadline of
+  `Duration::MAX`. Five mutations, each caught. `OPERATIONS.md` *A connection that stops
+  reading*, `docs/RUNBOOK.md` §13.
+
+- **`refresh_secs` is acted on: a running server keeps its data current, and every viewer sees
+  the change.** On `main` a manifest could say `refresh_secs = 300` on a source — 0.1.1
+  refused the key — and nothing read it again until the process restarted. Now `dagpane run`,
+  `serve` and `host` check a scheduled source on its interval while anybody is viewing the
+  app, read it when its version moved, and move every live viewer onto the new rows. ADR-0011
+  is the record; `OPERATIONS.md` *Refreshing the data* is how to run it.
+
+  **Read once, weighed once, held once.** The rows are read once per tick however many viewers
+  there are, and become a new graph — `Graph::with_sources` — which weighs them once and shares
+  everything else. Each viewer's session moves onto it with `Session::rebase`, so the rows from
+  before the refresh are freed when the last viewer has moved. The obvious implementation —
+  staging the table on each session — passes every value test and hashes the table once per
+  viewer while every page keeps the graph it opened on, and with it the data from when it opened.
+
+  **Each viewer recomputes only what reads the source, at their own filter**, and is sent a
+  `reloaded` frame holding only the panes that moved — or nothing: identical rows build no
+  graph and tell nobody, and a viewer whose panes the new rows do not move is sent nothing. The
+  page paints it unasked, leaves a `set` in flight waiting for its own reply, and says
+  *new data in sales* rather than claiming an interaction.
+
+  **A refresh changes rows, never their shape.** Rows whose columns differ from the app's are
+  refused and logged, and the app keeps what it had — the app was checked against those columns,
+  and a change of shape is a deploy. Every refresh, failure and refusal is a console line.
+
+  **Behind a front door, new rows go only to a token that still holds.** A token is checked when
+  a socket opens. Before this, a connection that outlived its token could only go on seeing what
+  it had — new data meant a restart, and a restart meant coming back through the door. Now a
+  connection whose token has expired is closed with WebSocket code `4401` when new rows arrive
+  for it, instead of being sent them, and the bundled page asks the viewer to sign in again
+  rather than retrying a door that token cannot open. `crates/serve/tests/door.rs` checks both
+  front doors over real sockets; `crates/serve/tests/reconnect.mjs` checks the page in Chromium.
+
+  **Under `host`**, a schedule runs per admission while it is viewed, `Host::reload` replaces the
+  resident slot so the next viewer opens on the new rows and the budget counts them, and
+  `SessionLease::rebase` keeps each viewer from being billed for the refreshed table. `dagpane
+  check` prints each scheduled source. The plan's exit criterion — with two viewers open, a
+  change repaints both and no change repaints neither — is `crates/serve/tests/refresh.rs`, over
+  real sockets; `crates/core/tests/oracle.rs` adds 480 refreshes over random graphs checked
+  against a viewer who opened afterwards.
+
+- **The process now knows what its viewers hold, and reports it beside the budget rather than
+  in it.** `ROADMAP.md` §7's `--budget-mb` box, which called this a design question. The design
+  could not be answered until the term was a number the process knew, so first it is one.
+
+  `Frame::allocations` reports a frame's storage allocation by allocation, and `FrameLedger`
+  counts each address once — so a projection of a source costs nothing, a filtered dictionary
+  column is billed for its keys and not its dictionary, and two slices of one buffer are one
+  buffer. `Host::session` and the new `Host::open_session` hand back a `SessionLease` with every
+  session; the host keeps a `Weak` to it, so a viewer is counted exactly as long as their
+  connection lives, and the connection records what its session holds after each pass with an
+  atomic store and no lock. Under `dagpane host`, `/healthz` gains each app's `sessions` and
+  `session_bytes`, their totals, and `held_after_eviction`.
+
+  **Checked against the kernel, by a rig that could have said otherwise.**
+  `benches/sessions/ledger.sh` ramps the held rig's three apps under `dagpane host` and reads
+  both figures at every rung. What the ledger leaves out is 145–162 kB a viewer whichever app
+  it is, while the ledger runs from 1.3 kB to 7 034 kB: everything that varies with the
+  pipeline is on its side of the line, and what is left is the per-connection floor.
+
+  **Reported, not enforced — and that is the decision the box asked for.** The budget evicts
+  apps, and evicting an app frees nothing its viewers hold: their graph keeps its sources alive
+  until they leave. That is also the gap pricing them surfaced. An app evicted while somebody is
+  still looking at it leaves `resident_bytes` at once and memory only when they do;
+  `held_after_eviction` lists it, matched by admission rather than by key, because a rollback is
+  the original key again — matched by key, the viewer who sat through it would be booked against
+  the reloaded copy and the copy they hold would vanish from the report. A test holds that, and
+  `docs/adr/0010-viewers-are-reported-not-budgeted.md` records the decision.
 
 - **What a viewer costs while they are *using* it — and the memory does not come back.**
   `benches/sessions/busy.sh`, `ROADMAP.md` §7's last open box, and the exclusion the held rig
@@ -118,46 +412,28 @@ anywhere and no number here supports it.
   pass cheap — `filter` builds all 200 000 rows before `group_by` discards them — it makes the
   cost stop growing with viewers.
 
-### Changed
+- **`dagpane_serve::Options` carries the heartbeat and both deadlines — `heartbeat`,
+  `write_timeout` and `ping_timeout`** (`Some(HEARTBEAT)`, `Some(WRITE_TIMEOUT)` and
+  `Some(PING_TIMEOUT)` by default) — and **`serve_host_replica` takes them together, as a
+  `Liveness`**, rather than as three `Option<Duration>`s side by side, which would swap
+  without a word from the compiler. `Options::default()` takes all three from
+  `Liveness::default()`, so the two front doors cannot drift apart. `HEARTBEAT`,
+  `WRITE_TIMEOUT`, `PING_TIMEOUT` and `SLOWEST_READER` are public.
 
-- **A verdict moved and four documents that totalled it up did not.** `POSITIONING.md` §3's score
-  line read *zero of four fully met* after condition 1's own verdict above it had been changed to
-  met, and so did every other place that totals it up — `ROADMAP.md`'s opening among them, and
-  one of them uses that score as half of a gate. The honest reading is **two of four fully met,
-  two partly**, and all four now say so with a note about what they said before. The same sweep found per-session memory still called unmeasured in four more places a
-  round after it was measured. `ROADMAP.md` §7 had already written the lesson down and it was
-  learned again anyway, in files that were open at the time; the habit that catches it is one
-  line — when a measurement lands or a verdict moves, grep the tree for the word that used to be
-  true.
+- **Public API for refresh.** `Graph::with_sources`, `Graph::initial`, `Session::rebase`,
+  `App::with_sources`, `AppSession::rebase`, `refresh::read` and `refresh::Reading`,
+  `Host::reload`, `SessionLease::rebase` and `SessionLease::admission`,
+  `ServerMessage::Reloaded`, `dagpane_auth::Viewer::expired` and `dagpane_serve::TOKEN_EXPIRED`.
+  `SessionError` gains `OtherGraph`, which an exhaustive `match` has to name, as it has to name
+  `ServerMessage::Reloaded`: **Breaking** for an exhaustive `match` on either enum.
+  `dagpane_app::source_builder` is public so that a refresh loads in the representation the
+  compile chose, and `dagpane refresh` asks it rather than deciding again from a feature of
+  its own.
 
-- **What one more viewer costs, measured — and it narrows a claim this project makes in nine
-  places.** `benches/sessions/`, `ROADMAP.md` §7's first item, and the last of its four to be
-  answered.
-
-  The rig ramps *idle* sessions 0 → 512 against one `dagpane run`, reads `smaps_rollup` rather
-  than `ps`, and takes the least-squares slope rather than a subtraction between two rungs —
-  RSS grows in allocator steps and does not come back down. The bundled example: **179 kB per
-  session**.
-
-  **The comparison is the result, not that number.** The same pipeline over 200 000 rows costs
-  **7 248 kB** a session; an *aggregating* pipeline over the same 200 000 rows costs **145 kB**.
-  Same data, same process, same sockets — 50× apart. So a session costs what its pipeline
-  **materialises**, not what its app **sources**.
-
-  Both halves of that matter. **The sources really are shared**, and the 145 kB is the first
-  measurement that says so — §7 had singled out `Arc::ptr_eq` as *"asserted by a test rather
-  than inferred from an RSS reading"*, and this is the reading. **The computed frames are not
-  shared**, and cannot be: two viewers with two filters must have two answers. That was never
-  wrong, and it was never priced.
-
-  So *"a hundred viewers of a 600-row app are a hundred slot vectors over one table, not a
-  hundred copies of it"* — true, and read as a statement about the total, which it is not. Even
-  on the bundled example a session costs **8.5× the CSV it is sharing**. The sentence has been
-  narrowed everywhere it appears to say what is shared rather than to imply what is not.
-
-  The operational consequence is in `OPERATIONS.md` under *Sizing*: **`--budget-mb` counts
-  source bytes and none of this is in it**, so a fleet of row-keeping apps with many viewers is
-  sized against the smaller of its two costs.
+- **`Host::session` returns `(Session, SessionLease)`**, and a host connection holds the lease for
+  as long as it lives. There is no way to get a session from a `Host` without one, on purpose: a
+  path that skipped it would be a viewer the process holds memory for and cannot see.
+  `--budget-mb`'s help says what it does not count and where that is reported.
 
 - **`dagpane host` is operated like `dagpane serve`.** The same probes on a listener of their
   own, the same unready-then-drain stop, and the same `SIGTERM`. What is not the same is the
@@ -216,7 +492,8 @@ anywhere and no number here supports it.
   allowlist from the address it bound, and stops when that person stops it. A replica is none
   of those things — it is stopped by something that will not read output, sent traffic by
   something that only asks yes-or-no questions, and reached at a name it was never told. So
-  the defaults are a separate command rather than a flag on that one, and `run` is unchanged.
+  the defaults are a separate command rather than a flag on that one, and `run` keeps its
+  laptop defaults.
 
   **Stopping is a sequence.** A replica that closes its listener the moment it is signalled is
   still in the load balancer's pool — the balancer finds out at its own pace, and every
@@ -299,8 +576,8 @@ anywhere and no number here supports it.
   once — the same cost `dagpane export` pays.
 
 - **Either half of a split app can now be run, and the protocol carries the frontier between
-  them.** The mechanism landed last release checked a cut and reported it; this is the layer
-  that would serve one.
+  them.** The placement entry below checks a cut and reports it; this is the layer that would
+  serve one.
 
   `AppSession::open_side` runs the server half or the page half over its own graph, with its
   own rendered-view cache — a pane repainted in the browser is not recorded on the server,
@@ -313,7 +590,10 @@ anywhere and no number here supports it.
   wire shape and holds an `Outcome` rather than a `Value`, so a failure upstream of the cut
   arrives as a failure instead of a null the page would draw as a legitimately empty answer.
   Both fields are omitted from the encoding when empty, so an app that declared no placement
-  sends byte-identical messages to the ones it sent before.
+  sends byte-identical messages to the ones it sent before. In Rust they are new fields of
+  `ServerMessage::Init` and `Patch`, beside `client_half` (above), `renderers` and `dropped`
+  on `Init`: **Breaking** for code that builds either variant, or destructures one without
+  `..`.
 
   `dagpane-wasm` takes `side: "client"` to open the page's half, and `dp_deliver` applies a
   server message and answers with the page's own patch. The extraction is in Rust and not in
@@ -378,11 +658,17 @@ anywhere and no number here supports it.
   gained a `transport`; everything above it is written once.
 
   ```sh
+  $ rustup target add wasm32-unknown-unknown
+  $ cargo build -p dagpane-wasm --target wasm32-unknown-unknown --release
   $ dagpane export examples/sales.toml --out dist
-      1.1 MiB  dist/dagpane.wasm
-      4.7 KiB  dist/dagpane.js
-     60.2 KiB  dist/index.html
-      1.2 MiB  total
+  dagpane: Sales explorer — dist
+      1.3 MiB  dist/dagpane.wasm
+      4.8 KiB  dist/dagpane.js
+     70.4 KiB  dist/index.html
+      1.4 MiB  total
+
+    Serve the whole directory over http — `cd dist && python3 -m http.server`
+    — or put it behind any static host. A browser will not run it from file://.
   ```
 
   A folder for any static host — served over `http://`, since a browser refuses modules and
@@ -392,11 +678,12 @@ anywhere and no number here supports it.
   3 of 7 panes** — the same numbers CI asserts against the server, because a browser build
   that recomputed a different number would be a different product with the same name.
 
-  **1.10 MiB raw, 318 KiB gzipped**, five exports and **no imports** — no `getrandom` backend,
-  no wasi shim, no COOP/COEP, which is what `dagpane-core`'s clocklessness buys once there is a
-  browser to spend it in. Against DuckDB-Wasm's 34.25 MB and DataFusion's 27 MiB, the payload
-  argument `ROADMAP.md` §4 calls false for a query engine is true for a thin evaluator, and
-  `BENCHMARKS.md` now has it measured rather than asserted.
+  **1.32 MiB raw, 365 KiB gzipped** as 0.2.0 builds it (1.10 MiB and 318 KiB when
+  `BENCHMARKS.md` measured it on 2026-09-18), five exports and **no imports** — no `getrandom`
+  backend, no wasi shim, no COOP/COEP, which is what `dagpane-core`'s clocklessness buys once
+  there is a browser to spend it in. Against DuckDB-Wasm's 34.25 MB and DataFusion's 27 MiB,
+  the payload argument `ROADMAP.md` §4 calls false for a query engine is true for a thin
+  evaluator, and `BENCHMARKS.md` now has it measured rather than asserted.
 
   **No wasm-bindgen.** `cargo build --target wasm32-unknown-unknown --release` is the whole
   build: about forty lines of `extern "C"` over linear memory and about the same again of
@@ -444,6 +731,7 @@ anywhere and no number here supports it.
   renderer that throws takes out its own pane and nothing else. Scripts are read when the app is
   compiled, so `dagpane check` fails on a missing one and serving one is a map lookup rather
   than a file read a request steered. `examples/renderers/heatmap.js` is a working example.
+  `PaneKind` and `View` gain `Custom`: **Breaking** for an exhaustive `match` on either.
 
 - **Ordering constraints — a `sort`'s column is a question about order, not a dependency.** A
   top-N pane depends on the order its ranking column put the rows in and on the columns it
@@ -507,8 +795,9 @@ anywhere and no number here supports it.
 
   The table changed. Every cell was still visited — they all declare an edge to `metrics`
   and the engine cannot know better until it looks — and none ran. Moving `cpu0_user`, which
-  three cells filter on, recomputes three; moving `net_eth0_rx_bytes`, which one cell sums,
-  recomputes one and sends one pane.
+  three cells filter on and a fourth ranks by, can recompute only those four and the cells
+  below them; moving `net_eth0_rx_bytes`, which one cell sums, recomputes one and sends one
+  pane.
 
   What a cell read is recorded as it runs, once per pipeline step rather than once per cell
   of the table, and an input nothing was said about keeps the whole-value comparison — so the
@@ -518,6 +807,10 @@ anywhere and no number here supports it.
 
   The counts on `examples/sales.toml` are unchanged, which is the assertion that none of this
   altered what the runtime does on an app that is not wide enough to need it.
+
+  `Inputs` now carries the read log, a `RefCell`, so it is no longer `Send` or `Sync`:
+  **Breaking** for a compute that moves or shares `inputs` across threads (*Upgrading from
+  0.1.1*).
 
 - **`dagpane explain --change-column CELL.COLUMN`** — rewrite one column of one source frame
   and report what it cost, the way `--set` reports what turning a control costs. The edit is
@@ -673,87 +966,13 @@ anywhere and no number here supports it.
   `$`. The one that reads the slider is a cell of its own. That is the mechanic the new
   example app exists to show.
 
-- **`dagpane check` names a bad column reference before the app runs**, in every verb and not
-  just the new one. Sources are loaded by `compile`, so the schema at each step of each
-  pipeline is known before a session exists; the checker threads it through `filter`,
-  `derive`, `select`, `sort`, `group_by` and `scalar`, and reports the column that is missing,
-  the columns that are there *at that point*, and a Damerau-Levenshtein suggestion.
-
-  ```console
-  $ dagpane check app.toml
-  dagpane: app.toml: cell `net`, step `derive`: `net = amont * (1 - $discount)`:
-    no column `amont` — did you mean `amount`?; the table here has `order_id`, `day`,
-    `region`, `channel`, `units`, `amount`
-  ```
-
-  It is best-effort **by construction**: a cell whose `from` names a cell declared later in
-  the file has no knowable schema, and everything downstream of one is left to the run time
-  rather than guessed at. The run-time checks did not move, and they are the same code —
-  `Expr::bind` against a different scope. All sixteen example apps compile unchanged.
-
 - **`examples/apps/16-margins.toml`** — account margins, and the app `15-unit-economics`
   could not be. It is in `tools/verify.py`, which now gates seventeen manifests.
 
-### Changed
-
-- **The client's "fetches nothing" is now "fetches no third party",** and the server has a
-  fourth endpoint. A renderer script is code the page did not ship with, so `GET /<renderer>`
-  serves one from memory — the bytes were read when the app was compiled, so no request steers
-  an `open(2)` and a path this process does not already hold is a `404`. The route is absent
-  unless a manifest declares a renderer.
-
-  The old claim was absolute and is not any more, so it is restated rather than quietly
-  dropped: `the_client_is_one_self_contained_file` now enumerates **four** same-origin
-  requests — `GET /auth`, a configured provider's token endpoint, a declared renderer script,
-  and `./dagpane.js` in an exported bundle — and fails on a fifth. `compile_renderers` refuses
-  a renderer path that is absolute, climbs with `..`, or contains a `:`, so neither `import`
-  can name another origin; a renderer that fails to load takes out its own pane rather than
-  the page. **The air-gapped deployment still renders**, which is the property the original
-  rule was protecting. `ARCHITECTURE.md`, `OPERATIONS.md`, `crates/serve/README.md` and
-  ADR-0007 say it in those words.
-
-- **`dagpane export --wasm` says what the default is relative to.** With no flag it looks in
-  `target/wasm32-unknown-unknown/release/` **relative to the current directory**, which
-  resolves to a module only in a dagpane workspace that has just built one. The failure now
-  prints the absolute path it tried and names the three cases that need `--wasm` — an
-  installed binary, a shell below the workspace root, and a `CARGO_TARGET_DIR` pointing
-  elsewhere — instead of leaving a relative path on screen for the reader to resolve against
-  a working directory they cannot see from it.
-
-- **"There is no benchmark in this repository" is narrowed to the claim that is still true.**
-  `ROADMAP.md` §7 and `ARCHITECTURE.md` both said it in the present tense while
-  `BENCHMARKS.md` sat beside them holding a row sweep, payload sizes, a fleet comparison and
-  round-trip figures. What is actually still unmeasured is what §7 is about: apps-per-core,
-  memory under N viewers, and latency against another runtime under identical load. The rule
-  those documents were protecting survives with one word added — **no *general* performance
-  claim** — so a dated figure that names its app, its machine and its command is allowed, and
-  a sentence about how fast this runtime *is* remains blocked on §7.
-
-- **A cell with no steps is an alias of whatever it reads, including a control.** It was
-  documented as an alias and was one only for tables; a cell reading a slider produced a
-  `CellError` at run time. It now passes the value through, and a cell that has a *step* and
-  reads a control is a compile error naming both.
-
-- **`Frame::memory_size` is unchanged, but `ColumnData` gained `with_capacity` and `push`,**
-  replacing two private helpers in `transform.rs` that did the same thing. `push` promotes an
-  `Int` into a `Float` column — the one conversion an expression needs, because `if(c, 1, 2.5)`
-  is statically a float and evaluates to an int on the rows that take the first branch.
-
-- **A missing column at run time now suggests the nearest one too**, through the same function
-  the compile-time checker uses.
-
-- **A cell's steps are normalised before they are compiled.** `StepSpec` (the TOML shape)
-  becomes a `Step` — one verb, literals resolved, expressions parsed — and `compile_cell`
-  works on that. It is what lets a SQL cell lower to the *same* steps a pipeline does rather
-  than to a second kind of step that would need a second copy of every check below it.
-
-- **`Agg` and `How` print the word the manifest spells.** An error saying `Sum` or `Anti` was
-  telling an author about a word they did not type; both now `Display` in the `snake_case` the
-  TOML uses.
-
 - **An OIDC front door** — `crates/auth`, `--auth-jwks` and friends, and the PKCE flow in the
   bundled page. Without the flags nothing changes: the socket is open and the CLI warns about
-  a non-loopback bind, exactly as before.
+  a non-loopback bind, as before (the warning is reworded, and comes after the bind; see
+  *Upgrading from 0.1.1*).
 
   **This process never talks to the identity provider.** Keys come from a file the operator
   supplies, so there is no discovery request to fail at start-up, nothing to redirect, and an
@@ -891,7 +1110,9 @@ anywhere and no number here supports it.
   is exactly `file = { path, format = "csv" }`. Exactly one, checked by the same rule that
   checks a control's kind. A manifest naming `http` or `sql` against a binary built without
   that feature fails at compile time, naming the feature — not at the first refresh, and
-  never as a source that silently loads nothing.
+  never as a source that silently loads nothing. In Rust, `SourceSpec.csv` is an
+  `Option<PathBuf>` now, as `CellSpec.from` is an `Option<String>`, since a SQL cell has
+  none: **Breaking** for code that builds or reads either.
 
 - `App::sources` — the compiled app keeps the things that produced its rows, so it can read
   them again. Without it a compiled app is a photograph, and a refresh, a schedule and a
@@ -915,35 +1136,205 @@ anywhere and no number here supports it.
   socket.
 
 - `dagpane host <dir>` — every `*.toml` in a directory served from one process on one port,
-  routed by the `Host` header. `sales.toml` is the app `sales`, reachable at any name whose
-  first label is `sales`; a filename that is not a DNS label is skipped and reported at
-  start-up rather than taking the process down. Editing a manifest on disk changes its
-  digest, so the next request compiles the new one and the old graph is evicted — a redeploy
-  with no deploy step. `--budget-mb` and `--idle-minutes` are the eviction policy.
+  routed by the `Host` header. `sales.toml` is the app `sales`, reachable as exactly one label
+  in front of a declared domain: `sales.localhost` always, and `sales.example.com` for each
+  `--domain example.com`. Any other name — a bare `sales`, an address, `x.sales.localhost`,
+  `sales` in front of a domain nobody declared — gets `404` before anything is read, compiled
+  or evicted; *Fixed* below has why. `--domain` repeats, takes `*.example.com` and a trailing
+  dot as spellings of `example.com`, and refuses — at start-up, before anything is bound, with
+  the fix or the reason named — a URL, a port, a path, an address, a comma list, a single
+  label other than `localhost`, `internal` or `test`, a name ending in `.local` (multicast DNS,
+  which any machine on the network answers for), and anything else that is not a domain to
+  publish under. Declaring one trusts every name directly under it, so it must be a zone
+  whose DNS you control. Start-up prints which names reach an app, and warns on a wide bind
+  with no `--domain` and on a `--domain` that begins with an app's own name. A filename that
+  is not a DNS label is skipped and reported at start-up rather than taking the process down.
+  Editing a manifest on disk changes its digest, so the next request compiles the new one and
+  the old graph is evicted — a redeploy with no deploy step. `--budget-mb` and
+  `--idle-minutes` are the eviction policy.
 
 - `dagpane_serve::serve_host` / `serve_host_on` — the same, as a library.
 
   The `Origin` check **generalises** here rather than carrying over. With one app it is the
   address the process bound; with many on one port there is no single address to derive one
   from, and the port a browser saw is the proxy's, not this process's. So the rule becomes:
-  the `Origin` must name the `Host` the request is already asking for — the same "open it at
-  its own address", stated for a server that has more than one. Without it, a page one party
-  has open could open a neighbouring app's socket on the same port; that case does not exist
-  for a single-app server and is a test now. An unrouted name gets a `404` at `/` rather than
-  the client shell, which would otherwise be a page whose socket fails with nothing to read.
+  the `Origin` must be `http` or `https` and name the `Host` the request is already asking
+  for — the same "open it at its own address", stated for a server that has more than one.
+  Without it, a page one party has open could open a neighbouring app's socket on the same
+  port; that case does not exist for a single-app server and is a test now.
+
+  **Under `localhost` the port must agree too**, when `Host` carries one: the port `Origin`
+  names, or 80 or 443 by its scheme, must be `Host`'s. A browser resolves `sales.localhost` to
+  loopback whoever serves it, so any other local server — a dev server on `:3000`,
+  `python -m http.server` — serves pages at `sales.localhost:3000`, and those must not open
+  `sales.localhost:8787`'s socket. A `Host` with no port, as a proxy forwarding nginx's `$host`
+  sends, is compared by name alone, and a name under a `--domain` stays port-blind, for the
+  proxy reason above. All of this is CSRF defence and not the rebinding defence — a page whose
+  name is pointed at this machine sends that name as both headers — which is why the names
+  answered are the boundary. An unrouted name gets a `404` at `/` rather than the client shell,
+  which would otherwise be a page whose socket fails with nothing to read; a name outside every
+  declared domain is told `this server does not answer to that name`, and stderr says so once
+  per refused domain.
 
 - `OPERATIONS.md` and `docs/RUNBOOK.md` — how to run this in front of other people, and what
   to do when it is already broken. Every message quoted in either was produced by this
   binary rather than written from memory, and the two facts most likely to cost an operator
   an afternoon are stated with the evidence: the `/ws` `Origin` check refuses a reverse proxy
-  on a different hostname (`403`, page loads, controls dead), and `SIGTERM` is not handled —
-  `SIGINT` shuts down gracefully, and systemd and Kubernetes both send `SIGTERM` by default.
+  on a different hostname (`403`, page loads, controls dead), and 0.1.1 handles only `SIGINT`
+  while systemd and Kubernetes both send `SIGTERM` by default. 0.2.0 handles both; *Fixed*
+  below has it.
 
 - `examples/` — fifteen worked apps grouped by role, the data behind them, a Jupyter bridge
   and an object-storage refresh loop. `examples/tools/verify.py` asserts per app that an
   interaction both skips work and repaints something; it runs in the `claim` job.
 
 ### Changed
+
+- **`run`, `serve` and `host` print their addresses once they are bound, so a URL on screen
+  means its port is listening, and `--port 0` works.** Each printed its URL before it tried to
+  bind it: `run` its URL, `serve` its app and probe addresses, `host` its list of apps. With the
+  port taken, `run` printed its URL and then `Address already in use`, and a URL was no
+  evidence of anything. Now every address is printed after its listener is bound, from the
+  listener itself:
+  - a URL means its port is bound and listening;
+  - `--port 0` and `--admin-port 0` print the ports the kernel picked;
+  - a bind that fails is an error naming the address,
+    `127.0.0.1:8787: Address already in use (os error 98)`, where `run` used to leave the
+    address out.
+
+  The start-up lines are reordered to match: the settings first, then any warning, then the
+  addresses. Both warnings that name an address — a reachable address with no front door, and
+  `serve` on a wildcard with no `--origin` — name the address bound. A fixed port is bound
+  before a port 0, so with `--port 0` and a fixed `--admin-port` the kernel cannot hand the
+  probes' port to the app first, and `--port 0` with `--admin-port 0` is no longer refused as
+  two listeners on one port. **Breaking** for a script that took `run`'s URL from the second
+  line of its output, where 0.1.1 printed it: match `^dagpane: http://` instead.
+
+  The tests change with it. `crates/cli/tests/liveness.rs` runs each server on port 0 and reads
+  the port it printed, which replaces binding a port and letting it go, and the retry that came
+  with it. `crates/cli/tests/e2e.rs` requires no URL, and an error naming the address, when the
+  app's port or the probes' is taken, and that every address printed on port 0 answers: the
+  app's, and the probes' `/healthz`. Unit tests hold both warnings. Seventeen mutations,
+  thirteen caught. The four that survive are where a warning is printed and which address it
+  is handed, which a test could only reach by binding a wildcard address, and the bind order,
+  which depends on the port the kernel picks and was checked in a network namespace instead.
+  `docs/RUNBOOK.md` §2 is rewritten for the new behaviour.
+
+- **A verdict moved and four documents that totalled it up did not.** `POSITIONING.md` §3's score
+  line read *zero of four fully met* after condition 1's own verdict above it had been changed to
+  met, and so did every other place that totals it up — `ROADMAP.md`'s opening among them, and
+  one of them uses that score as half of a gate. The honest reading is **two of four fully met,
+  two partly**, and all four now say so with a note about what they said before. The same sweep found per-session memory still called unmeasured in four more places a
+  round after it was measured. `ROADMAP.md` §7 had already written the lesson down and it was
+  learned again anyway, in files that were open at the time; the habit that catches it is one
+  line — when a measurement lands or a verdict moves, grep the tree for the word that used to be
+  true.
+
+- **What one more viewer costs, measured — and it narrows a claim this project makes in nine
+  places.** `benches/sessions/`, `ROADMAP.md` §7's first item, and the last of its four to be
+  answered.
+
+  The rig ramps *idle* sessions 0 → 512 against one `dagpane run`, reads `smaps_rollup` rather
+  than `ps`, and takes the least-squares slope rather than a subtraction between two rungs —
+  RSS grows in allocator steps and does not come back down. The bundled example: **179 kB per
+  session**.
+
+  **The comparison is the result, not that number.** The same pipeline over 200 000 rows costs
+  **7 248 kB** a session; an *aggregating* pipeline over the same 200 000 rows costs **145 kB**.
+  Same data, same process, same sockets — 50× apart. So a session costs what its pipeline
+  **materialises**, not what its app **sources**.
+
+  Both halves of that matter. **The sources really are shared**, and the 145 kB is the first
+  measurement that says so — §7 had singled out `Arc::ptr_eq` as *"asserted by a test rather
+  than inferred from an RSS reading"*, and this is the reading. **The computed frames are not
+  shared**, and cannot be: two viewers with two filters must have two answers. That was never
+  wrong, and it was never priced.
+
+  So *"a hundred viewers of a 600-row app are a hundred slot vectors over one table, not a
+  hundred copies of it"* — true, and read as a statement about the total, which it is not. Even
+  on the bundled example a session costs **8.5× the CSV it is sharing**. The sentence has been
+  narrowed everywhere it appears to say what is shared rather than to imply what is not.
+
+  The operational consequence is in `OPERATIONS.md` under *Sizing*: **`--budget-mb` counts
+  source bytes and none of this is in it**, so a fleet of row-keeping apps with many viewers is
+  sized against the smaller of its two costs.
+
+- **`dagpane check` names a bad column reference before the app runs**, in every verb and not
+  just the new one. Sources are loaded by `compile`, so the schema at each step of each
+  pipeline is known before a session exists; the checker threads it through `filter`,
+  `derive`, `select`, `sort`, `group_by` and `scalar`, and reports the column that is missing,
+  the columns that are there *at that point*, and a Damerau-Levenshtein suggestion.
+
+  ```console
+  $ dagpane check app.toml
+  dagpane: app.toml: cell `net`, step `derive`: `net = amont * (1 - $discount)`:
+    no column `amont` — did you mean `amount`?; the table here has `order_id`, `day`,
+    `region`, `channel`, `units`, `amount`
+  ```
+
+  It is best-effort **by construction**: a cell whose `from` names a cell declared later in
+  the file has no knowable schema, and everything downstream of one is left to the run time
+  rather than guessed at. The run-time checks did not move, and they are the same code —
+  `Expr::bind` against a different scope. All sixteen example apps compile unchanged.
+  **Breaking** for a manifest with such a reference, which 0.1.1 compiled and which failed
+  only at run time.
+
+- **The client's "fetches nothing" is now "fetches no third party",** and the server has a
+  fourth endpoint. A renderer script is code the page did not ship with, so `GET /<renderer>`
+  serves one from memory — the bytes were read when the app was compiled, so no request steers
+  an `open(2)` and a path this process does not already hold is a `404`. The route is absent
+  unless a manifest declares a renderer.
+
+  The old claim was absolute and is not any more, so it is restated rather than quietly
+  dropped: `the_client_is_one_self_contained_file` now enumerates **four** same-origin
+  requests — `GET /auth`, a configured provider's token endpoint, a declared renderer script,
+  and `./dagpane.js` in an exported bundle — and fails on a fifth. `compile_renderers` refuses
+  a renderer path that is absolute, climbs with `..`, or contains a `:`, so neither `import`
+  can name another origin; a renderer that fails to load takes out its own pane rather than
+  the page. **The air-gapped deployment still renders**, which is the property the original
+  rule was protecting. `ARCHITECTURE.md`, `OPERATIONS.md`, `crates/serve/README.md` and
+  ADR-0007 say it in those words.
+
+- **`dagpane export --wasm` says what the default is relative to.** With no flag it looks in
+  `target/wasm32-unknown-unknown/release/` **relative to the current directory**, which
+  resolves to a module only in a dagpane workspace that has just built one. The failure now
+  prints the absolute path it tried and names the three cases that need `--wasm` — an
+  installed binary, a shell below the workspace root, and a `CARGO_TARGET_DIR` pointing
+  elsewhere — instead of leaving a relative path on screen for the reader to resolve against
+  a working directory they cannot see from it.
+
+- **"There is no benchmark in this repository" is narrowed to the claim that is still true.**
+  `ROADMAP.md` §7 and `ARCHITECTURE.md` both said it in the present tense while
+  `BENCHMARKS.md` sat beside them holding a row sweep, payload sizes, a fleet comparison and
+  round-trip figures. What is actually still unmeasured is what §7 is about: apps-per-core,
+  memory under N viewers, and latency against another runtime under identical load. The rule
+  those documents were protecting survives with one word added — **no *general* performance
+  claim** — so a dated figure that names its app, its machine and its command is allowed, and
+  a sentence about how fast this runtime *is* remains blocked on §7.
+
+- **A cell with no steps is an alias of whatever it reads, including a control.** It was
+  documented as an alias and was one only for tables; a cell reading a slider produced a
+  `CellError` at run time. It now passes the value through, and a cell that has a *step* and
+  reads something that is not a table — a control, or a cell ending in `count` or `scalar` —
+  is a compile error naming both. **Breaking** for a manifest with such a cell, which 0.1.1
+  compiled.
+
+- **`ColumnData` gained `with_capacity` and `push`,** replacing two private helpers in
+  `transform.rs` that did the same thing. `push` promotes an `Int` into a `Float` column — the
+  one conversion an expression needs, because `if(c, 1, 2.5)` is statically a float and
+  evaluates to an int on the rows that take the first branch.
+
+- **A missing column at run time now suggests the nearest one too**, through the same function
+  the compile-time checker uses.
+
+- **A cell's steps are normalised before they are compiled.** `StepSpec` (the TOML shape)
+  becomes a `Step` — one verb, literals resolved, expressions parsed — and `compile_cell`
+  works on that. It is what lets a SQL cell lower to the *same* steps a pipeline does rather
+  than to a second kind of step that would need a second copy of every check below it.
+
+- **`Agg` and `How` print the word the manifest spells.** An error saying `Sum` or `Anti` was
+  telling an author about a word they did not type; both now `Display` in the `snake_case` the
+  TOML uses.
 
 - **"No HTTP client anywhere" is now "one crate, optional, off by default".** The old rule
   was worth what it cost — a data-app runtime that can phone home is not one anybody
@@ -952,8 +1343,8 @@ anywhere and no number here supports it.
   `connect`'s `default` feature list is empty. CI checks those three and then checks the one
   that actually holds — that `cargo tree` on a default `dagpane-cli` resolves neither. A
   manifest rule can be satisfied while another crate's default feature turns the client on;
-  the resolution cannot. `cargo install dagpane` still links no HTTP stack and no database
-  driver.
+  the resolution cannot. `cargo install --path crates/cli` still links no HTTP client and no
+  database driver.
 
 - `dagpane_app::csv` moved to `dagpane-connect` and is re-exported from its old path, so
   `dagpane_app::csv::parse` still resolves.
@@ -965,9 +1356,116 @@ anywhere and no number here supports it.
   be handed. `Table` answers exactly (buffer capacity plus the heap behind every string),
   Arrow answers with `get_array_memory_size`, so a dictionary-encoded column reports its
   dictionary once rather than once per row. **Breaking** for anything outside this repository
-  implementing `Frame`.
+  implementing `Frame`, and for a caller of `ArrowFrame::memory_size`, which now needs the
+  trait in scope.
 
 ### Fixed
+
+Several of these fix something no release had. `host`, the heartbeat, custom panes and their
+renderers, `OPERATIONS.md` and the ADRs from 0005 on are all new in 0.2.0, so a bug in any of
+them lived only on `main` between 0.1.1 and this release, and nobody on 0.1.1 met it.
+
+- **A stop closes every socket with `1001` and waits for it, instead of dropping it.** The
+  drain's last step, "stop accepting and let what is in flight finish", was true of requests
+  and only half true of sockets: `axum`'s graceful shutdown stops tracking a connection the
+  moment it upgrades, so `axum::serve` returned with every viewer still connected and the
+  runtime was dropped under them — a pass in flight finished, but the socket then went with no
+  close frame, so a browser was told `1006` and backed off as from a failure. Now each socket
+  is closed between passes with `1001`, *going away* (`GOING_AWAY`), after the drain and never
+  during it: a viewer is served through the drain, a pass already running is answered before
+  the close, and a message not yet read is dropped with it (the page carries the viewer's
+  values to its next connection). Everything after the listener closes — the requests `axum`
+  is finishing, then the sockets — is held to `CLOSE_GRACE` (2 s), because a client that sent
+  half a request, or stopped reading, could otherwise hold the stop until a supervisor's
+  `SIGKILL` took every other close with it; and the binary then lets its runtime go rather
+  than wait on a pass still running, which is abandoned and its viewer reconnects. A pass
+  already running when the stop is signalled can still delay the stop by what it has left: it
+  holds its thread, and while it does the runtime may not see the signal or a timer. The page answers `1001` by going back inside half a second
+  without advancing its backoff. Measured against a real `SIGTERM` with `--drain-seconds 3`:
+  `close=1006` at 3.005 s before, `close=1001` at 3.005 s after, exit `0` both times. Held by
+  `tests/replica.rs` and `tests/fleet.rs` (served through the drain, then `1001`; a half-sent
+  request cannot hold the stop), `tests/deadline.rs` (a viewer stuck in a write cannot hold
+  it, under `serve` and `host`), `crates/cli/tests/liveness.rs` (a real `SIGTERM` under
+  `run`, `serve` and `host`, and a stuck viewer under `run`) and `tests/reconnect.mjs` (a
+  browser is told `1001`, says the server is stopping, and comes back). Under `run`, which
+  has no drain, the change is the close and a wait for it — a round trip, normally, and never
+  more than 2 s.
+
+- **The image is asked a browser's question now, and the docs no longer hand out a 0.1.1
+  container path whose controls are dead.** CI asked a built image `--version` and `check`,
+  and neither is a browser, so nothing caught that the documented
+  `docker run … mancube/dagpane:0.1.1 run /app/your-app.toml --host 0.0.0.0` served a page
+  whose socket refused every browser: a wildcard-bound `run` allows only
+  `http(s)://0.0.0.0:<port>`, an origin no browser sends. One step, the same in the image job
+  of `.github/workflows/ci.yml` on every CI run and of `.github/workflows/docker.yml` before every publish, against the
+  image about to be pushed — nothing is pushed until it passes — starts the image as
+  `serve /app/sales.toml --origin http://localhost:8787 --drain-seconds 1`, waits for
+  `/readyz`, and requires `101` from `http://localhost:8787`, `403` from `https://evil.example`
+  and from the bound `http://0.0.0.0:8787`, and then that the container exits `0` within 4 s
+  of `docker stop` — which, as PID 1, it does only by handling `SIGTERM`.
+  `crates/cli/tests/e2e.rs` holds the rule through the binary: under
+  `--origin https://dash.example` that origin gets `101`, any other and the bound address
+  `403`, and no `Origin` `101`. **0.1.1 has no `serve`**, so `README.md`, `docs/DOCKERHUB.md`
+  and `examples/bucket/README.md` stop offering its `run --host 0.0.0.0` as a way to serve a
+  browser, `OPERATIONS.md`'s container example stops running a `serve` that 0.1.1 does not
+  have, and `OPERATIONS.md` and `docs/RUNBOOK.md` stop saying there is no flag to fix it:
+  serving from a container means `mancube/dagpane:0.2.0` and `serve … --origin` with the URL
+  the browser opens — `http://localhost:8787` for a port published on the same machine.
+  `docs/RUNBOOK.md` §10 stops saying `SIGTERM` is not handled, which the same step now proves
+  false of 0.2.0, and names 0.1.1 as the build it is true of; `examples/bucket/serve.sh`, the
+  notebook quickstart and its `Panel.serve` stop saying there is no authentication, and say
+  what a wildcard bind costs under `run`; the quickstart stops pulling 0.1.1 to serve; and
+  `COMPETITORS.md` stops crediting 0.1.1 with the optional front door, which arrives in 0.2.0.
+
+- **`dagpane host` answered any name whose first label was an app's, so a page whose name
+  rebinds to the machine could read every pane.** Builds of `main` since `dagpane host` landed
+  routed any name whose first label was `sales` — `sales.<anything>`, a bare `sales` — to
+  `sales.toml`, and an address by its first number, `127.0.0.1` to `127.toml`; the socket's
+  `Origin` check asked only that `Origin` name the same host as `Host`. A page at
+  `http://sales.attacker.example:8787` whose owner then points that name at `127.0.0.1` sends
+  its own name as both, so it passed the check and read every pane; `GET /` for that name
+  compiled the app as well, and could evict others to fit it. Only `<app>.localhost` and
+  `<app>.<a --domain>` are answered now — exactly one label in front of a declared domain,
+  compared exactly and never as a suffix — and any other name gets `404` before anything is
+  read, compiled or evicted. As a library: `DirAppSource::new` answers `<app>.localhost` alone
+  and `with_domains` adds a `dagpane_host::Domain` per domain, checked by `Domain::parse`; a
+  refused name is the new `HostError::OutsideDomains`; a provided `AppSource::domains`,
+  none by default, lets the refusal log say that `x.team.example.com` is one label too deep
+  under a declared `example.com`, rather than under no domain that is answered; and the
+  contract on `AppSource::resolve` now binds every source to answer only names its operator
+  declared.
+  Under `localhost` the socket's `Origin` must agree with `Host` on the port too, when `Host`
+  carries one, because any other local server can serve a page at `sales.localhost:3000`, and
+  until now such a page could open `sales.localhost:8787`'s socket; both holes were reproduced
+  against the built binary. **No release has them**: `dagpane host` first ships in 0.2.0, with
+  this fix, so only a build of `main` from before the fix has them. `SECURITY.md`,
+  *`dagpane host` and DNS rebinding*, has the rule and what it still does not cover, and
+  ADR-0012 the decision. Tests: every name, in `crates/host/src/source.rs`; the rebinding
+  shape, a proxy that moves the port and the `localhost` port rule, in
+  `crates/serve/tests/multi_app.rs`; and the names and the once-per-domain stderr line through
+  the binary, in `crates/cli/tests/e2e.rs`.
+
+- **A heartbeat too long to schedule, or of zero, no longer panics every connection.** A
+  `--heartbeat-seconds` of about 2^63 or more, or an `Options::heartbeat` of `Duration::MAX` —
+  a natural way to say never — overflowed the clock when the first ping was scheduled. Every
+  connection died the moment its opening frame went out, and its page reconnected into the same
+  panic. `serve`, `host` and `run` all take the flag. The interval is
+  capped at a hundred years, which is never in practice. An `Options::heartbeat` of
+  `Duration::ZERO` died the same way, because the timer refused a zero period; zero now sends no
+  pings, as `--heartbeat-seconds 0` always has. `crates/serve/tests/heartbeat.rs` holds both.
+
+- **A CSV source's dictionary columns were billed for Arrow's default capacity.** The streaming
+  builder chose a dictionary from the reader's counts and then built it with
+  `StringDictionaryBuilder::new()`, which starts at 1 024 keys and grows by doubling — and
+  `memory_size`, which `--budget-mb` is summed from, counts a buffer's capacity rather than its
+  length. It is now sized from the same counts: one key a row, and the dictionary at its distinct
+  count. The bundled example's source goes from 43 140 bytes to **23 252**, nearly half of it
+  slack; the 200 000-row fixture in `benches/sessions/` from 7 962 180 to **7 201 652**, within
+  about a kilobyte of what a viewer of its row-keeping pipeline holds — so *about its source
+  again per viewer* is now what the accounting says as well as what the kernel did. Found by the
+  session ledger: a host test printed a 456 652-byte source for 400 000 bytes of data. A plain
+  text column still reserves on Arrow's twelve-bytes-a-value rule of thumb, because the reader's
+  counts carry no text lengths, and the builder now says so where it does it.
 
 - **`ROADMAP.md` §7 and `POSITIONING.md` described measured work as unbuilt.** §7 was titled
   *"the concurrency numbers that do not exist"* and its body said *"nothing here measures what
@@ -976,7 +1474,7 @@ anywhere and no number here supports it.
   p99 under load. `POSITIONING.md` graded the same condition *"not met"* on the grounds that
   *"no apps-per-core number has been measured. No p99 has been measured. No memory figure has
   been measured"*, and asserted that *"the multiplexing story does not exist"* — which had been
-  false since `crates/host` shipped.
+  false since `crates/host` landed on `main`.
 
   All four of §7's boxes are ticked, with what each one actually measured beside it, and a new
   list of what is genuinely still open underneath. §7 keeps both of its wrong headers on the
@@ -984,8 +1482,8 @@ anywhere and no number here supports it.
   is done when the file claiming it is undone is edited.
 
 - **`--idle-minutes` configured a sweep that never ran.** `Host::sweep_idle` has existed since
-  the day `crates/host` did and was called only by that crate's own tests, so in the shipped
-  binary an app left residency on a redeploy or under budget pressure and **never for being
+  the day `crates/host` did and was called only by that crate's own tests, so on `main` before
+  this fix an app left residency on a redeploy or under budget pressure and **never for being
   idle** — whatever the flag said. `OPERATIONS.md` and `ROADMAP.md` §1 both listed it as a known
   gap. `dagpane_serve::sweep_idle` is the caller; it lives in the crate that owns a clock,
   because the one that owns the map deliberately does not. It runs at half the idle window, so
@@ -997,13 +1495,13 @@ anywhere and no number here supports it.
   honest while nothing was sweeping.
 
 - **Evictions were recorded and never printed.** The log is in memory and bounded and nothing in
-  the shipped binary read it, so an app leaving residency was invisible from outside except as a
+  the binary read it, so an app leaving residency was invisible from outside except as a
   slower next request. The sweep prints one line per eviction, naming the key, the reason and the
   bytes freed.
 
 - **`OPERATIONS.md` promised a reconnect that did not exist.** *"A restart drops every open
-  page. Viewers reconnect automatically and get a fresh first render"* has been in the
-  **Refreshing the data** section for three releases, and it was false: `client.html` answered
+  page. Viewers reconnect automatically and get a fresh first render"* was in the
+  **Refreshing the data** section from the start, and it was false: `client.html` answered
   a closed socket with a banner reading "Disconnected" and stopped. Every documented data
   refresh was therefore a reload on every open dashboard. The sentence is now true rather than
   edited.
@@ -1015,8 +1513,9 @@ anywhere and no number here supports it.
   for a client that keeps a socket across losing its own state; a page is not one.
 
 - **ADR-0009 claimed a rolling update was invisible to viewers.** Half true as written: the
-  drain closed sockets cleanly and the page's answer to a clean close was that banner, so
-  "their next connection" meant a reload the viewer had to think of. The ADR now carries the
+  drain closed sockets — with no close frame, it later turned out — and the page's answer to a
+  closed socket was that banner, so "their next connection" meant a reload the viewer had to
+  think of. The ADR now carries the
   correction beside the claim rather than a quiet edit.
 
 - **`SIGTERM` is handled, in every mode.** It was not, and what that meant depended on the
@@ -1027,7 +1526,9 @@ anywhere and no number here supports it.
   systemd and Kubernetes both send `SIGTERM` by default, that was the ordinary path and not an
   edge case. Measured now: `SIGTERM` to `dagpane run`, exit `0` in 3 ms. The
   `KillSignal=SIGINT` and `STOPSIGNAL SIGINT` workarounds `OPERATIONS.md` recommended are no
-  longer needed, and are harmless if you have them.
+  longer needed, and are harmless if you have them. **Breaking** for a program that embeds
+  `dagpane_serve::serve` or `serve_on`, whose future now returns `Ok(())` on `SIGTERM`;
+  *Upgrading from 0.1.1* has the rest of what changed under them.
 
 - **`examples/renderers/heatmap.js` printed `Infinity – -Infinity`** as its legend when a
   frame arrived empty or with a value column that was all nulls, because `min`/`max` were

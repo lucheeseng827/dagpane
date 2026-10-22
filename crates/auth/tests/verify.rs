@@ -233,6 +233,40 @@ fn a_token_with_no_expiry_is_refused() {
 }
 
 #[test]
+fn a_viewer_says_when_their_token_stops_being_one_by_admission_s_own_arithmetic() {
+    // A connection is admitted once and can outlive its token; `expired` is how a server asks
+    // afterwards. It has to agree with admission to the second, or a server closes a viewer's
+    // connection and sends them to sign in when reconnecting would have let them straight in.
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let idp = Idp::new("k1");
+    let jwks = Jwks::parse(&idp.jwks()).unwrap();
+    let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+
+    let exp = now() + 300;
+    let mut fresh = claims();
+    fresh["exp"] = serde_json::json!(exp);
+    let viewer = apps().admit(&jwks, &idp.sign(fresh), "sales").unwrap();
+    assert!(!viewer.expired(SystemTime::now()));
+    // `exp` itself and the policy's five seconds after it are still admitted — admission
+    // refuses only an `exp` earlier than now less the leeway, in whole seconds...
+    assert!(!viewer.expired(at(exp)));
+    assert!(!viewer.expired(at(exp + 5) + Duration::from_millis(999)));
+    // ...and the first second past them is not.
+    assert!(viewer.expired(at(exp + 6)));
+
+    // The leeway is the policy's, here as at the door: a token thirty seconds stale, let in by
+    // a two-minute leeway, has not expired until that leeway has run out too.
+    let stale = now() - 30;
+    let mut late = claims();
+    late["exp"] = serde_json::json!(stale);
+    let mut generous = apps();
+    generous.leeway_seconds = 120;
+    let viewer = generous.admit(&jwks, &idp.sign(late), "sales").unwrap();
+    assert!(!viewer.expired(SystemTime::now()));
+    assert!(viewer.expired(at(stale + 121)));
+}
+
+#[test]
 fn a_token_for_another_service_or_another_issuer_is_refused() {
     let idp = Idp::new("k1");
     let jwks = Jwks::parse(&idp.jwks()).unwrap();

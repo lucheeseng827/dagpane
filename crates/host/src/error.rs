@@ -18,6 +18,15 @@ pub enum HostError {
     /// survived normalisation somewhere upstream.
     UnknownHost(String),
 
+    /// The header is not one label under any domain this source answers for: another domain,
+    /// a bare label, an address. Refused before anything is read, compiled or evicted.
+    ///
+    /// Distinct from [`HostError::UnknownHost`] because the fix is different. An unknown name
+    /// under a declared domain is a missing manifest; a name outside every declared domain is
+    /// either an attack — a page whose DNS was pointed at this machine, sending its own name —
+    /// or a domain the operator forgot to declare, and only the operator can tell which.
+    OutsideDomains(String),
+
     /// The source resolved this key and then had nothing to fetch for it. A registry that
     /// answers two questions inconsistently, most often because a deploy landed between them.
     NotFound(AppKey),
@@ -63,6 +72,10 @@ impl fmt::Display for HostError {
             HostError::UnknownHost(host) => {
                 write!(f, "no app is routed at {host:?}")
             }
+            HostError::OutsideDomains(host) => write!(
+                f,
+                "{host:?} is not one label under a domain this source answers for"
+            ),
             HostError::NotFound(key) => {
                 write!(f, "{key} resolved, but the source has no manifest for it")
             }

@@ -95,6 +95,10 @@ set min_amount = 400
   patch: 3 of 7 panes — revenue, order_count, region_totals
 
 $ dagpane run examples/sales.toml
+dagpane: Sales explorer — 11 cells, 7 panes
+dagpane: heartbeat 25s — keep the idle timeout in front of this above that
+dagpane: writes    30s per frame beyond what a 128 kbit/s link needs — a client that stops reading, or falls that far behind, is dropped
+dagpane: answers   30s per ping beyond what a 128 kbit/s link needs — a client that stops reading, or goes, is dropped
 dagpane: http://127.0.0.1:8787
 ```
 
@@ -130,6 +134,15 @@ output says so. A column that is entirely null is an error rather than a mislead
 
 `--json` emits the same figures for a CI gate to assert on; this repository's own CI does
 exactly that and fails the build when they move.
+
+`tests/e2e.rs` runs the commands as a user does and asserts on what they print: the one-shot
+commands' text quoted here; no URL from a serving command that could not bind its port; and,
+from one that could, an answer at every address it printed.
+`tests/liveness.rs` starts `run`, `serve` and `host` for real and checks, over real sockets, that
+`--heartbeat-seconds`, `--write-timeout-seconds` and `--ping-timeout-seconds` each reach the
+server at the number given. What each setting does once it is there is `dagpane-serve`'s to
+test. Its three tests take about six seconds when they can run at once, on three cores or more,
+and about three times that on one.
 
 ```sh
 cargo test -p dagpane-cli

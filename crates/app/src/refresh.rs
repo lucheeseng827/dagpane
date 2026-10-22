@@ -35,7 +35,7 @@ use dagpane_connect::{SourceError, Version};
 use dagpane_core::frame::FrameBuilder;
 use dagpane_core::{Session, Trace, Value};
 
-use crate::App;
+use crate::{App, BoundSource};
 
 /// What happened to one source in one refresh.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,35 +133,93 @@ pub enum RefreshOutcome {
     Force,
 }
 
-/// Re-read `app`'s sources into `session` and run the pass.
+/// What re-reading some of an app's sources found, before it has reached any session.
 ///
-/// `previous` is what each source's version was last time — [`Refresh::versions`] from the
-/// last call, or the app's own [`crate::BoundSource::loaded_version`] on the first. Passing
-/// it in rather than storing it here is what keeps an `App` immutable and shared: two
-/// sessions over one app can refresh independently, and neither can corrupt the other's idea
-/// of what it has seen.
+/// Reading and applying are separate because a server has many sessions and one set of
+/// sources. The rows are read **once**, here, and then either staged on the one session a
+/// command-line [`refresh`] has, or turned by [`App::with_sources`] into the graph every live
+/// session moves onto — which is where a new table is weighed, once, rather than per viewer.
+#[derive(Clone, Debug)]
+pub struct Reading {
+    /// One entry per source that was asked about, in the manifest's order.
+    pub sources: Vec<(String, SourceRefresh)>,
+    /// The rows that came back, by source cell, for every source that [`reloaded`].
+    ///
+    /// [`reloaded`]: SourceRefresh::reloaded
+    pub values: Vec<(String, Value)>,
+    /// The version each source that was asked about now holds, for the next read to compare
+    /// against. A source that **failed** keeps the version it had — see [`Refresh::versions`].
+    pub versions: BTreeMap<String, Version>,
+}
+
+impl Reading {
+    /// Sources that could not be read, or were refused once read.
+    pub fn failed(&self) -> impl Iterator<Item = (&str, &SourceError)> {
+        self.sources
+            .iter()
+            .filter_map(|(name, outcome)| match outcome {
+                SourceRefresh::Failed { error } => Some((name.as_str(), error)),
+                _ => None,
+            })
+    }
+}
+
+/// Re-read the sources of `app` that `due` picks, without applying anything.
 ///
-/// # Errors
+/// `previous` is what each source's version was last time, as [`refresh`] takes it. A source
+/// whose version has not moved is not read; one that has is loaded through `builder` and
+/// checked against the data the app holds now.
 ///
-/// Never. A source that cannot be read is recorded in the result and the others are still
-/// applied — a dashboard with four sources should not go blank because one API is down, and
-/// the pane whose data did not arrive keeps the value it had, which is the honest thing to
-/// show and what a freshness label is for.
-pub fn refresh(
+/// **A refresh changes rows, never the shape the app was checked against.** New rows whose
+/// columns differ from the ones the app holds — a column gone, renamed, reordered, or read
+/// as another type — are refused and reported as a failure, and the app keeps the rows it
+/// had. Every cell was type-checked against those columns when the manifest compiled, and
+/// `dagpane check` in front of a deploy is the gate that a change of shape is supposed to go
+/// through; a refresh that applied it would hand every cell a table it was never checked
+/// against, and the first viewer to find out would be looking at a broken pane.
+pub fn read(
     app: &App,
-    session: &mut Session,
     previous: &BTreeMap<String, Version>,
     outcome: RefreshOutcome,
+    due: impl Fn(&BoundSource) -> bool,
     builder: impl Fn() -> Box<dyn FrameBuilder>,
-) -> Refresh {
-    let mut sources = Vec::with_capacity(app.sources.len());
+) -> Reading {
+    let mut sources = Vec::new();
+    let mut values = Vec::new();
     let mut versions = BTreeMap::new();
 
-    for bound in &app.sources {
+    for bound in app.sources.iter().filter(|b| due(b)) {
         let was = previous
             .get(&bound.cell)
             .copied()
             .unwrap_or(bound.loaded_version);
+        // A source that fails keeps the version it had, so the next read tries again.
+        let fail = |sources: &mut Vec<(String, SourceRefresh)>,
+                    versions: &mut BTreeMap<String, Version>,
+                    error: SourceError| {
+            versions.insert(bound.cell.clone(), was);
+            sources.push((bound.cell.clone(), SourceRefresh::Failed { error }));
+        };
+
+        // The cell this source fills, and the rows it holds now. Only a hand-built `App` can
+        // name a cell its graph does not have as a source, so that is reported rather than
+        // ignored — dropping it silently would mean a source that never refreshes and no way
+        // to find out.
+        let Some(held) = app
+            .graph
+            .id(&bound.cell)
+            .and_then(|id| app.graph.initial(id))
+        else {
+            fail(
+                &mut sources,
+                &mut versions,
+                SourceError::Misconfigured {
+                    source: bound.source.describe(),
+                    reason: format!("this app has no source cell named {:?}", bound.cell),
+                },
+            );
+            continue;
+        };
 
         let now = match outcome {
             RefreshOutcome::Force => None,
@@ -175,11 +233,10 @@ pub fn refresh(
                     continue;
                 }
                 Ok(now) => Some(now),
+                // The version could not be read, so the source keeps the one it had and the
+                // next refresh asks again.
                 Err(error) => {
-                    // The version could not be read, so the source keeps the one it had and
-                    // the next refresh asks again.
-                    versions.insert(bound.cell.clone(), was);
-                    sources.push((bound.cell.clone(), SourceRefresh::Failed { error }));
+                    fail(&mut sources, &mut versions, error);
                     continue;
                 }
             },
@@ -188,11 +245,34 @@ pub fn refresh(
         let frame = match bound.source.load(builder()) {
             Ok(frame) => frame,
             Err(error) => {
-                versions.insert(bound.cell.clone(), was);
-                sources.push((bound.cell.clone(), SourceRefresh::Failed { error }));
+                fail(&mut sources, &mut versions, error);
                 continue;
             }
         };
+
+        // Compared against the frame the app holds rather than against the manifest: the two
+        // agree — the app was compiled from that frame, and every refresh since was refused
+        // unless it agreed too — and the frame is what a cell will actually be handed.
+        if let Some(had) = held.value().and_then(Value::as_frame) {
+            let (before, after) = (had.schema(), frame.schema());
+            if before != after {
+                fail(
+                    &mut sources,
+                    &mut versions,
+                    SourceError::Unreadable {
+                        source: bound.source.describe(),
+                        reason: format!(
+                            "its columns changed from {} to {}; this app was checked against the \
+                         first, and a refresh changes rows, never their shape — redeploy to \
+                         change it",
+                            describe_columns(&before),
+                            describe_columns(&after)
+                        ),
+                    },
+                );
+                continue;
+            }
+        }
         let rows = frame.rows();
 
         // Read AFTER the load under `Force`, for the reason `compile` states: a version read
@@ -209,29 +289,79 @@ pub fn refresh(
             },
         };
 
-        if session.set(&bound.cell, Value::frame(frame)).is_err() {
-            // The cell is not in the graph. Only reachable for a hand-built `App` whose
-            // `sources` names something its graph does not, so it is reported rather than
-            // ignored — silently dropping it would mean a source that never refreshes and
-            // no way to find out.
-            sources.push((
-                bound.cell.clone(),
-                SourceRefresh::Failed {
-                    error: SourceError::Misconfigured {
-                        source: bound.source.describe(),
-                        reason: format!("this app has no source cell named {:?}", bound.cell),
-                    },
-                },
-            ));
-            versions.insert(bound.cell.clone(), was);
-            continue;
-        }
-
         versions.insert(bound.cell.clone(), now);
         sources.push((
             bound.cell.clone(),
             SourceRefresh::Reloaded { was, now, rows },
         ));
+        values.push((bound.cell.clone(), Value::frame(frame)));
+    }
+
+    Reading {
+        sources,
+        values,
+        versions,
+    }
+}
+
+/// `region: text, amount: float`, for a refusal a person has to read.
+fn describe_columns(columns: &[(String, dagpane_core::ColumnType)]) -> String {
+    let parts: Vec<String> = columns
+        .iter()
+        .map(|(name, ty)| format!("{name}: {ty}"))
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
+/// Re-read `app`'s sources into `session` and run the pass.
+///
+/// `previous` is what each source's version was last time — [`Refresh::versions`] from the
+/// last call, or the app's own [`crate::BoundSource::loaded_version`] on the first. Passing
+/// it in rather than storing it here is what keeps an `App` immutable and shared: two
+/// sessions over one app can refresh independently, and neither can corrupt the other's idea
+/// of what it has seen.
+///
+/// The one-session form of [`read`]: every source is asked, and the rows that came back are
+/// staged on `session` and committed together. A server with many sessions reads once and
+/// moves them all onto [`App::with_sources`] instead.
+///
+/// # Errors
+///
+/// Never. A source that cannot be read is recorded in the result and the others are still
+/// applied — a dashboard with four sources should not go blank because one API is down, and
+/// the pane whose data did not arrive keeps the value it had, which is the honest thing to
+/// show and what a freshness label is for.
+pub fn refresh(
+    app: &App,
+    session: &mut Session,
+    previous: &BTreeMap<String, Version>,
+    outcome: RefreshOutcome,
+    builder: impl Fn() -> Box<dyn FrameBuilder>,
+) -> Refresh {
+    let Reading {
+        mut sources,
+        values,
+        mut versions,
+    } = read(app, previous, outcome, |_| true, builder);
+
+    for (cell, value) in values {
+        if let Err(e) = session.set(&cell, value) {
+            // `read` checked the cell is one of the app's sources, so this is a session over
+            // some other graph than the app's. Reported for the same reason as above.
+            let Some(entry) = sources.iter_mut().find(|(name, _)| *name == cell) else {
+                continue;
+            };
+            let SourceRefresh::Reloaded { was, .. } = entry.1 else {
+                continue;
+            };
+            versions.insert(cell.clone(), was);
+            entry.1 = SourceRefresh::Failed {
+                error: SourceError::Misconfigured {
+                    source: cell.clone(),
+                    reason: e.to_string(),
+                },
+            };
+        }
     }
 
     Refresh {

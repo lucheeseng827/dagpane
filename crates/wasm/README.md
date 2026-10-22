@@ -71,13 +71,13 @@ CLI whose version has to match it.
 
 | | raw | gzipped |
 |---|---:|---:|
-| `dagpane-wasm` — engine, nine verbs, expression language, manifest compiler, CSV reader | **1.10 MiB** | **318 KiB** |
+| `dagpane-wasm` 0.2.0 — engine, nine verbs, expression language, manifest compiler, CSV reader | **1.32 MiB** | **365 KiB** |
 | DataFusion 54.1 | 27 MiB | 5.9 MiB |
 | DuckDB-Wasm `1.33.1-dev57.0` | 34.25 MB | — |
 
-`BENCHMARKS.md` has the other rows and how they were measured. The payload argument
-`ROADMAP.md` §4 calls false for a query engine is true for a thin evaluator, and this is the
-measurement rather than the assertion.
+`BENCHMARKS.md` has the other rows and how they were measured; its 1.10 MiB and 318 KiB for
+this crate are from 2026-09-18. The payload argument `ROADMAP.md` §4 calls false for a query
+engine is true for a thin evaluator, and this is the measurement rather than the assertion.
 
 ## Use it
 

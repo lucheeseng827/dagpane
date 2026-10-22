@@ -335,6 +335,33 @@ impl AppSession {
         self.session.set(cell, value).map_err(|e| e.to_string())
     }
 
+    /// Move this viewer onto `app` — this app over refreshed data, from [`App::with_sources`]
+    /// — and run the pass that follows.
+    ///
+    /// What a scheduled refresh does to every live viewer. Whatever reads a re-read source
+    /// recomputes and nothing else does; the viewer's own controls are kept; and the panes
+    /// whose views changed come back exactly as [`AppSession::commit`] returns them, recorded
+    /// as sent. Afterwards this session holds the new app's graph and lets go of the old one,
+    /// so the old rows are freed when the last viewer has moved.
+    ///
+    /// # Errors
+    ///
+    /// A message, and nothing changes, when `app` is not this app over new data: a redeploy,
+    /// or the same manifest compiled again. Moving between those would mean recomputing
+    /// everything from nothing, which is what reconnecting is for.
+    pub fn rebase(&mut self, app: Arc<App>) -> Result<(Trace, Vec<PaneUpdate>), String> {
+        let refused = || "that app is not this one over refreshed data".to_string();
+        let graph = match (self.side, &app.split) {
+            (None, _) => Arc::clone(&app.graph),
+            (Some(Placement::Server), Some(split)) => Arc::clone(&split.server),
+            (Some(Placement::Client), Some(split)) => Arc::clone(&split.client),
+            (Some(_), None) => return Err(refused()),
+        };
+        self.session.rebase(graph).map_err(|_| refused())?;
+        self.app = app;
+        Ok(self.commit())
+    }
+
     /// Recompute, then work out what the viewer has to be sent.
     pub fn commit(&mut self) -> (Trace, Vec<PaneUpdate>) {
         let epoch_of_this_pass = self.session.epoch() + 1;

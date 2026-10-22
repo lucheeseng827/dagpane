@@ -86,15 +86,17 @@ One static binary. No Python, no Node, no package manager, no build step for the
 
 *Real captures of a local build of `dagpane run examples/sales.toml` — the Sales explorer
 example this whole README is measured on — at first render and after moving the controls.
-Not mockups; also not from the tagged `v0.1.1` release. See the note below.*
+Not mockups; also not from a `0.2.0` build. See the note below.*
 
-> **WIP — not shipped.** Added 2026-09-28, from a local build of this workspace at HEAD.
-> Every other number and transcript in this file is pinned to a named release or checked by
-> CI against the bundled app (`.github/workflows/ci.yml`'s `claim` job); these two images have not been
-> through that discipline yet — they have not been diffed against a build of tagged `v0.1.1`,
-> and no CI job re-renders them. Here so the README stops saying nothing about what the UI
-> looks like, not offered as a verified, permanent asset. The product site carries the same
-> two images under the same caveat (`dagpane-site/README.md`, the `#run` section).
+> **WIP — not from a release.** Added 2026-09-28, from a local build of this workspace as it
+> stood that day. Every transcript in this file is the output of `dagpane 0.2.0` — the two
+> `check` errors wrapped, and the `explain` runs under *Columns, not tables* and *Worked
+> examples* cut to the lines the text discusses — and the bundled app's counts are also
+> checked by CI (`.github/workflows/ci.yml`'s `claim` job); these two images have not been through that
+> discipline yet — they have not been diffed against a `0.2.0` build, and no CI job re-renders
+> them. Here so the README stops saying nothing about what the UI looks like, not offered as a
+> verified, permanent asset. The product site, https://dagpane.mancube.net, carries the same
+> two screenshots under the same caveat, in its *Run the pass yourself* section.
 
 ---
 
@@ -127,14 +129,22 @@ what makes it impossible for a cell to see a mix of old and new inputs.
 
 $ dagpane run examples/sales.toml
 dagpane: Sales explorer — 11 cells, 7 panes
+dagpane: heartbeat 25s — keep the idle timeout in front of this above that
+dagpane: writes    30s per frame beyond what a 128 kbit/s link needs — a client that stops reading, or falls that far behind, is dropped
+dagpane: answers   30s per ping beyond what a 128 kbit/s link needs — a client that stops reading, or goes, is dropped
 dagpane: http://127.0.0.1:8787
 
+$ rustup target add wasm32-unknown-unknown                               # once
+$ cargo build -p dagpane-wasm --target wasm32-unknown-unknown --release   # the engine, for export
 $ dagpane export examples/sales.toml --out dist
 dagpane: Sales explorer — dist
-    1.1 MiB  dist/dagpane.wasm
-    4.7 KiB  dist/dagpane.js
-   60.2 KiB  dist/index.html
-    1.2 MiB  total
+    1.3 MiB  dist/dagpane.wasm
+    4.8 KiB  dist/dagpane.js
+   70.4 KiB  dist/index.html
+    1.4 MiB  total
+
+  Serve the whole directory over http — `cd dist && python3 -m http.server`
+  — or put it behind any static host. A browser will not run it from file://.
 ```
 
 `check` and `graph` answer questions about an app that has not run — which is possible
@@ -143,25 +153,39 @@ precisely because the edges are written down rather than discovered while evalua
 demo: the page shows the same counts live, above the panes, and repainted panes flash their
 border so you can see which three of seven moved. `export` writes the same page with the
 engine compiled into it and the rows inlined, so the app runs with no server at all — and
-prints what that costs, because an exported app is as big as its data.
+prints what that costs, because an exported app is as big as its data. The binary does not
+carry that engine: `export` reads the module the `cargo build` above writes, at
+`target/wasm32-unknown-unknown/release/dagpane_wasm.wasm` under the directory it runs in, and
+from anywhere else needs `--wasm` and the path to one.
 
 ## In a container
 
 ```sh
-docker pull mancube/dagpane:0.1.1
+docker pull mancube/dagpane:0.2.0
 
 # run these from the directory holding your app manifest and its data
-docker run --rm -v "$PWD:/app:ro" mancube/dagpane:0.1.1 check /app/your-app.toml
+docker run --rm -v "$PWD:/app:ro" mancube/dagpane:0.2.0 check /app/your-app.toml
 docker run --rm -p 8787:8787 -v "$PWD:/app:ro" \
-  mancube/dagpane:0.1.1 run /app/your-app.toml --host 0.0.0.0
+  mancube/dagpane:0.2.0 serve /app/your-app.toml --origin http://localhost:8787
 ```
 
 `scratch` plus one static musl binary: no shell, no package manager, no libc. The app is
-mounted rather than baked in, because there is nothing in the image to bake it into. Note
-the `--host 0.0.0.0` and read what it prints: **authentication is off unless you turn it
-on**, so either pass `--auth-jwks` with a mounted JWKS file or put something that
-authenticates in front, before the port is reachable by anyone you would not show the data
-to. `SECURITY.md` covers this in full.
+mounted rather than baked in, because there is nothing in the image to bake it into. `serve`
+binds every interface, which is what a container needs, and `--origin` names the origin the
+browser sends — the address you type, here `http://localhost:8787` — in place of the bound
+address, which no browser sends. Behind a proxy, pass the name your users type instead,
+once per name, and nothing in front has to rewrite `Origin`. Binding every interface is also
+why you should read what it prints: **authentication is off unless you turn it on**, so either
+pass `--auth-jwks` with a mounted JWKS file or put something that authenticates in front,
+before the port is reachable by anyone you would not show the data to. `SECURITY.md` covers
+this in full.
+
+**On 0.1.1?** That image has no `serve`, and none of `--origin`, the probes or the drain —
+they arrived in 0.2.0 — so it serves only as `run --host 0.0.0.0`, which allows only the
+origin `http(s)://0.0.0.0:8787`. A browser at `http://localhost:8787` gets the page and a
+refused socket: dead controls, and nothing in the log, unless a proxy in front allowlists
+`Origin` and rewrites it to that address (`OPERATIONS.md`). Pull 0.2.0 and replace
+`run --host 0.0.0.0` with the `serve … --origin` line above.
 
 `linux/amd64` only. The build pins the `x86_64-unknown-linux-musl` target, and an `arm64`
 manifest carrying an `x86_64` binary would advertise a container that cannot start.
@@ -192,7 +216,10 @@ Three mechanisms fall out of that decision, and each has an ADR:
   A cycle is a build error naming the loop, not something a user runs into. The graph is
   built at start-up and shared immutably — a hundred viewers are a hundred vectors of values
   over one app, and one allocation per source that nobody has touched. What that shares is the
-  **sources**; the frames a session computes are its own, and `BENCHMARKS.md` prices both.
+  **sources**; the frames a session computes are its own, and `BENCHMARKS.md` prices both. A
+  source that names `refresh_secs` keeps it that way when its data moves: the new rows become a
+  new graph, built once, and every viewer moves onto it
+  ([ADR-0011](docs/adr/0011-a-refresh-is-a-new-graph.md)).
 * **Evaluation is in ascending height, which is what makes it glitch-free** ([ADR-0002](docs/adr/0002-height-ordered-evaluation.md)).
   Every edge runs from a lower height to a strictly higher one, so a cell's inputs are final
   before it runs. A diamond evaluates its join exactly once, and never with one new parent
@@ -355,8 +382,9 @@ $ dagpane explain examples/apps/19-wide-telemetry.toml --change-column metrics.d
 
 The table changed. Every cell was still *visited* — they all declare an edge to `metrics`,
 and the engine has no way to know better until it looks — and not one of them ran, because no
-column any of them reads had moved. Move `cpu0_user`, which three cells filter on, and three
-run; move `net_eth0_rx_bytes`, which one cell sums, and one runs and one pane is sent.
+column any of them reads had moved. Move `cpu0_user`, which three cells filter on and a fourth
+ranks by, and only those four and the cells below them can run; move `net_eth0_rx_bytes`, which
+one cell sums, and one runs and one pane is sent.
 
 A `filter` is finer again. Three cells on that page filter on `cpu0_user`, and moving every
 value in it costs nothing — *when the rows it picks do not move*:
@@ -445,7 +473,7 @@ runtime and no `unsafe`, and it can be embedded without any of the rest of this.
 
 ## Worked examples
 
-`examples/README.md` is fifteen running apps grouped by who asks the question — analyst, data
+`examples/README.md` is nineteen running apps grouped by who asks the question — analyst, data
 engineer, devops, manager — with the real `explain` output for each and an honest list of when
 *not* to reach for this. Each one teaches a distinct mechanic rather than holding a different
 dataset.
@@ -463,15 +491,16 @@ Two more paths live there, and both are about where the data comes from:
   the panel is a directory the notebook writes and then stops being involved in. `explain`
   comes back as a dict, so "will this page be cheap to interact with" is an assertion you
   write beside the analysis that produced it.
-* `examples/bucket/` — a panel whose data lives in object storage. Sources load once at
-  start-up and there is no hot reload, so following a bucket means `sync → compile → swap →
+* `examples/bucket/` — a panel whose data lives in object storage. A source that names
+  `refresh_secs` is re-read by the running server, but a bucket snapshot carries the manifest
+  beside the data, and a new app is a deploy: following a bucket means `sync → compile → swap →
   restart`; `serve.sh` is that loop, with `check` in front of the swap so a snapshot that will
   not compile never reaches a viewer.
 
-`python3 examples/tools/verify.py` compiles all fifteen and asserts each one both skips work
-and repaints something. It runs in CI, and it earned its place immediately — three apps had a
-checkbox written with a literal instead of a `param`, which compiles, renders, and never
-skips.
+`python3 examples/tools/verify.py` compiles all twenty-one manifests in `examples/` and asserts
+each one both skips work and repaints something. It runs in CI, and it earned its place
+immediately — three apps had a checkbox written with a literal instead of a `param`, which
+compiles, renders, and never skips.
 
 ## Running it in front of other people
 
@@ -479,18 +508,30 @@ skips.
 companion. Two things in there will cost you an afternoon if you meet them for the first time
 in production, so they are stated here too:
 
-* **The `/ws` upgrade checks `Origin` against the address the process bound.** Put this behind
-  a reverse proxy on a real hostname and the browser sends that hostname, which never matches —
-  `GET /` returns `200`, the upgrade returns `403`, and the page loads with dead controls and
-  nothing in the log. Opening it at the exact address it bound works; note that
-  `--host 0.0.0.0` allows only `http(s)://0.0.0.0:<port>`, which no browser sends, so a
-  wildcard bind always needs a proxy — and a loopback SSH tunnel does not rescue one, because a
-  tunnel changes the TCP destination and not the browser's `Origin`. A proxy must **allowlist
-  the incoming `Origin` before rewriting it**: rewriting unconditionally forwards every origin
-  as the allowed one, and authentication is not a substitute, because a cross-site request
-  carries the viewer's own cookies. **`dagpane host` is the exception**: with many apps on one
-  port the check compares `Origin` against the `Host` header instead, so forwarding `Host`
-  unchanged is enough and there is no rewrite to get wrong. `OPERATIONS.md` has the config.
+* **Under `dagpane run`, the `/ws` upgrade checks `Origin` against the address the process
+  bound.** Put `run` behind a reverse proxy on a real hostname and the browser sends that
+  hostname, which never matches — `GET /` returns `200`, the upgrade returns `403`, and the
+  page loads with dead controls and nothing in the log. Opening it at the exact address it
+  bound works; note that `--host 0.0.0.0` allows only `http(s)://0.0.0.0:<port>`, which no
+  browser sends, so a wildcard-bound `run` always needs a proxy — and a loopback SSH tunnel
+  does not rescue one, because a tunnel changes the TCP destination and not the browser's
+  `Origin`. **`dagpane serve` takes the list instead**: `--origin`, once per name, *replaces*
+  the derived one — the bound address is then not allowed at all — so in a container or
+  behind a proxy, `serve --origin https://<the name users type>` is the whole fix and nothing
+  in front rewrites `Origin`. Each value is checked at start-up and a near miss, such as a
+  missing scheme or a trailing slash, is refused with the fix named; a non-loopback bind with
+  no `--origin` warns at start-up that the page will load with dead controls. A proxy in front
+  of `run` must **allowlist the incoming `Origin` before rewriting it**: rewriting
+  unconditionally forwards every origin as the allowed one, and authentication is not a
+  substitute, because a cross-site request carries the viewer's own cookies.
+  **`dagpane host` is the exception**: with many apps on one
+  port the check compares `Origin` against the `Host` header instead, so there is no rewrite
+  to get wrong — forwarding `Host` unchanged and starting `host` with `--domain` naming the
+  domain you publish under is enough. An app answers only as one label in front of a declared
+  domain — `sales.localhost` always, `sales.example.com` once `--domain example.com` is
+  passed — and any other name gets `404`, so a forgotten `--domain` is a `404` for every app,
+  with the refused domain named once on stderr. `OPERATIONS.md` has the config, and
+  `SECURITY.md` has why a name nobody declared is refused.
 * **`dagpane run` is a laptop; `dagpane serve` is a replica.** Same app, and every default
   they disagree about is one the other would get wrong. `serve` binds every interface, takes
   the origins you publish at with `--origin` (which is what makes the paragraph above
@@ -507,7 +548,7 @@ in production, so they are stated here too:
 
 ## How it is checked
 
-493 tests. The one that decides whether any of the above is true is
+609 tests. The one that decides whether any of the above is true is
 `crates/core/tests/oracle.rs`.
 
 Every other test asserts a *count*, and a count asserted on a graph the author drew is a
@@ -541,7 +582,7 @@ Stated here rather than discovered later.
   them on connect, so a reload returns to the same view without this process holding anything
   to name, evict or leak.
 * **A browser can run the whole engine, and it is 2.5× slower at it.** `crates/wasm` is
-  `dagpane-core` plus the app model compiled for wasm32 — **1.10 MiB raw, 318 KiB gzipped**,
+  `dagpane-core` plus the app model compiled for wasm32 — **1.32 MiB raw, 365 KiB gzipped**,
   five exports and no imports — speaking the same patch protocol the socket does, so the
   client works either way and `dagpane export` writes an app as static files. What that buys
   is the wire; what it costs is measured: the same pass runs **2.2–2.8× slower** in wasm, so
@@ -588,10 +629,12 @@ crates/app     widgets, panes, the patch, the manifest compiler. no sockets.
 crates/host    many apps in one process, keyed by (app, manifest digest). no sockets either.
 crates/auth    the front door: an OIDC token against a JWKS file. no outbound request.
 crates/serve   axum, one session per connection, and the single-file client.
+crates/wasm    the engine and app model for wasm32, what `dagpane export` ships. five exports,
+               no imports, and the tree's only `unsafe`, in `abi.rs`.
 crates/cli     the `dagpane` binary.
-examples/      eighteen worked apps by role, their data, and the gate that keeps them honest.
+examples/      nineteen worked apps by role, their data, and the gate that keeps them honest.
                Also the Jupyter and object-storage paths. Start at examples/README.md.
-docs/adr/      the six decisions, and what breaks if you change them.
+docs/adr/      the decisions, and what breaks if you change them.
 docs/RUNBOOK.md  symptom first, when it is already broken. OPERATIONS.md is how to run it.
 docs/CUSTOMISING.md  every manifest option, and the limits of them.
 docs/PUBLIC-HTTPS.md  serving it on the internet, over TLS, behind an edge proxy.
@@ -607,7 +650,7 @@ says. `ARCHITECTURE.md` §2 has the whole graph.
 
 ```sh
 cargo build --release                 # the `dagpane` binary
-cargo test --workspace                # everything, 493 tests
+cargo test --workspace                # everything, 609 tests
 cargo test -p dagpane-core            # the reactive semantics, no browser needed
 cargo test -p dagpane-serve --test socket   # the real wire, over a real socket
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings

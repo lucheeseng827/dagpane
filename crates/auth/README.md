@@ -143,6 +143,12 @@ The gap is the interesting part, so `SECURITY.md` lists it and this is the same 
   again, because this process makes no outbound request. `--auth-leeway-secs` is small
   (`jsonwebtoken`'s own 60 seconds is a reasonable number nobody chose) and the practical
   control is a short token lifetime at the provider.
+* **A connection that outlives its token.** A token is checked when the socket opens, and
+  not again. A page open when its token expires keeps what it was sent and can go on moving
+  controls over the rows it holds until it closes. What it is not sent is *new* data: when a
+  scheduled refresh reads new rows, a connection whose token has expired is closed with code
+  `4401` instead, and the bundled page asks the viewer to sign in again. A short token
+  lifetime bounds which data a viewer can see, not how long a page stays open.
 * **`/` itself.** The page is served without a token, because the page is where the sign-in
   starts. It carries no data: every value arrives over the socket, which is the thing that
   checks.

@@ -13,11 +13,16 @@
 # not decoration: the WebSocket origin allowlist is otherwise derived from the address bound,
 # so a wildcard bind allows an origin no browser sends and the page loads with dead controls.
 #
-# NOTE THE `--host 0.0.0.0`, and note what it prints. There is **no authentication in this
-# version**: `dagpane run` binds loopback by default and warns when told to bind anything
-# else, and inside a container "anything else" is the only useful choice. Put it behind
-# something that authenticates before it is reachable by anyone you would not show the data
-# to. See SECURITY.md.
+# Note what it prints. There is **no authentication unless you ask for it**: on a wildcard
+# bind `serve` warns that anyone who can reach the port can read every pane. Pass
+# `--auth-jwks` and it verifies a bearer token itself, or put something that authenticates
+# in front, before it is reachable by anyone you would not show the data to. See SECURITY.md.
+#
+# `docker stop` stops it. The binary is PID 1 here, where SIGTERM has no default action, so
+# it handles the signal itself: it fails readiness, drains for `--drain-seconds` (5 by
+# default), and exits 0. .github/workflows/ci.yml runs this image that way on every push — a browser's
+# upgrade, a stranger's refused, then a stop — and .github/workflows/docker.yml repeats it on the image
+# it publishes.
 
 FROM rust:1.94-alpine AS build
 # binutils for readelf, which is what actually answers the static question below.

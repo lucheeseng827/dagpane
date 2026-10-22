@@ -63,11 +63,12 @@ again of JavaScript. `cargo build --target wasm32-unknown-unknown --release` is 
 build. Every call that returns anything returns one pointer to a little-endian `u32` length
 followed by that many bytes of UTF-8 JSON; the caller frees `4 + length`.
 
-The cost is stated where it lives: `abi.rs` is the only module in the tree that is not
-`#![forbid(unsafe_code)]`, its module docs enumerate every obligation a caller has, and
-everything with logic in it is in `engine.rs`, which is ordinary safe Rust tested on the host.
-If this ever needs to pass structured values rather than bytes — a frame shared with the page
-without a copy — the trade changes and that comment is the first thing to revisit.
+The cost is stated where it lives: `abi.rs` is the only module in the tree that uses `unsafe`
+— `crates/wasm` is the one crate not `#![forbid(unsafe_code)]` — its module docs enumerate
+every obligation a caller has, and everything with logic in it is in `engine.rs`, which is
+ordinary safe Rust tested on the host. If this ever needs to pass structured values rather
+than bytes — a frame shared with the page without a copy — the trade changes and that
+comment is the first thing to revisit.
 
 **The module imports nothing.** That is a consequence rather than a goal: `dagpane-core` is
 clockless, I/O-free and deterministic because that is what made it testable without a browser,
@@ -180,6 +181,5 @@ one for an app whose pass is already most of a frame budget.
 **An exported app is as big as its data.** The rows go into the page, so they need no second
 fetch — but the export is still a **multi-file bundle** whose files deploy together: the page,
 the glue, the module and any renderer scripts. `dagpane export` prints the total for exactly
-this reason — 1.2
-MiB for the bundled example is fine and a 40 MB CSV is not, and the row sweep says where the
-line is.
+this reason — about 1.2 MiB for the bundled example when this was decided, 1.4 MiB as 0.2.0
+builds it, is fine and a 40 MB CSV is not, and the row sweep says where the line is.

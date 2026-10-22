@@ -35,6 +35,7 @@
 //! than none: it invites a backend author to "fix" a digest there and believe it took
 //! effect. Found by mutating it and watching the differential test below stay green.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -81,6 +82,31 @@ pub trait Frame: fmt::Debug + Send + Sync {
     /// a client and a socket buffer besides.
     fn memory_size(&self) -> usize;
 
+    /// Every allocation behind this frame, each reported to `visit` as its address and its
+    /// size in bytes.
+    ///
+    /// [`Frame::memory_size`] answers *how big is this frame*. This answers *which bytes is
+    /// it*, and the difference is why it exists: frames share storage. A projection clones a
+    /// column's `Arc`, a filter over a dictionary column keeps the dictionary, and a derived
+    /// column wraps the frame it extends — so the sizes of two frames do not add up to what
+    /// the two of them hold. Summing `memory_size` bills a shared allocation once for every
+    /// frame that can reach it. [`FrameLedger`] counts each address once instead, and that is
+    /// the only way to state what one viewer costs over the app they are viewing.
+    ///
+    /// The sizes behind a frame that shares nothing internally add up to its `memory_size`;
+    /// the tests hold every backend to that. The default reports the frame as **one**
+    /// allocation of `memory_size` bytes at its own address, which is exact for a backend
+    /// that owns all of its storage outright, as [`Table`] does. A backend that shares
+    /// anything must override it, or a ledger will take shared bytes for private ones —
+    /// which is not a crash or a wrong answer anybody would notice, only an over-count that
+    /// looks entirely plausible.
+    fn allocations(&self, visit: &mut dyn FnMut(usize, usize)) {
+        visit(
+            (self as *const Self).cast::<()>() as usize,
+            self.memory_size(),
+        );
+    }
+
     /// Which backend this is — `"table"`, `"arrow"`, whatever a future one calls itself.
     ///
     /// Required rather than defaulted, because a default would let a new backend silently
@@ -106,8 +132,10 @@ pub trait Frame: fmt::Debug + Send + Sync {
     /// A new frame with only these columns, in this order.
     ///
     /// The one verb `take_rows` cannot express: `select` moves along the other axis. A
-    /// backend that stores columns separately — both of ours do — answers it by cloning
-    /// pointers rather than data.
+    /// backend may answer it by cloning pointers rather than data — Arrow does, and its
+    /// result then shares storage with its input, which [`Frame::allocations`] has to report.
+    /// [`Table`] does not: its columns are owned vectors, so its projection copies them, and
+    /// that is why the default `allocations` is exact for it.
     fn select_columns(&self, cols: &[usize]) -> Arc<dyn Frame>;
 
     /// Is this cell null?
@@ -845,6 +873,18 @@ impl Frame for WithColumn {
         self.base.memory_size() + self.extra.data.memory_size()
     }
 
+    // The base by reference — it is very often a source every session of an app shares — and
+    // only the column this frame added as its own. Without this override the default would
+    // report `memory_size`, base included, as one private allocation, and every viewer who
+    // derived a column from a 200 000-row source would be billed for the whole source again.
+    fn allocations(&self, visit: &mut dyn FnMut(usize, usize)) {
+        self.base.allocations(visit);
+        visit(
+            (&self.extra as *const Column).cast::<()>() as usize,
+            self.extra.data.memory_size(),
+        );
+    }
+
     fn backend(&self) -> &'static str {
         self.base.backend()
     }
@@ -928,5 +968,230 @@ impl Frame for WithColumn {
         } else {
             self.base.compare_to_value(row, col, rhs)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What a set of values holds, each allocation counted once
+// ---------------------------------------------------------------------------
+
+/// What a set of values holds, with every allocation behind them counted once.
+///
+/// The question it answers is *what do these cost over and above those*, which is the only
+/// form in which a per-viewer cost can be stated honestly. A viewer's frames point into the
+/// app's sources, into one another, and into the dictionaries their filters kept, so adding
+/// up their sizes counts shared storage once for every frame that reaches it. Here,
+/// [`FrameLedger::exclude`] marks what is already paid for and [`FrameLedger::add`] counts
+/// whatever else a value reaches — each address once, through [`Frame::allocations`].
+///
+/// It takes values rather than frames because a value is what a session's slot holds, and a
+/// cell that returns a megabyte of text costs that viewer a megabyte as surely as a table
+/// does. Scalars live inline in the value and hold nothing behind it.
+///
+/// Not an RSS figure, for the reasons [`Frame::memory_size`] is not one: it counts the
+/// buffers that hold cells and strings, and nothing a process keeps around them.
+#[derive(Clone, Debug, Default)]
+pub struct FrameLedger {
+    seen: HashSet<usize>,
+    bytes: u64,
+    allocations: u64,
+}
+
+impl FrameLedger {
+    /// An empty ledger: nothing paid for, nothing counted.
+    pub fn new() -> FrameLedger {
+        FrameLedger::default()
+    }
+
+    /// Mark everything behind `value` as already paid for, without counting it.
+    pub fn exclude(&mut self, value: &Value) {
+        let seen = &mut self.seen;
+        visit_value(value, &mut |addr, _| {
+            seen.insert(addr);
+        });
+    }
+
+    /// Count everything behind `value` that has been neither counted nor excluded, and return
+    /// the bytes this call added.
+    pub fn add(&mut self, value: &Value) -> u64 {
+        let (seen, allocations) = (&mut self.seen, &mut self.allocations);
+        let mut added = 0u64;
+        visit_value(value, &mut |addr, bytes| {
+            if seen.insert(addr) {
+                added += bytes as u64;
+                *allocations += 1;
+            }
+        });
+        self.bytes += added;
+        added
+    }
+
+    /// Bytes counted so far.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Distinct allocations counted so far. Excluded ones are not among them.
+    pub fn allocations(&self) -> u64 {
+        self.allocations
+    }
+}
+
+/// Every allocation behind a value: a frame's own, a string's heap, a list's spine and its
+/// elements'.
+fn visit_value(value: &Value, visit: &mut dyn FnMut(usize, usize)) {
+    match value {
+        Value::Frame { v } => v.as_frame().allocations(visit),
+        // An empty string or list owns no allocation, and its pointer is the one dangling
+        // address every empty one shares — reporting it would make two unrelated empties look
+        // like one shared allocation. Nothing is lost by skipping it: its size is zero.
+        Value::Text { v } => {
+            if v.capacity() > 0 {
+                visit(v.as_ptr() as usize, v.capacity());
+            }
+        }
+        Value::List { v } => {
+            if v.capacity() > 0 {
+                visit(
+                    v.as_ptr() as usize,
+                    v.capacity() * std::mem::size_of::<Value>(),
+                );
+            }
+            for item in v {
+                visit_value(item, visit);
+            }
+        }
+        Value::Null | Value::Bool { .. } | Value::Int { .. } | Value::Float { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+
+    fn table(rows: usize) -> Arc<dyn Frame> {
+        Arc::new(
+            Table::new(vec![
+                Column::int("n", (0..rows).map(|i| Some(i as i64)).collect()),
+                Column::text("s", (0..rows).map(|i| Some(format!("row-{i}"))).collect()),
+            ])
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_frame_that_shares_nothing_is_its_memory_size_in_one_allocation() {
+        let t = table(500);
+        let mut ledger = FrameLedger::new();
+        assert_eq!(ledger.add(&Value::frame(t.clone())), t.memory_size() as u64);
+        assert_eq!(ledger.allocations(), 1);
+    }
+
+    #[test]
+    fn a_frame_reached_twice_is_counted_once() {
+        let t = table(500);
+        let mut ledger = FrameLedger::new();
+        let first = ledger.add(&Value::frame(t.clone()));
+        // Two slots holding one `Arc` — a pass-through cell, or a pane reading a cell's value —
+        // are one allocation, and summing `memory_size` over slots would say two.
+        assert_eq!(ledger.add(&Value::frame(t.clone())), 0);
+        assert_eq!(ledger.bytes(), first);
+    }
+
+    #[test]
+    fn what_is_excluded_is_never_counted() {
+        let t = table(500);
+        let mut ledger = FrameLedger::new();
+        ledger.exclude(&Value::frame(t.clone()));
+        assert_eq!(ledger.add(&Value::frame(t)), 0);
+        assert_eq!(ledger.allocations(), 0);
+    }
+
+    /// The case the whole method exists for. A derived column wraps its base by reference,
+    /// and `WithColumn::memory_size` — rightly, for what it answers — includes the base. A
+    /// session that derives a column from an app's 200 000-row source must not be billed for
+    /// the source again: only for the column it added.
+    #[test]
+    fn a_derived_column_is_billed_for_itself_and_not_for_the_frame_it_extends() {
+        let base = table(1_000);
+        let extra = Column::float("x", (0..1_000).map(|i| Some(i as f64)).collect());
+        let extra_bytes = extra.data.memory_size() as u64;
+        let derived = with_column(Arc::clone(&base), extra);
+
+        // Nothing paid for: the derived frame costs exactly what it says, base included.
+        let mut whole = FrameLedger::new();
+        assert_eq!(
+            whole.add(&Value::frame(Arc::clone(&derived))),
+            derived.memory_size() as u64
+        );
+
+        // The base already paid for — an app's source: only the added column is this
+        // viewer's.
+        let base_bytes = base.memory_size() as u64;
+        let mut marginal = FrameLedger::new();
+        marginal.exclude(&Value::frame(base));
+        assert_eq!(marginal.add(&Value::frame(derived)), extra_bytes);
+        // And the two readings differ by exactly the base: the bytes a ledger that took the
+        // default `allocations` would have billed this viewer for a second time.
+        assert_eq!(whole.bytes(), base_bytes + extra_bytes);
+    }
+
+    #[test]
+    fn a_derived_column_over_a_derived_column_bills_each_layer_once() {
+        let base = table(200);
+        let one = with_column(
+            Arc::clone(&base),
+            Column::int("a", (0..200).map(|i| Some(i as i64)).collect()),
+        );
+        let two = with_column(
+            Arc::clone(&one),
+            Column::int("b", (0..200).map(|i| Some(i as i64)).collect()),
+        );
+        let mut ledger = FrameLedger::new();
+        ledger.add(&Value::frame(Arc::clone(&one)));
+        // `two` reaches `one` and `base`, both already counted: only `b` is new.
+        let b_bytes = ledger.add(&Value::frame(two));
+        assert_eq!(b_bytes, 200 * std::mem::size_of::<Option<i64>>() as u64);
+    }
+
+    #[test]
+    fn text_counts_its_heap_and_an_empty_string_counts_nothing() {
+        let mut ledger = FrameLedger::new();
+        let big = "x".repeat(10_000);
+        let capacity = big.capacity() as u64;
+        assert_eq!(ledger.add(&Value::text(big)), capacity);
+        // Two empty strings share one dangling address. Were it reported, the second would
+        // look like the first one reached again; it is not reported, and both cost nothing.
+        assert_eq!(ledger.add(&Value::text(String::new())), 0);
+        assert_eq!(ledger.add(&Value::text(String::new())), 0);
+        assert_eq!(ledger.allocations(), 1);
+    }
+
+    #[test]
+    fn a_list_counts_its_spine_and_every_element() {
+        let mut ledger = FrameLedger::new();
+        let t = table(100);
+        let list = Value::list(vec![
+            Value::text("abc"),
+            Value::frame(Arc::clone(&t)),
+            Value::int(7),
+        ]);
+        let spine = 3 * std::mem::size_of::<Value>() as u64;
+        let added = ledger.add(&list);
+        assert_eq!(added, spine + 3 + t.memory_size() as u64);
+    }
+
+    #[test]
+    fn scalars_hold_nothing_behind_them() {
+        let mut ledger = FrameLedger::new();
+        for v in [
+            Value::Null,
+            Value::bool(true),
+            Value::int(1),
+            Value::float(2.0),
+        ] {
+            assert_eq!(ledger.add(&v), 0);
+        }
+        assert_eq!(ledger.allocations(), 0);
     }
 }

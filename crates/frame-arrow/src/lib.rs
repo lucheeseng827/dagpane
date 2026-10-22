@@ -38,6 +38,7 @@ use arrow_array::types::Int32Type;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int64Array, StringArray,
 };
+use arrow_data::ArrayData;
 use arrow_schema::DataType;
 use dagpane_core::frame::Frame;
 use dagpane_core::value::{Column, ColumnData, ColumnType, Table, Value};
@@ -269,6 +270,33 @@ impl Frame for ArrowFrame {
         self.columns.iter().map(|a| a.get_array_memory_size()).sum()
     }
 
+    /// By allocation, not by array, and that is the point of overriding it. A projection
+    /// shares whole arrays, `take` over a dictionary column keeps the dictionary, and a slice
+    /// shares a buffer at an offset: all three reach one allocation, which `memory_size`
+    /// reports once from every array holding it and this reports once in total. Each buffer
+    /// is keyed by the start of the allocation it points into, so a slice and its parent
+    /// agree.
+    fn allocations(&self, visit: &mut dyn FnMut(usize, usize)) {
+        for column in &self.columns {
+            let mut buffers = 0usize;
+            visit_buffers(&column.to_data(), &mut |addr, bytes| {
+                buffers += bytes;
+                visit(addr, bytes);
+            });
+            // What Arrow's own accounting adds over the buffers: the array structs, a few
+            // dozen bytes each. Keyed by the array's `Arc`, so a projection that shares the
+            // array shares this as well — and a frame that shares nothing reports exactly its
+            // `memory_size`, which is what lets the tests demand equality rather than nearness.
+            // A dictionary filtered with `take` keeps the old dictionary's struct inside the
+            // new array, and it is billed here to the new one: tens of bytes, said rather than
+            // hidden.
+            visit(
+                Arc::as_ptr(column).cast::<()>() as usize,
+                column.get_array_memory_size().saturating_sub(buffers),
+            );
+        }
+    }
+
     fn backend(&self) -> &'static str {
         "arrow"
     }
@@ -312,6 +340,29 @@ impl Frame for ArrowFrame {
             columns,
             rows: keep.len(),
         })
+    }
+}
+
+/// Every buffer behind one array — its own, its null bitmap's, and its children's, which is
+/// where a dictionary keeps its values — keyed by the start of the allocation each points
+/// into.
+///
+/// An empty buffer owns nothing and its pointer is the dangling one every empty buffer shares,
+/// so it is skipped: reporting it would make unrelated empties look like one shared buffer.
+fn visit_buffers(data: &ArrayData, visit: &mut dyn FnMut(usize, usize)) {
+    for buffer in data.buffers() {
+        if buffer.capacity() > 0 {
+            visit(buffer.data_ptr().as_ptr() as usize, buffer.capacity());
+        }
+    }
+    if let Some(nulls) = data.nulls() {
+        let buffer = nulls.buffer();
+        if buffer.capacity() > 0 {
+            visit(buffer.data_ptr().as_ptr() as usize, buffer.capacity());
+        }
+    }
+    for child in data.child_data() {
+        visit_buffers(child, visit);
     }
 }
 
@@ -399,12 +450,24 @@ impl FrameBuilder for ArrowFrameBuilder {
             ColumnType::Int => ColumnSink::Int(Int64Builder::with_capacity(n)),
             ColumnType::Float => ColumnSink::Float(Float64Builder::with_capacity(n)),
             ColumnType::Bool => ColumnSink::Bool(BooleanBuilder::with_capacity(n)),
+            // Sized from the hint, which `worth_encoding` has just required to carry both
+            // counts: one key a row, and the distinct values at the plain column's twelve
+            // bytes apiece. `new()` starts at Arrow's default of 1 024 keys and grows by
+            // doubling, so 200 000 rows ended in a buffer of 262 144 keys — and
+            // `memory_size`, which a host's byte budget is summed from, counts a buffer's
+            // capacity rather than its length, so that slack was billed as data.
             ColumnType::Text if Self::worth_encoding(hint) => {
-                ColumnSink::Dict(StringDictionaryBuilder::new())
+                let distinct = hint.distinct.unwrap_or(0);
+                ColumnSink::Dict(StringDictionaryBuilder::with_capacity(
+                    n,
+                    distinct,
+                    distinct * 12,
+                ))
             }
             // 12 bytes per value is arrow's own rule of thumb for the offsets plus a short
-            // string; over-reserving a byte buffer costs nothing that dropping it does not
-            // return.
+            // string. A guess, where the dictionary's sizes above are counts: the hint carries
+            // no text lengths, so a column of longer strings grows past this and one of
+            // shorter strings is billed, in `memory_size`, for the bytes it did not use.
             ColumnType::Text => ColumnSink::Text(StringBuilder::with_capacity(n, n * 12)),
         });
         self.sinks.len() - 1
@@ -766,6 +829,37 @@ mod tests {
         assert_eq!(blind.encodings()[0], Some(Encoding::Plain));
     }
 
+    /// A dictionary built from a hint reserves one key a row and a dictionary its size.
+    ///
+    /// Not a nicety: `memory_size` counts a buffer's capacity, and a host's byte budget is
+    /// summed from it, so whatever a builder over-reserves is charged as data. Built with
+    /// `new()`, these 20 000 keys landed in a buffer of 32 768 and the four-value dictionary
+    /// in one sized for a thousand.
+    #[test]
+    fn a_hinted_dictionary_reserves_one_key_a_row_and_no_more() {
+        let n = 20_000;
+        let columns = vec![Column::text(
+            "region",
+            (0..n)
+                .map(|i| Some(["north", "south", "east", "west"][i % 4].to_string()))
+                .collect(),
+        )];
+        let frame = built(&columns, true);
+        assert_eq!(frame.encodings()[0], Some(Encoding::Dictionary));
+        let dict = frame.columns[0].as_dictionary::<Int32Type>();
+
+        // Four bytes a key, rounded up to Arrow's 64-byte allocation unit — which 80 000
+        // already is.
+        let keys = dict.keys().values().inner().capacity();
+        assert_eq!(keys, (n * 4).div_ceil(64) * 64, "keys buffer for {n} rows");
+        // Four short strings and their offsets: a couple of cache lines, not five kilobytes.
+        let values = dict.values().get_buffer_memory_size();
+        assert!(
+            values <= 256,
+            "a four-value dictionary holds {values} bytes of buffers"
+        );
+    }
+
     /// A hint that says "many distinct" must not encode: a dictionary over high-cardinality
     /// text is *larger* than plain, so acting on it would make the column worse.
     #[test]
@@ -801,6 +895,111 @@ mod tests {
         assert_eq!(
             frame_digest(&*Frame::head(&arrow, 7)),
             frame_digest(&*Frame::head(&table, 7))
+        );
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    use dagpane_core::frame::FrameLedger;
+
+    fn mixed(n: usize) -> Vec<Column> {
+        let regions = ["north", "south", "east", "west"];
+        vec![
+            Column::int("id", (0..n).map(|i| Some(i as i64)).collect()),
+            Column::text(
+                "region",
+                (0..n).map(|i| Some(regions[i % 4].to_string())).collect(),
+            ),
+            Column::float(
+                "amount",
+                (0..n)
+                    .map(|i| if i % 9 == 0 { None } else { Some(i as f64) })
+                    .collect(),
+            ),
+            Column::bool("ok", (0..n).map(|i| Some(i % 2 == 0)).collect()),
+        ]
+    }
+
+    fn charge(frame: Arc<dyn Frame>, paid: &[Arc<dyn Frame>]) -> u64 {
+        let mut ledger = FrameLedger::new();
+        for p in paid {
+            ledger.exclude(&Value::frame(Arc::clone(p)));
+        }
+        ledger.add(&Value::frame(frame))
+    }
+
+    /// The anchor every other test leans on: a frame that shares nothing internally reports
+    /// exactly what Arrow's own accounting says it holds, so a difference anywhere below is a
+    /// sharing that was found and not a rounding the ledger introduced.
+    #[test]
+    fn a_frame_that_shares_nothing_reports_exactly_its_memory_size() {
+        for encoding in [Encoding::Dictionary, Encoding::Plain] {
+            let frame: Arc<dyn Frame> =
+                Arc::new(ArrowFrame::from_columns_with(&mixed(1_000), encoding));
+            assert_eq!(
+                charge(Arc::clone(&frame), &[]),
+                frame.memory_size() as u64,
+                "{encoding:?}"
+            );
+        }
+    }
+
+    /// A projection clones each kept column's `Arc`. Summed by `memory_size` it is a second
+    /// copy of those columns; it is in fact none.
+    #[test]
+    fn a_projection_of_a_frame_already_paid_for_costs_nothing() {
+        let source: Arc<dyn Frame> = Arc::new(ArrowFrame::from_columns(&mixed(5_000)));
+        let projected = source.select_columns(&[0, 1, 3]);
+        assert!(projected.memory_size() > 0);
+        assert_eq!(charge(projected, &[source]), 0);
+    }
+
+    /// `take` over a dictionary column gathers new keys and keeps the dictionary. With the
+    /// source paid for, a filtered frame owes everything except that dictionary — and the
+    /// difference is checked against Arrow's own figure for the dictionary's buffers, so this
+    /// does not grade the ledger by the ledger.
+    #[test]
+    fn a_filter_keeps_the_dictionary_and_is_not_billed_for_it_again() {
+        let concrete = ArrowFrame::from_columns_with(&mixed(5_000), Encoding::Dictionary);
+        let dictionary = concrete.columns[1]
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("region is dictionary-encoded")
+            .values()
+            .get_buffer_memory_size() as u64;
+        let source: Arc<dyn Frame> = Arc::new(concrete);
+        let keep: Vec<usize> = (0..5_000).step_by(2).collect();
+        let filtered = source.take_rows(&keep);
+
+        let owed = charge(Arc::clone(&filtered), &[source]);
+        assert!(owed > 0, "the gathered keys and the other columns are new");
+        assert_eq!(
+            filtered.memory_size() as u64 - owed,
+            dictionary,
+            "exactly the dictionary is shared, and nothing else"
+        );
+    }
+
+    /// Two slices of one array point into one allocation at different offsets. Keyed by the
+    /// buffer's own pointer they would look like two; keyed by the allocation they are one,
+    /// which is what they are.
+    #[test]
+    fn two_slices_of_one_array_are_one_allocation() {
+        let parent: ArrayRef = Arc::new((0..1_000).map(Some).collect::<Int64Array>());
+        let parent_buffers = parent.get_buffer_memory_size() as u64;
+        let frame: Arc<dyn Frame> = Arc::new(ArrowFrame {
+            names: vec!["a".into(), "b".into()],
+            types: vec![ColumnType::Int, ColumnType::Int],
+            columns: vec![parent.slice(0, 100), parent.slice(100, 100)],
+            rows: 100,
+        });
+        // Arrow's accounting reports the parent's whole allocation once per slice.
+        assert_eq!(
+            frame.memory_size() as u64 - charge(frame, &[]),
+            parent_buffers,
+            "the second slice's copy of the parent's buffer is the one that does not exist"
         );
     }
 }

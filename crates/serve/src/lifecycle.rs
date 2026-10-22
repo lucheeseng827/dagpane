@@ -17,8 +17,10 @@
 //!    is still open and in-flight work is untouched.
 //! 2. **Wait.** Long enough for whatever is in front to have asked and been told. That is a
 //!    property of the balancer, not of this process, so it is a number the operator sets.
-//! 3. **Stop accepting**, and let what is in flight finish. This is the part `axum` already
-//!    does; everything above is what has to happen before it.
+//! 3. **Stop accepting**, and let what is in flight finish. `axum` does that for requests. A
+//!    socket stops being one the moment it upgrades, so the sockets are closed by this crate
+//!    instead: each with `1001`, *going away*, between passes, and then waited for, up to
+//!    [`crate::CLOSE_GRACE`]. See `Connections` in `lib.rs`.
 //!
 //! Skipping step 2 is the whole bug, and it is invisible in a test that stops one process.
 //!
@@ -42,6 +44,7 @@
 //! lands. `OPERATIONS.md` measured 11 s for a `podman stop` that should have taken
 //! milliseconds, paid once per replica per rollout.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -144,6 +147,14 @@ impl Health for Identity {
 ///
 /// `resident_bytes` against `budget_bytes` is the other number worth watching, because it is
 /// the one that decides what gets evicted next.
+///
+/// `session_bytes` is the one it does not see. The budget is written in source bytes, and a
+/// viewer costs what their pipeline materialises on top of the sources they share — about the
+/// rows again for a pipeline that keeps rows, next to nothing for one that aggregates. Each
+/// app's entry says how many sessions it has and what they hold; `held_after_eviction` lists
+/// versions the budget has let go of that a connected viewer is still holding, sources and
+/// all. Nothing acts on either figure. They are here so that the memory a process holds
+/// stops being a sum an operator does by hand.
 #[derive(Debug)]
 pub struct Fleet {
     host: Arc<dagpane_host::Host>,
@@ -169,27 +180,78 @@ impl Health for Fleet {
         // nobody can trust, which for a probe is the whole of its job.
         let resident = self.host.resident();
         let resident_bytes: u64 = resident.iter().map(|s| s.footprint.source_bytes).sum();
+        // And one of the sessions, taken beside it. They are separate locks, so a viewer can
+        // connect between the two and move a count by one; each total below is summed from its
+        // own list, so neither ever disagrees with the entries printed next to it.
+        let sessions = self.host.sessions();
+        let session_bytes: u64 = sessions.iter().map(|s| s.bytes).sum();
+        // Grouped by admission and not by key. A key evicted and opened again is compiled
+        // again, with a second copy of its sources, and a viewer who connected before the
+        // eviction is still holding the first. Matched by key, they would be booked against
+        // the copy that is resident and the one they actually hold would vanish from here.
+        type Tally = (u64, u64, u64); // sessions, what they hold, their admission's source bytes
+        let mut by_admission: HashMap<(&dagpane_host::AppKey, u64), Tally> = HashMap::new();
+        for live in &sessions {
+            let entry = by_admission.entry((&live.key, live.admission)).or_default();
+            entry.0 += 1;
+            entry.1 += live.bytes;
+            entry.2 = live.source_bytes;
+        }
         let mut apps: Vec<serde_json::Value> = resident
             .iter()
             .map(|slot| {
+                let (count, held, _) = by_admission
+                    .remove(&(&slot.key, slot.admission))
+                    .unwrap_or_default();
                 serde_json::json!({
                     "app": slot.key.app_id.as_str(),
                     "manifest": slot.key.manifest_digest.to_string(),
                     "bytes": slot.footprint.source_bytes,
+                    "sessions": count,
+                    "session_bytes": held,
+                })
+            })
+            .collect();
+        // Whatever is left has sessions and no residency: an admission evicted — by a redeploy,
+        // the budget or the sweep — while somebody was still looking at it. Its graph, and so
+        // its sources, stay alive until they leave, and `resident_bytes` stopped counting them.
+        // One entry per version, and `bytes` sums its admissions: two of them still held are
+        // two copies of the same sources.
+        let mut held_by_key: HashMap<&dagpane_host::AppKey, Tally> = HashMap::new();
+        for ((key, _), (count, held, source_bytes)) in by_admission {
+            let entry = held_by_key.entry(key).or_default();
+            entry.0 += count;
+            entry.1 += held;
+            entry.2 += source_bytes;
+        }
+        let mut held_after_eviction: Vec<serde_json::Value> = held_by_key
+            .into_iter()
+            .map(|(key, (count, held, source_bytes))| {
+                serde_json::json!({
+                    "app": key.app_id.as_str(),
+                    "manifest": key.manifest_digest.to_string(),
+                    "bytes": source_bytes,
+                    "sessions": count,
+                    "session_bytes": held,
                 })
             })
             .collect();
         // Residency is a map, so its order is whatever the hash gave. Sorted, because a probe
         // output that reshuffles between two identical requests is one nobody can diff.
-        apps.sort_by(|a, b| {
+        let by_name = |a: &serde_json::Value, b: &serde_json::Value| {
             (a["app"].as_str(), a["manifest"].as_str())
                 .cmp(&(b["app"].as_str(), b["manifest"].as_str()))
-        });
+        };
+        apps.sort_by(by_name);
+        held_after_eviction.sort_by(by_name);
         serde_json::json!({
             "kind": "host",
             "apps": apps,
             "resident_bytes": resident_bytes,
             "budget_bytes": self.host.budget().max_bytes,
+            "sessions": sessions.len(),
+            "session_bytes": session_bytes,
+            "held_after_eviction": held_after_eviction,
             "version": self.version,
         })
     }
@@ -245,7 +307,7 @@ impl Lifecycle {
         *self.state.borrow()
     }
 
-    /// The future to hand [`axum::serve`]'s graceful shutdown: wait for a stop signal, then
+    /// The future to hand [`axum::serve()`]'s graceful shutdown: wait for a stop signal, then
     /// run the drain.
     pub async fn on_signal(&self) {
         tokio::select! {

@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use dagpane_app::App;
+use dagpane_core::frame::FrameLedger;
 use dagpane_core::Session;
 
 /// What one compiled app costs to keep resident.
@@ -24,7 +25,8 @@ pub struct Footprint {
     /// compiled pipelines, every session's slot vector, and the allocator's slack. Those are
     /// real and they are not here, for the reason the whole crate exists: the sources are
     /// what a second app adds and a second *viewer* does not, so they are what a budget over
-    /// apps can honestly be written in. Nothing in this crate predicts RSS from it.
+    /// apps can honestly be written in. Nothing in this crate predicts RSS from it. What a
+    /// viewer adds is [`SessionFootprint`], counted per session and never added to this.
     pub source_bytes: u64,
     /// Rows across those sources.
     pub source_rows: u64,
@@ -54,6 +56,79 @@ impl Footprint {
             source_bytes,
             source_rows,
             cells: app.graph.len() as u32,
+        }
+    }
+}
+
+/// What every session of one app starts out holding without owning: the allocations behind
+/// its sources.
+///
+/// Computed once, when the app is admitted, from the same frames [`Footprint::of`] weighs,
+/// and kept beside the app so that [`SessionFootprint::of`] can subtract it from every session
+/// for as long as the app is resident — rather than rediscovering, on every pass, what every
+/// session already shares.
+#[derive(Clone, Debug, Default)]
+pub struct SharedBaseline(FrameLedger);
+
+impl SharedBaseline {
+    /// Everything reachable from a compiled app's sources, marked as paid for.
+    ///
+    /// Every source, scalars included: a text box's default string is shared until a viewer
+    /// types into it, and then the new string is theirs — which is the right answer, and falls
+    /// out of excluding the default rather than needing a rule of its own.
+    pub fn of(app: &App) -> SharedBaseline {
+        let session = Session::new(app.graph.clone());
+        let mut ledger = FrameLedger::new();
+        for id in app.graph.sources() {
+            if let Some(value) = session.get_id(id).value() {
+                ledger.exclude(value);
+            }
+        }
+        SharedBaseline(ledger)
+    }
+}
+
+/// What one live session holds over and above the app it is a session of.
+///
+/// The term [`Footprint`] leaves out. The sources are shared and the frames a session
+/// computes are not, so a row-keeping pipeline costs about its source again per viewer while
+/// an aggregating one costs almost nothing. `benches/sessions/` measured that from outside the
+/// process as resident memory; this counts it from inside, per session, as it happens.
+///
+/// **Reported, not enforced.** Nothing in this crate admits, refuses or evicts on it:
+/// [`Budget::max_bytes`] is still written in source bytes and still decides alone. A budget
+/// over apps that charged them for their viewers would evict an app *because* it was popular,
+/// out from under the viewers making it so — and would free nothing by it, because a viewer
+/// holds their app's graph, and through it the sources, until they leave. Limiting what viewers
+/// hold means refusing or shedding viewers: a different policy from the one implemented here,
+/// and one nobody has chosen. What this does is turn the figure such a policy would need from
+/// something an operator works out by hand into something the process knows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionFootprint {
+    /// Bytes behind the session's slots that its app's sources do not already hold, each
+    /// allocation counted once — however many cells, panes or derived frames reach it.
+    pub bytes: u64,
+    /// How many distinct allocations those bytes are spread over.
+    pub allocations: u64,
+}
+
+impl SessionFootprint {
+    /// Weigh a session against the baseline its app was admitted with.
+    ///
+    /// Every slot, computed or stale: a stale slot's value is resident until the next pass
+    /// replaces it, so leaving it out would under-count exactly when a viewer has just moved
+    /// a control. The cost is a walk over the cells and the buffers behind their frames — no
+    /// copy, and no hashing of any cell's contents.
+    pub fn of(session: &Session, baseline: &SharedBaseline) -> SessionFootprint {
+        let mut ledger = baseline.0.clone();
+        for &id in session.graph().order() {
+            if let Some(value) = session.get_id(id).value() {
+                ledger.add(value);
+            }
+        }
+        SessionFootprint {
+            bytes: ledger.bytes(),
+            allocations: ledger.allocations(),
         }
     }
 }

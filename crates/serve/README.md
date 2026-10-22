@@ -103,7 +103,7 @@ its own pace, and every connection routed in the meantime is a reset. So a `SIGT
 |---|---|---|
 | 1 | go unready | `/readyz` → `503`. The listener stays open; in-flight work is untouched |
 | 2 | wait | `--drain-seconds`, the window the balancer has to notice |
-| 3 | stop accepting | and let what is in flight finish — the part `axum` already did |
+| 3 | stop accepting | let what is in flight finish, then close every socket with `1001` and wait, up to 2 s |
 
 **`/healthz` stays `200` throughout.** A liveness probe that failed during a drain would have
 the supervisor conclude the process had hung and `SIGKILL` it, in the middle of the graceful
@@ -133,6 +133,40 @@ on for sixty seconds, so a person who is merely *reading* gets disconnected. Thi
 client code: a browser answers a Ping in the transport, and cannot send one from script even
 if it wanted to, so the server is the only end that can start it.
 
+**Every frame is written within its allowance** — 30 s (`Options::write_timeout`,
+`Liveness`, `--write-timeout-seconds`) plus the time `SLOWEST_READER`, 16 KiB/s, needs for the
+frame's bytes — or the connection is dropped. The heartbeat is for a client that is reading and
+has nothing to say; this is for a connection stuck sending to one that has stopped reading. A
+connection is sequential, so it waits behind a frame it cannot write, and without a deadline it
+would hold its session — and the rows a refresh has since replaced — for as long as the client
+liked. The size term is what stops a slow reader of a large frame being taken for a stopped
+one; a client sent more than its link carries can still fall far enough behind to be
+dropped, and reconnects onto the newest state.
+
+**Every ping is answered within its allowance** — 30 s (`Options::ping_timeout`, `Liveness`,
+`--ping-timeout-seconds`) plus the time the same reader needs for everything written since the
+last answer — or the connection is dropped the same way. This is for a client that stops
+reading on a quiet connection, which never makes a write wait: its kernel takes the pings, the
+pings keep a proxy's idle timeout from firing, and TCP sees a healthy peer for good. Only a
+Pong echoing the ping counts, because a client can send one only after reading everything
+before it; each ping carries a sequence number, offset by a per-connection key so it cannot be
+guessed, and each keeps the allowance it was written with, so pings that waited behind a large
+frame are not re-timed when the first of them is answered. When a ping falls overdue, whatever
+the client has already sent is read first — up to 64 frames — so an answer that landed while
+the loop was busy writing or computing is not lost to the clock. A desktop browser answers
+pings without the page's script, so a background tab keeps its connection.
+
+`tests/deadline.rs` stalls a real client — a receive buffer of a few kilobytes and requests
+whose answers it never reads — and requires the server to let it go under `run` and under
+`host`, while a client that reads is answered throughout; reads an 8.7 MB opening frame at
+about 1.5 MB/s, far past the bare deadline, and requires it to arrive whole; and, as the
+control, waits out the same stall with the deadline off. `tests/unanswered.rs` does the same
+for a quiet connection: a client that stops reading is let go under `run` and `host` while one
+that reads is kept; neither unsolicited pongs, nor pongs counting the pings, nor a flood of
+frames keep a client that never reads; a slow reader of the 8.7 MB frame answers its pings late
+and is kept; four clients whose answers land while the server is busy writing to them are all
+kept; and the stall is waited out with the deadline off.
+
 **The page reconnects on its own** — exponential, capped at 30 s, jittered so that every viewer
 of a drained replica does not arrive back in the same instant. It costs one pass and can land
 on a different replica, because a session *is* its input values and the viewer carries those in
@@ -144,6 +178,34 @@ Node with **no npm dependency**. It kills the server and requires the page back 
 controls working — the assertion that matters, because `inFlight` is cleared only by a reply,
 so a socket that dies mid-pass leaves it set and `flush` refuses to send forever. That page
 renders perfectly and answers nothing, which is worse than the banner it replaced.
+
+## Data that moves while somebody is watching
+
+A source that names `refresh_secs` is re-read by this crate, which owns the only clock in the
+process — `dagpane-app` has none and `dagpane-host` is not allowed one. `src/refresh.rs` is the
+schedule:
+
+* **one schedule per app being viewed** — per *admission* under `host`, for the reason
+  `Host::sessions` gives — started by its first viewer, checking every source at once, and
+  stopped when its last viewer leaves;
+* **one read per tick**, off the async workers, with the version asked first so an untouched
+  file costs a `stat`; rows whose columns changed are refused, and the app keeps the rows it had;
+* **one new graph per change**, built with `App::with_sources`, which weighs the new rows once
+  and shares everything else; identical rows build nothing and tell nobody;
+* **every connection moves onto it** between messages — never inside a viewer's own pass —
+  with `AppSession::rebase`: one pass over what reads the new rows, at that viewer's own
+  filter, and a `Reloaded` frame carrying only the panes that moved, or nothing at all;
+* **except a connection that has outlived its token.** Behind a front door, a connection whose
+  token has expired is closed with code `4401` (`TOKEN_EXPIRED`) instead of being moved onto
+  new rows, and the bundled page asks the viewer to sign in again. A token is checked when a
+  socket opens, and before schedules new data meant reconnecting; this keeps that true.
+
+Under `host` the schedule also replaces the admission's resident slot, so the next viewer opens
+on the new rows and the budget is spent against them, and moves each lease's baseline so a
+viewer is not billed for the refreshed table. `tests/refresh.rs` holds all of it over real
+sockets: two viewers at two filters repainted, a viewer whose panes did not move sent nothing,
+identical rows sending nothing to anyone, a change of columns refused, and a second app on the
+same port left alone.
 
 ## Event flow
 
@@ -163,13 +225,21 @@ sequenceDiagram
     A-->>C: Trace + only the panes that moved
     C-->>B: Patch { seq, panes, stats { visited, evaluated, untouched, micros } }
 
+    Note over C: the app's schedule read new rows
+    C->>A: rebase onto the new app + commit
+    A-->>C: Trace + only the panes that moved
+    C-->>B: Reloaded { sources, panes, stats } — or nothing, if no pane moved
+    Note over C,B: behind a front door, a connection whose token has<br/>expired is closed with 4401 instead of being moved
+
     B->>C: Close
     Note over C,A: the session is dropped — Arc<App> is not
 ```
 
 The loop is deliberately sequential: a message is read, a pass runs, a patch goes out, and
-only then is the next message read. Concurrency inside one connection would buy nothing and
-would cost the guarantee that the viewer's controls and their page describe the same epoch.
+only then is the next message read — and a refresh waits its turn the same way, between
+messages, so it never lands inside a pass the viewer asked for. Concurrency inside one
+connection would buy nothing and would cost the guarantee that the viewer's controls and their
+page describe the same epoch.
 
 ## The client
 
@@ -232,3 +302,19 @@ exist, and would let an unauthenticated request spend a core on a manifest. `cra
 decides; this crate only carries the answer. A refusal is `401` or `403` with a deliberately
 coarse body, and the detail on stderr where the operator is rather than in the body where a
 prober is. See `SECURITY.md`.
+
+**Under `host`, which names are served is decided by the source, and this crate reports it.**
+A name the source refuses as outside its domains — for `dagpane host`, anything but one label
+in front of a declared domain — is a `404` reading `no app is served at <name>: this server
+does not answer to that name`, and nothing is compiled or evicted for it. Stderr gets one line
+per refused domain — every address shares one, every bare name another — and at most
+thirty-two in all, so a forgotten `--domain` is one line to read and a prober cannot choose how
+much is written. The host socket's `Origin` check is CSRF defence and **not** the rebinding
+defence: `Origin` must be `http` or `https` and name the request's `Host`, which a page whose
+name was pointed at this machine satisfies by sending its own name as both. Under `localhost`
+the port must agree as well, when `Host` carries one, because any other local server can serve
+a page at `sales.localhost:3000`; under a `--domain` it is not compared, because behind a proxy
+`Origin` carries the public port and `Host` this process's. Not covered: `GET /` opens — and
+so may compile, and evict for — an app on a declared name without a token, which is asked for
+only at `/ws`; and the probe listener checks no `Host`. `SECURITY.md`, *`dagpane host` and DNS
+rebinding*, has all of it.

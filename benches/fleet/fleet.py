@@ -201,8 +201,9 @@ RUNTIMES: dict[str, Runtime] = {
     ),
     # The same binary, the other way round: N apps in ONE process, which is what
     # `crates/host` exists for and what the product's hosting claim is actually about.
-    # Routed by the first label of the Host header, so the driver visits `a3.localhost:PORT`
-    # and the browser resolves every `*.localhost` to loopback without a hosts file.
+    # Routed as one label in front of a declared domain, and `localhost` always is one, so the
+    # driver visits `a3.localhost:PORT` and the browser resolves every `*.localhost` to loopback
+    # without a hosts file.
     "dagpane-host": Runtime(
         name="dagpane-host",
         command=lambda port: [

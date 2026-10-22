@@ -93,7 +93,12 @@ The dotted edges are the ones CI enforces with a grep, and each of them is load-
   that test need a socket, which is exactly the test that then gets skipped.
 
 `serve` is the smallest crate here on purpose. It owns the three things that cannot exist
-without a machine — an address, a clock and a browser — and nothing else.
+without a machine — an address, a clock and a browser — and nothing else. The clock is why
+scheduled refresh lives there too: it decides *when* to re-read a source, and everything a read
+does after that is the other crates' — `app` builds the app over the new rows, `core` builds the
+graph that weighs them once and moves each session onto it, `host` replaces the resident slot.
+"Immutable, compiled once" stays true per generation: a refresh is a new graph sharing every
+computation with the old one, not a mutation of it (ADR-0011).
 
 ## 3. The pass
 
@@ -252,6 +257,17 @@ each is a place the plan would have been actively harmful if followed:
    §2 keeps that half open under the same rule that governed this trait: wait for a second
    implementation to justify it.
 
+**One method was added since, for a reason none of those had.** `allocations` reports a
+frame's storage allocation by allocation, because frames share it — a projection clones a
+column's `Arc`, a filter over a dictionary keeps the dictionary, a slice is its parent at an
+offset — and `memory_size` summed over a viewer's frames counts that sharing once for every
+frame that reaches it. `crates/host` uses it to say what a viewer holds beyond the sources they
+share. It is **defaulted**, the opposite call from `memory_size`, and the default is safe in a
+direction that matters: one allocation of `memory_size` bytes at the frame's own address, which
+is exact for a backend that owns its storage, as `Table` does, and for one that shares and does
+not override it errs **high** and never low — a viewer billed for bytes they share, never one
+whose bytes go missing.
+
 `crates/frame-arrow/tests/oracle.rs` is what holds the two backends to being
 indistinguishable, and it asserts **traces** as well as values. That is the assertion that
 makes the seam real: the short-circuit is driven by content digests, so a backend whose digest
@@ -288,7 +304,7 @@ another origin; the air-gapped case still holds because none of the four is a th
 
 ## 8. What is checked, and what is not
 
-**Checked.** 122 tests. `crates/core/tests/oracle.rs` is the one that decides whether the
+**Checked.** 609 tests. `crates/core/tests/oracle.rs` is the one that decides whether the
 rest mean anything: 200 pseudo-random graphs from a seeded in-tree LCG, 12 interactions each,
 and after every one of the 2,400 commits both a correctness assertion against a full-recompute
 oracle and an economy assertion that the pass stayed inside the structural closure. A count

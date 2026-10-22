@@ -195,6 +195,44 @@ struct Slot {
     changed_at: u64,
 }
 
+/// What waits in the queue [`Session::commit`] drains.
+///
+/// Almost always a value somebody set, which the commit weighs: one walk over it for the
+/// digest it is compared by and, for a frame, the per-column digests beside it. The other kind
+/// is a source's new starting value taken from a graph that has already weighed it — see
+/// [`Session::rebase`] — and weighing that again would hash the same table once per viewer,
+/// which is the cost a graph holds its starting values to avoid.
+#[derive(Debug)]
+enum Staged {
+    /// Set by a caller. Weighed at commit.
+    Raw(Outcome),
+    /// A graph's starting value, with what the graph already knows about it. Adopted as it
+    /// is, allocation included, so the slot shares it with the graph and with every other
+    /// session that moved onto that graph.
+    Weighed {
+        outcome: Arc<Outcome>,
+        digest: Digest,
+        grain: Option<Arc<Grain>>,
+    },
+}
+
+impl Staged {
+    /// The outcome as a slot holds it, and what it is compared by.
+    fn weighed(self) -> (Arc<Outcome>, Digest, Option<Arc<Grain>>) {
+        match self {
+            Staged::Raw(outcome) => {
+                let (digest, grain) = weigh(&outcome);
+                (Arc::new(outcome), digest, grain)
+            }
+            Staged::Weighed {
+                outcome,
+                digest,
+                grain,
+            } => (outcome, digest, grain),
+        }
+    }
+}
+
 /// One user's state: the values, and nothing else.
 ///
 /// The graph is shared (`Arc<Graph>`) and immutable; a session is a vector of slots beside
@@ -217,7 +255,7 @@ pub struct Session {
     graph: Arc<Graph>,
     slots: Vec<Slot>,
     epoch: u64,
-    staged: Vec<(CellId, Outcome)>,
+    staged: Vec<(CellId, Staged)>,
     /// Visited marks for the dirty walk, stamped with the epoch rather than cleared. Epochs
     /// only ever increase, so a stale stamp can never be mistaken for a fresh one and the
     /// walk costs nothing per pass in clearing.
@@ -371,7 +409,7 @@ impl Session {
                 found: value.type_name(),
             });
         }
-        self.stage(id, Outcome::ok(value));
+        self.stage(id, Staged::Raw(Outcome::ok(value)));
         Ok(())
     }
 
@@ -452,7 +490,7 @@ impl Session {
                         name: node.name.clone(),
                     });
                 }
-                self.stage(id, outcome);
+                self.stage(id, Staged::Raw(outcome));
                 Ok(())
             }
         }
@@ -460,12 +498,113 @@ impl Session {
 
     /// Last write wins within a pass: a client that drags a slider sends a stream of values
     /// and only the one it stopped on matters.
-    fn stage(&mut self, id: CellId, outcome: Outcome) {
+    fn stage(&mut self, id: CellId, staged: Staged) {
         if let Some(slot) = self.staged.iter_mut().find(|(c, _)| *c == id) {
-            slot.1 = outcome;
+            slot.1 = staged;
         } else {
-            self.staged.push((id, outcome));
+            self.staged.push((id, staged));
         }
+    }
+
+    /// Move this session onto `graph`: this app, with some sources' starting values replaced.
+    ///
+    /// What a scheduled refresh does to every live viewer at once. Refreshed data arrives as a
+    /// new graph — [`Graph::with_sources`] — because the graph is where a source's starting
+    /// value lives, weighed once and shared. Staging the new table on each session instead
+    /// would hash it once per viewer, and would leave every viewer pinning the old table
+    /// through the graph they were opened on, so that a long-lived page held one copy of the
+    /// data for every refresh it had sat through.
+    ///
+    /// Every source whose starting value differs between the two graphs is staged with the new
+    /// one, **unless this session holds a value of its own there** — one it set, committed or
+    /// not. (A committed value equal to the one it replaced changed nothing, so it is not one:
+    /// the session follows the refresh as though it had never set it.) A viewer's own state
+    /// survives a refresh of the data under it, which is the whole difference between a
+    /// refresh and reloading the page. Staged and not applied: the commit is the caller's, and
+    /// every replaced source lands in that one pass. Moving again before committing replaces
+    /// what the earlier move staged, so the pass lands on the newest graph.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::OtherGraph`] when `graph` is not this session's graph with new starting
+    /// values — a different cell, edge, declared type or computation anywhere — and nothing
+    /// changes. Slots are indexed by position, so carrying them onto a graph of another shape
+    /// would read every cell from the wrong place.
+    pub fn rebase(&mut self, graph: Arc<Graph>) -> Result<(), SessionError> {
+        if !self.graph.same_shape(&graph) {
+            return Err(SessionError::OtherGraph);
+        }
+        for index in 0..graph.nodes.len() {
+            let (
+                Kind::Source { initial: was, .. },
+                Kind::Source {
+                    initial: now,
+                    digest,
+                    grain,
+                    ..
+                },
+            ) = (&self.graph.nodes[index].kind, &graph.nodes[index].kind)
+            else {
+                continue;
+            };
+            // Not replaced: the new graph shares this source's allocation with the old one.
+            if Arc::ptr_eq(was, now) {
+                continue;
+            }
+            let id = CellId(index as u32);
+            // Still the old graph's starting value, by allocation and not by content: a value
+            // the session set is its own, and stays — an equal one too, while it is staged. (A
+            // committed equal value was never installed, so the slot still holds the graph's.)
+            // What is staged counts first, because it is what the next commit installs: a value
+            // staged by a caller is the session's own, and one an earlier `rebase` staged and
+            // nobody has committed yet is the old graph's — so two moves before one commit land
+            // on the newest graph's rows, not on the rows of the graph in between.
+            let untouched = match self.staged.iter().find(|(c, _)| *c == id) {
+                None => Arc::ptr_eq(&self.slots[index].outcome, was),
+                Some((_, Staged::Weighed { outcome, .. })) => Arc::ptr_eq(outcome, was),
+                Some((_, Staged::Raw(_))) => false,
+            };
+            if untouched {
+                self.stage(
+                    id,
+                    Staged::Weighed {
+                        outcome: Arc::clone(now),
+                        digest: *digest,
+                        grain: grain.clone(),
+                    },
+                );
+            }
+        }
+        self.graph = graph;
+        Ok(())
+    }
+
+    /// Put one staged value into its slot, and say whether that changed the cell.
+    ///
+    /// A value equal to the one held is not a change — that is the engine's contract, and why a
+    /// client re-sending its state recomputes nothing. A **graph's** value is taken even then,
+    /// quietly: nothing is marked and nothing recomputes, but the slot holds the new graph's
+    /// allocation rather than the one it replaced. Rows can come back — A, then B, then A
+    /// again as a new copy, moved through before one commit — and a slot that kept the first
+    /// A would pin it for good, and the next [`Session::rebase`] would take it for a value the
+    /// session set itself and leave the viewer on it while everyone else moved on.
+    fn install(&mut self, id: CellId, staged: Staged, epoch: u64) -> bool {
+        let graphs = matches!(staged, Staged::Weighed { .. });
+        let (outcome, digest, grain) = staged.weighed();
+        let slot = &mut self.slots[id.index()];
+        if slot.valid && slot.digest == digest {
+            if graphs {
+                slot.outcome = outcome;
+                slot.grain = grain;
+            }
+            return false;
+        }
+        slot.outcome = outcome;
+        slot.digest = digest;
+        slot.grain = grain;
+        slot.valid = true;
+        slot.changed_at = epoch;
+        true
     }
 
     /// Apply everything staged and recompute exactly what depends on whatever actually
@@ -481,19 +620,11 @@ impl Session {
         let staged = std::mem::take(&mut self.staged);
         let mut roots: Vec<CellId> = Vec::with_capacity(staged.len());
         let mut root_names: Vec<String> = Vec::with_capacity(staged.len());
-        for (id, outcome) in staged {
-            let (digest, grain) = weigh(&outcome);
-            let slot = &mut self.slots[id.index()];
-            if slot.valid && slot.digest == digest {
-                continue;
+        for (id, staged) in staged {
+            if self.install(id, staged, epoch) {
+                roots.push(id);
+                root_names.push(self.graph.name(id).to_string());
             }
-            slot.outcome = Arc::new(outcome);
-            slot.digest = digest;
-            slot.grain = grain;
-            slot.valid = true;
-            slot.changed_at = epoch;
-            roots.push(id);
-            root_names.push(self.graph.name(id).to_string());
         }
 
         if roots.is_empty() {
@@ -529,18 +660,10 @@ impl Session {
         let epoch = self.epoch;
         let staged = std::mem::take(&mut self.staged);
         let mut root_names = Vec::new();
-        for (id, outcome) in staged {
-            let (digest, grain) = weigh(&outcome);
-            let slot = &mut self.slots[id.index()];
-            if slot.valid && slot.digest == digest {
-                continue;
+        for (id, staged) in staged {
+            if self.install(id, staged, epoch) {
+                root_names.push(self.graph.name(id).to_string());
             }
-            slot.outcome = Arc::new(outcome);
-            slot.digest = digest;
-            slot.grain = grain;
-            slot.valid = true;
-            slot.changed_at = epoch;
-            root_names.push(self.graph.name(id).to_string());
         }
         let plan: Vec<CellId> = self.graph.order().to_vec();
         let closure_size = plan.len();
@@ -892,7 +1015,7 @@ fn constraint_still_holds(c: &RowKey, slot: &Slot, grain: &Grain) -> bool {
 /// `outcome.digest()` would absorb — `weigh_agrees_with_the_plain_digest` in `tests/reactive.rs`
 /// is what holds that, because the two are written out separately and nothing but a test
 /// stops them drifting.
-fn weigh(outcome: &Outcome) -> (Digest, Option<Arc<Grain>>) {
+pub(crate) fn weigh(outcome: &Outcome) -> (Digest, Option<Arc<Grain>>) {
     if let Outcome::Value {
         value: Value::Frame { v },
     } = outcome
@@ -965,7 +1088,7 @@ fn debug_assert_trace(trace: &Trace, closure_size: usize) {
 ///
 /// The check exists because the alternative is a type error surfacing inside somebody's
 /// compute function, three cells away from the socket that caused it.
-fn type_compatible(declared: &'static str, incoming: &Value) -> bool {
+pub(crate) fn type_compatible(declared: &'static str, incoming: &Value) -> bool {
     match (declared, incoming.type_name()) {
         ("null", _) => true,
         ("float", "int") => true,

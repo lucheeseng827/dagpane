@@ -80,8 +80,10 @@ fn two_parties_on_one_graph_do_not_observe_each_other() {
     src.publish("globex.example.com", &b, &text, dir.path());
 
     let host = Host::new(src.clone(), budget());
-    let mut session_a = host.session("acme.example.com").unwrap();
-    let mut session_b = host.session("globex.example.com").unwrap();
+    // Named, not `_`: a lease bound to `_` drops at once, and these sessions are live for the
+    // whole of the test.
+    let (mut session_a, _lease_a) = host.session("acme.example.com").unwrap();
+    let (mut session_b, _lease_b) = host.session("globex.example.com").unwrap();
 
     session_a.refresh();
     session_b.refresh();

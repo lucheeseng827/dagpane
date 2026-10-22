@@ -1,7 +1,7 @@
 # Explicit fields, no `workspace = true` inheritance — same reason as the other crates.
 [package]
 name = "dagpane-serve"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/dagpane"
@@ -17,13 +17,13 @@ default = ["arrow-sources"]
 arrow-sources = ["dagpane-app/arrow-sources", "dagpane-host/arrow-sources"]
 
 [dependencies]
-dagpane-app = { path = "../app", version = "0.1.1", default-features = false }
+dagpane-app = { path = "../app", version = "0.2.0", default-features = false }
 # Multi-app serving. `host` owns no socket and this crate owns no map, which is why the
 # arrow points this way and not the other.
-dagpane-host = { path = "../host", version = "0.1.1", default-features = false }
+dagpane-host = { path = "../host", version = "0.2.0", default-features = false }
 # The front door. No HTTP client comes with it — see that crate's manifest.
-dagpane-auth = { path = "../auth", version = "0.1.1" }
-dagpane-core = { path = "../core", version = "0.1.1" }
+dagpane-auth = { path = "../auth", version = "0.2.0" }
+dagpane-core = { path = "../core", version = "0.2.0" }
 axum = { version = "0.8", features = ["ws", "json"] }
 # `signal` is `SIGTERM` as well as Ctrl-C, `sync` is the watch channel the probe listener
 # and the drain share their state through, and `time` is the drain window itself.

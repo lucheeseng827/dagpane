@@ -1,7 +1,7 @@
 # Explicit fields, no `workspace = true` inheritance — same reason as `dagpane-core`.
 [package]
 name = "dagpane-app"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/dagpane"
@@ -25,12 +25,12 @@ sql = ["dagpane-connect/sql"]
 # BENCHMARKS.md. Behind a default-on feature so the lean binary stays reachable: the two
 # paths are observably identical (the cross-backend oracle asserts it), so this is a size
 # knob and never a behaviour one.
-dagpane-frame-arrow = { path = "../frame-arrow", version = "0.1.1", optional = true }
-dagpane-core = { path = "../core", version = "0.1.1" }
+dagpane-frame-arrow = { path = "../frame-arrow", version = "0.2.0", optional = true }
+dagpane-core = { path = "../core", version = "0.2.0" }
 # Where a source's rows come from. `connect` sits beside `core` under this crate rather
 # than inside it: `app` decides what a pane is, `connect` decides what a row is, and
 # neither needs the other's vocabulary.
-dagpane-connect = { path = "../connect", version = "0.1.1", default-features = false }
+dagpane-connect = { path = "../connect", version = "0.2.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

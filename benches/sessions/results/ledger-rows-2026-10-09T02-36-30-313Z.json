@@ -1,0 +1,379 @@
+{
+  "machine": {
+    "host": "vm",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "mem_total_bytes": 16876494848,
+    "kernel": "Linux version 6.18.44-fc-v80 (builder@sandboxing) (gcc (GCC) 15.3.0, GNU ld (GNU Binutils) 2.46) #1 SMP PREEMPT_DYNAMIC @0"
+  },
+  "provenance": {
+    "command": "target/release/dagpane host /tmp/tmp.WuV2yIbEQJ/rows --port 8821 --admin-port 9821 --admin-bind 127.0.0.1 --heartbeat-seconds 0 --idle-minutes 0",
+    "binary": "target/release/dagpane",
+    "binary_bytes": 4311240,
+    "binary_sha256": "b45f945dcea83079a6d23d4ba6f218d44ef51d332e6740f050b36b7296e95c67",
+    "libc": "glibc",
+    "linkage": "linux-vdso.so.1 (0x00007f44e7e6e000)\n\tlibgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1 (0x00007f44e7e2f000)\n\tlibm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x00007f44e7917000)\n\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f44e7600000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f44e7e70000)",
+    "libc_evidence": {
+      "ldd": "linux-vdso.so.1 (0x00007f44e7e6e000)",
+      "static": false,
+      "glibc_markers_in_binary": true,
+      "musl_markers_in_binary": false,
+      "path_names_musl_triple": false
+    },
+    "revision": "5eca0555042fc745d72490853b987eee772155f9",
+    "dirty": false,
+    "untracked_files": 1,
+    "node": "v22.22.2",
+    "malloc_env": {
+      "MALLOC_ARENA_MAX": null,
+      "MALLOC_TRIM_THRESHOLD_": null,
+      "MALLOC_MMAP_THRESHOLD_": null
+    }
+  },
+  "when": "2026-10-09T02:36:30.287Z",
+  "app": "fixture:rows.toml",
+  "manifest_sha256": "fa08241ec0095817fd3d823f27f8657cc831133fb927b6bfe3739154bcb5f904",
+  "csv_bytes": 7936950,
+  "csv_sha256": "cf19426300e60e4bacdbeeede2bde86eae04c31cd18d9818bf8ba4cb01ed511a",
+  "settle_ms": 700,
+  "samples_per_rung": 5,
+  "rungs": [
+    {
+      "sessions": 0,
+      "rss": 14065664,
+      "pss": 12254208,
+      "samples": [
+        {
+          "rss": 14065664,
+          "pss": 12254208
+        },
+        {
+          "rss": 14065664,
+          "pss": 12254208
+        },
+        {
+          "rss": 14065664,
+          "pss": 12254208
+        },
+        {
+          "rss": 14065664,
+          "pss": 12254208
+        },
+        {
+          "rss": 14065664,
+          "pss": 12254208
+        }
+      ],
+      "ledger_bytes": 0,
+      "source_bytes": 7962180,
+      "held_after_eviction": 0
+    },
+    {
+      "sessions": 1,
+      "rss": 31236096,
+      "pss": 29424640,
+      "samples": [
+        {
+          "rss": 31236096,
+          "pss": 29424640
+        },
+        {
+          "rss": 31236096,
+          "pss": 29424640
+        },
+        {
+          "rss": 31236096,
+          "pss": 29424640
+        },
+        {
+          "rss": 31236096,
+          "pss": 29424640
+        },
+        {
+          "rss": 31236096,
+          "pss": 29424640
+        }
+      ],
+      "ledger_bytes": 7202913,
+      "source_bytes": 7962180,
+      "held_after_eviction": 0
+    },
+    {
+      "sessions": 2,
+      "rss": 38436864,
+      "pss": 36625408,
+      "samples": [
+        {
+          "rss": 38436864,
+          "pss": 36625408
+        },
+        {
+          "rss": 38436864,
+          "pss": 36625408
+        },
+        {
+          "rss": 38436864,
+          "pss": 36625408
+        },
+        {
+          "rss": 38436864,
+          "pss": 36625408
+        },
+        {
+          "rss": 38436864,
+          "pss": 36625408
+        }
+      ],
+      "ledger_bytes": 14405826,
+      "source_bytes": 7962180,
+      "held_after_eviction": 0
+    },
+    {
+      "sessions": 4,
+      "rss": 65515520,
+      "pss": 63704064,
+      "samples": [
+        {
+          "rss": 65515520,
+          "pss": 63704064
+        },
+        {
+          "rss": 65515520,
+          "pss": 63704064
+        },
+        {
+          "rss": 65515520,
+          "pss": 63704064
+        },
+        {
+          "rss": 65515520,
+          "pss": 63704064
+        },
+        {
+          "rss": 65515520,
+          "pss": 63704064
+        }
+      ],
+      "ledger_bytes": 28811652,
+      "source_bytes": 7962180,
+      "held_after_eviction": 0
+    },
+    {
+      "sessions": 8,
+      "rss": 95113216,
+      "pss": 93301760,
+      "samples": [
+        {
+          "rss": 95113216,
+          "pss": 93301760
+        },
+        {
+          "rss": 95113216,
+          "pss": 93301760
+        },
+        {
+          "rss": 95113216,
+          "pss": 93301760
+        },
+        {
+          "rss": 95113216,
+          "pss": 93301760
+        },
+        {
+          "rss": 95113216,
+          "pss": 93301760
+        }
+      ],
+      "ledger_bytes": 57623304,
+      "source_bytes": 7962180,
+      "held_after_eviction": 0
+    },
+    {
+      "sessions": 16,
+      "rss": 153526272,
+      "pss": 151714816,
+      "samples": [
+        {
+          "rss": 153526272,
+          "pss": 151714816
+        },
+        {
+          "rss": 153526272,
+          "pss": 151714816
+        },
+        {
+          "rss": 153526272,
+          "pss": 151714816
+        },
+        {
+          "rss": 153526272,
+          "pss": 151714816
+        },
+        {
+          "rss": 153526272,
+          "pss": 151714816
+        }
+      ],
+      "ledger_bytes": 115246608,
+      "source_bytes": 7962180,
+      "held_after_eviction": 0
+    },
+    {
+      "sessions": 32,
+      "rss": 271642624,
+      "pss": 269831168,
+      "samples": [
+        {
+          "rss": 271642624,
+          "pss": 269831168
+        },
+        {
+          "rss": 271642624,
+          "pss": 269831168
+        },
+        {
+          "rss": 271642624,
+          "pss": 269831168
+        },
+        {
+          "rss": 271642624,
+          "pss": 269831168
+        },
+        {
+          "rss": 271642624,
+          "pss": 269831168
+        }
+      ],
+      "ledger_bytes": 230493216,
+      "source_bytes": 7962180,
+      "held_after_eviction": 0
+    },
+    {
+      "sessions": 64,
+      "rss": 504152064,
+      "pss": 502340608,
+      "samples": [
+        {
+          "rss": 504152064,
+          "pss": 502340608
+        },
+        {
+          "rss": 504152064,
+          "pss": 502340608
+        },
+        {
+          "rss": 504152064,
+          "pss": 502340608
+        },
+        {
+          "rss": 504152064,
+          "pss": 502340608
+        },
+        {
+          "rss": 504152064,
+          "pss": 502340608
+        }
+      ],
+      "ledger_bytes": 460986432,
+      "source_bytes": 7962180,
+      "held_after_eviction": 0
+    },
+    {
+      "sessions": 128,
+      "rss": 978968576,
+      "pss": 977157120,
+      "samples": [
+        {
+          "rss": 978968576,
+          "pss": 977157120
+        },
+        {
+          "rss": 978968576,
+          "pss": 977157120
+        },
+        {
+          "rss": 978968576,
+          "pss": 977157120
+        },
+        {
+          "rss": 978968576,
+          "pss": 977157120
+        },
+        {
+          "rss": 978968576,
+          "pss": 977157120
+        }
+      ],
+      "ledger_bytes": 921972864,
+      "source_bytes": 7962180,
+      "held_after_eviction": 0
+    },
+    {
+      "sessions": 256,
+      "rss": 1919905792,
+      "pss": 1918094336,
+      "samples": [
+        {
+          "rss": 1919905792,
+          "pss": 1918094336
+        },
+        {
+          "rss": 1919905792,
+          "pss": 1918094336
+        },
+        {
+          "rss": 1919905792,
+          "pss": 1918094336
+        },
+        {
+          "rss": 1919905792,
+          "pss": 1918094336
+        },
+        {
+          "rss": 1919905792,
+          "pss": 1918094336
+        }
+      ],
+      "ledger_bytes": 1843945728,
+      "source_bytes": 7962180,
+      "held_after_eviction": 0
+    },
+    {
+      "sessions": 512,
+      "rss": 3803688960,
+      "pss": 3801818112,
+      "samples": [
+        {
+          "rss": 3803688960,
+          "pss": 3801818112
+        },
+        {
+          "rss": 3803688960,
+          "pss": 3801818112
+        },
+        {
+          "rss": 3803688960,
+          "pss": 3801818112
+        },
+        {
+          "rss": 3803688960,
+          "pss": 3801818112
+        },
+        {
+          "rss": 3803688960,
+          "pss": 3801818112
+        }
+      ],
+      "ledger_bytes": 3687891456,
+      "source_bytes": 7962180,
+      "held_after_eviction": 0
+    }
+  ],
+  "source_bytes": 7962180,
+  "marginal_rss_bytes_per_session": 7369303.305214438,
+  "marginal_pss_bytes_per_session": 7369203.935370344,
+  "ledger_bytes_per_session": 7202913,
+  "ledger_same_for_every_viewer": true,
+  "unseen_rss_bytes_per_session": 166390.30521443766,
+  "fixed_rss_bytes": 14065664
+}

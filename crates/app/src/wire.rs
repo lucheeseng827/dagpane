@@ -144,6 +144,26 @@ pub enum ServerMessage {
         /// What the pass cost.
         stats: PassStats,
     },
+    /// The data under the page moved: a scheduled refresh re-read a source, and the pass it
+    /// caused in this viewer's session changed what they see.
+    ///
+    /// Sent **unasked**, which is the whole difference from `Patch`. It answers no message, so
+    /// it carries no `seq` — and a client with a `Set` in flight must go on waiting for the
+    /// `Patch` that does answer it, rather than take this for the reply. It is only ever sent
+    /// with at least one pane in it: a refresh that moved nothing this viewer can see puts
+    /// nothing on their wire, so a nightly export that produced yesterday's numbers again
+    /// repaints nothing and does not even reset the stats line.
+    Reloaded {
+        /// The sources whose new rows started the pass, by cell name — the roots of the trace.
+        sources: Vec<String>,
+        /// Only the panes whose rendered view changed, as in a `Patch`.
+        panes: Vec<PaneUpdate>,
+        /// The boundary cells that moved, as in a `Patch`. Empty on an unsplit app.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frontier: Vec<BoundaryValue>,
+        /// What the pass cost, in this viewer's session.
+        stats: PassStats,
+    },
     /// Every pane's current view, in answer to a `Refresh`.
     ///
     /// Distinct from `Patch` because a refresh **runs no pass**: it re-renders state the

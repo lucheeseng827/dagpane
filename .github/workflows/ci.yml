@@ -132,7 +132,7 @@ jobs:
       # This job used to assert only that `dagpane-core` COMPILES for wasm32, which held the
       # core to no filesystem, no clock and no threads and proved nothing about a browser.
       # It now builds the artefact a page actually loads and drives it in a real WebAssembly
-      # engine — the four `extern "C"` exports, the hand-written length prefix and the
+      # engine — the five `extern "C"` exports, the hand-written length prefix and the
       # JavaScript that has to agree with both, which is the seam a hand-rolled ABI breaks at.
       #
       # `run.sh` also exports the bundled example and drives THAT, which is what asserts the
@@ -203,6 +203,67 @@ jobs:
           # The app is therefore mounted, which is also how anybody would really run this.
           docker run --rm dagpane:ci --version
           docker run --rm -v "$PWD/examples:/app:ro" dagpane:ci check /app/sales.toml
+
+      # The same step runs against the image about to be published, in .github/workflows/docker.yml, before
+      # anything is pushed.
+      # Keep the two `run:` bodies identical; only REF differs.
+      - name: a browser can open the socket, and docker stop stops it
+        env:
+          REF: dagpane:ci
+        run: |
+          set -euo pipefail
+          # A browser-shaped upgrade, which `--version` and `check` never were. The documented
+          # `docker run` served a page whose socket refused every browser (the bound address
+          # was the only origin, and a browser never names 0.0.0.0), and nothing caught it,
+          # because the image was only ever asked those two questions.
+          cleanup() {
+            rc=$?
+            [ "$rc" = 0 ] || docker logs dagpane-smoke || true
+            docker rm -f dagpane-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run -d --name dagpane-smoke -p 8787:8787 -p 9787:9787 \
+            -v "$PWD/examples:/app:ro" "$REF" \
+            serve /app/sales.toml --origin http://localhost:8787 --drain-seconds 1
+
+          ready=""
+          for _ in $(seq 100); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+              http://127.0.0.1:9787/readyz || true)
+            if [ "$code" = 200 ]; then ready=1; break; fi
+            sleep 0.2
+          done
+          [ -n "$ready" ] || { echo "::error::/readyz never answered 200"; exit 1; }
+
+          # --max-time because a successful upgrade holds the socket open: curl may then exit
+          # 28 having already printed 101, so the status is read and the exit code is not.
+          upgrade() {
+            curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+              -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+              -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+              -H "Origin: $1" http://127.0.0.1:8787/ws || true
+          }
+          expect() {
+            got=$(upgrade "$2")
+            echo "Origin $2 -> $got"
+            [ "$got" = "$1" ] || { echo "::error::Origin $2 got $got, expected $1"; exit 1; }
+          }
+          expect 101 http://localhost:8787   # the origin it was given
+          expect 403 https://evil.example    # any other page
+          expect 403 http://0.0.0.0:8787     # the bind's own: --origin replaces it, not adds
+
+          # And it stops on the signal every supervisor sends. The binary is PID 1 on scratch,
+          # where SIGTERM has no default action: unhandled, `docker stop` waits out its whole
+          # grace period and then SIGKILLs, which shows as exit code 137 rather than 0.
+          # In milliseconds, and under the 5 s default drain, so a binary that ignored
+          # --drain-seconds fails here too rather than passing on a rounded-down second.
+          start=$(date +%s%N)
+          docker stop -t 10 dagpane-smoke >/dev/null
+          took=$(( ($(date +%s%N) - start) / 1000000 ))
+          code=$(docker inspect -f '{{.State.ExitCode}}' dagpane-smoke)
+          echo "docker stop: ${took} ms, exit ${code}"
+          [ "$code" = 0 ] || { echo "::error::exit ${code} after docker stop: SIGTERM went unhandled"; exit 1; }
+          [ "$took" -le 4000 ] || { echo "::error::docker stop took ${took} ms with a 1 s drain"; exit 1; }
 
   invariants:
     name: architecture invariants

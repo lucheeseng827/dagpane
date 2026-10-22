@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{decode, decode_header, Validation};
 use serde::Deserialize;
@@ -261,6 +262,7 @@ impl Policy {
             name: claims.name,
             email: claims.email,
             apps,
+            until: claims.exp.saturating_add(self.leeway_seconds),
         })
     }
 }
@@ -282,6 +284,9 @@ pub struct Viewer {
     /// The `email` claim, when the provider sent one.
     pub email: Option<String>,
     apps: Apps,
+    /// The last second, since the epoch, that the token would still be admitted in: its `exp`
+    /// and the policy's leeway.
+    until: u64,
 }
 
 impl Viewer {
@@ -294,6 +299,22 @@ impl Viewer {
             Apps::All => true,
             Apps::Only(listed) => listed.contains(app),
         }
+    }
+
+    /// Whether the token this viewer was admitted on would be refused at `at`: its `exp` has
+    /// passed by more than the leeway admission allows.
+    ///
+    /// Admission is a moment — a token is checked when a connection opens — and a connection
+    /// can outlive it. What such a connection may still be sent is the caller's decision
+    /// (`dagpane-serve` sends it no new data), and this answers the question without keeping
+    /// the token around to verify again. The arithmetic is admission's own, whole seconds and
+    /// all, so a token this calls expired is one [`Policy::admit`] would refuse: a caller that
+    /// closes a connection on it never sends a viewer to sign in when reconnecting would do.
+    pub fn expired(&self, at: SystemTime) -> bool {
+        let now = at
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        now > self.until
     }
 }
 
@@ -314,6 +335,9 @@ struct Claims {
     name: Option<String>,
     #[serde(default)]
     email: Option<String>,
+    /// Required, and checked, by the validation in [`Policy::admit`]; kept so a connection can
+    /// ask later whether the token it opened on still is one.
+    exp: u64,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
 }

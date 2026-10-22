@@ -71,14 +71,14 @@ struct Args {
 
     /// The `Host` header to send, with `{i}` replaced by the app's 1-based number.
     ///
-    /// Required to reach a `dagpane host` fleet, which routes on the header's first label —
-    /// `a{i}.localhost`. Omitted means talk to `--addr` directly, which is what a single
-    /// `dagpane run` wants.
+    /// Required to reach a `dagpane host` fleet, which answers only `<app>.localhost` and
+    /// `<app>.<--domain>` — `a{i}.localhost` here. Omitted means talk to `--addr` directly,
+    /// which is what a single `dagpane run` wants.
     ///
     /// **Explicit rather than inferred from `--apps`.** An earlier version switched on
     /// `apps > 1`, which is a rule about a count and not about the server: it silently sent
-    /// `Host: 127.0.0.1:PORT` at a one-app host fleet, whose first label is `127`, and got a
-    /// 404 that looks like the server being broken.
+    /// `Host: 127.0.0.1:PORT` at a one-app host fleet, which refuses an address as a name, and
+    /// got a 404 that looks like the server being broken.
     #[arg(long)]
     host_pattern: Option<String>,
 
@@ -196,8 +196,8 @@ async fn open(addr: &str, host: Option<&str>) -> Result<(WebSocket, String, Stri
             // `dagpane host` answers 404 for a name it routes nothing at, so the status alone
             // reads as a broken server when it is really a wrong Host header.
             None => format!(
-                "upgrade: {e}\n  If this server is a `dagpane host` fleet it routes on the \
-                 Host header's first label, and none was sent. Pass \
+                "upgrade: {e}\n  If this server is a `dagpane host` fleet it answers only \
+                 <app>.localhost and <app>.<--domain>, and the address was sent instead. Pass \
                  --host-pattern 'a{{i}}.localhost'."
             ),
             Some(name) => format!("upgrade to {name}: {e}"),

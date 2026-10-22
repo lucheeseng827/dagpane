@@ -426,6 +426,23 @@ impl Graph {
         matches!(self.nodes[id.index()].kind, Kind::Source { .. })
     }
 
+    /// A source's starting value: what every session over this graph begins with in that
+    /// cell. `None` for a computed cell, which has no starting value.
+    ///
+    /// For a source loaded from data this **is** the data — the one allocation every session
+    /// shares until it sets something of its own — and a refresh asks it what shape the data
+    /// has, so that new rows can be refused for having a different one.
+    ///
+    /// # Panics
+    ///
+    /// If the id is from another graph.
+    pub fn initial(&self, id: CellId) -> Option<&crate::session::Outcome> {
+        match &self.nodes[id.index()].kind {
+            Kind::Source { initial, .. } => Some(initial),
+            Kind::Computed { .. } => None,
+        }
+    }
+
     /// The cell's declared inputs, in declaration order — the order its compute sees them in
     /// [`Inputs`].
     ///
@@ -462,6 +479,120 @@ impl Graph {
     /// Every cell, in evaluation order.
     pub fn order(&self) -> &[CellId] {
         &self.order
+    }
+
+    /// This graph with some sources' starting values replaced — which is what refreshing an
+    /// app's data is.
+    ///
+    /// Everything else is shared rather than copied: every computation is the same `Arc`,
+    /// every source not named keeps its allocation, and the cells, edges and heights are this
+    /// graph's. That is what lets a session opened on this graph move onto the new one with
+    /// [`crate::Session::rebase`]. Each new value is weighed here, once — its digest and, for
+    /// a frame, the per-column digests every session compares against — exactly as
+    /// [`GraphBuilder::source`] weighs a starting value, so that no session ever has to.
+    ///
+    /// A value whose digest equals the one its source already holds is **not a change**: the
+    /// source keeps the allocation it has and the new one is dropped. When that is true of
+    /// every value — a file rewritten with the bytes it already had — there is nothing to
+    /// build and the answer is `None`, so that an unchanged refresh costs the sessions over
+    /// this graph nothing at all. Naming a source twice keeps the last value, as staging does.
+    ///
+    /// # Errors
+    ///
+    /// A [`crate::SessionError`] for the first value that could not be a starting value here —
+    /// an unknown cell, a computed one, or a type the source was not declared with — the same
+    /// three a session would give for setting it. Nothing is built.
+    pub fn with_sources<'a>(
+        &self,
+        values: impl IntoIterator<Item = (&'a str, Value)>,
+    ) -> Result<Option<Graph>, crate::error::SessionError> {
+        use crate::error::SessionError;
+
+        let mut kinds: Vec<Option<Kind>> = (0..self.nodes.len()).map(|_| None).collect();
+        for (name, value) in values {
+            let id = self
+                .id(name)
+                .ok_or_else(|| SessionError::UnknownCell(name.to_string()))?;
+            let node = &self.nodes[id.index()];
+            let Kind::Source {
+                digest: held,
+                declared,
+                ..
+            } = &node.kind
+            else {
+                return Err(SessionError::NotAnInput {
+                    name: node.name.clone(),
+                });
+            };
+            if !crate::session::type_compatible(declared, &value) {
+                return Err(SessionError::TypeMismatch {
+                    name: node.name.clone(),
+                    expected: declared,
+                    found: value.type_name(),
+                });
+            }
+            let outcome = crate::session::Outcome::ok(value);
+            // One walk over the data for both digests, which is what a commit does with a value
+            // a caller set — and agrees with `GraphBuilder::source`'s two walks by the test
+            // `weigh_agrees_with_the_plain_digest`.
+            let (digest, grain) = crate::session::weigh(&outcome);
+            kinds[id.index()] = (digest != *held).then(|| Kind::Source {
+                initial: Arc::new(outcome),
+                digest,
+                grain,
+                declared,
+            });
+        }
+        if kinds.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+
+        let nodes = self
+            .nodes
+            .iter()
+            .zip(kinds)
+            .map(|(node, kind)| Node {
+                name: node.name.clone(),
+                kind: kind.unwrap_or_else(|| node.clone_kind()),
+                inputs: node.inputs.clone(),
+                input_names: node.input_names.clone(),
+                height: node.height,
+                dependents: node.dependents.clone(),
+            })
+            .collect();
+        Ok(Some(Graph {
+            nodes,
+            by_name: self.by_name.clone(),
+            order: self.order.clone(),
+        }))
+    }
+
+    /// Whether `other` has this graph's cells, edges, declared types and computations — that
+    /// is, whether it could differ from this one only in its sources' starting values.
+    ///
+    /// Computations are compared by **allocation**: two compiles of one manifest build two sets
+    /// of closures that happen to do the same thing, and nothing here can tell that they do.
+    /// [`Graph::with_sources`] shares every one of them, which is the only way to get a graph
+    /// this says yes to.
+    pub(crate) fn same_shape(&self, other: &Graph) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        self.nodes.len() == other.nodes.len()
+            && self.order == other.order
+            && self.nodes.iter().zip(&other.nodes).all(|(a, b)| {
+                a.name == b.name
+                    && a.inputs == b.inputs
+                    && match (&a.kind, &b.kind) {
+                        (Kind::Source { declared: x, .. }, Kind::Source { declared: y, .. }) => {
+                            x == y
+                        }
+                        (Kind::Computed { compute: x }, Kind::Computed { compute: y }) => {
+                            Arc::ptr_eq(x, y)
+                        }
+                        _ => false,
+                    }
+            })
     }
 
     /// Whether this id addresses a cell of this graph. Ids are bare indices, so this is the

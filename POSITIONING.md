@@ -1,10 +1,10 @@
 # dagpane — positioning
 
 *Written 2026-09-08, against the survey in COMPETITORS.md and against this checkout at
-v0.1.0. Every claim about dagpane below was produced by a command in this repository; every
-claim about anything else carries a date. The paragraph this file opens with is a deliberate
-narrowing of the one the prior-art dossier offered, and §1 says which parts were cut and
-why.*
+v0.1.0; §3 now grades 0.2.0. Every claim about dagpane below was produced by a command in
+this repository; every claim about anything else carries a date. The paragraph this file
+opens with is a deliberate narrowing of the one the prior-art dossier offered, and §1 says
+which parts were cut and why.*
 
 ---
 
@@ -41,17 +41,22 @@ dagpane has not built them.** They are roadmap, not positioning:
   example. The predicate half is built too: a filter change that does not move the result set
   costs nothing. ADR-0006 has the design, the two conditions a constraint rests on, and what
   it costs.
-* **Engine placement decided at deploy time.** `cargo check -p dagpane-core --target
-  wasm32-unknown-unknown` exits 0 and CI runs it. That is the entire claim. There is no
-  `crates/wasm`, no wasm-bindgen, no client-side compute, and nothing has ever executed in a
-  browser. Perspective 5.3.1 (2026-09-04, Apache-2.0, OpenJS Foundation) already ships
-  symmetric client/server WASM compute with a memory64 build past 4 GB; dagpane does not
-  compete there and must not imply it does.
+* **Engine placement decided at deploy time.** **Half built, and not the half this entry
+  meant.** Through 0.1.1 the entire claim was that `cargo check -p dagpane-core --target
+  wasm32-unknown-unknown` exits 0. 0.2.0 ships `crates/wasm` and `dagpane export`, so an app
+  can run *wholly* in a page, as WebAssembly with no server behind it. Placement per cell is
+  not served: `place = "client"` is checked and reported, and `run`, `serve` and `export`
+  still evaluate every cell on one side (ADR-0008). Perspective 5.3.1 (2026-09-04,
+  Apache-2.0, OpenJS Foundation) already ships symmetric client/server WASM compute with a
+  memory64 build past 4 GB; dagpane does not compete there and must not imply it does.
 * **Serialisable session state that removes the sticky-session requirement.** dagpane has no
   session state to serialise. A session is a WebSocket connection; closing the tab discards
   it; there is no store, no eviction, no TTL, no reconnection token. That does dodge marimo's
   sticky-session problem, but by having nothing worth preserving across a reconnect rather
-  than by making state portable. It is a smaller claim and it is the true one.
+  than by making state portable. It is a smaller claim and it is the true one. From 0.2.0 the
+  page keeps its control values in its URL fragment and replays them when it connects — a
+  session *is* its input values — so a reload, or a reconnect that lands on another replica,
+  comes back to the same view, and the server still holds nothing.
 
 ---
 
@@ -103,7 +108,7 @@ become true for it to stop being decisive, and §3 grades them strictly.
 
 ---
 
-## 3. The four conditions, and where v0.1.0 actually stands
+## 3. The four conditions, and where 0.2.0 actually stands
 
 All four, not any. The dossier was explicit about that, and the grades below are deliberately
 harsh — a condition marked partly met is a condition not met.
@@ -128,16 +133,18 @@ met"* while it said no figure existed; all three now do.
   for Streamlit and 106.6 MB for marimo — 385× and 433×. `benches/fleet/`.
 * **`dagpane host` is the multiplexing story**, and it is what makes that 0.25 MB figure a
   figure rather than a hope: 400 apps is one process. The line that used to stand here — *"the
-  multiplexing story does not exist"* — has been false since `crates/host` shipped.
+  multiplexing story does not exist"* — has been false since `crates/host` landed, and
+  0.2.0 is the first release with it.
 
 **What is still honest to say against it** is narrower and it is about a term nobody had
 priced. A session's cost is what its pipeline **materialises**, not what its app sources: on
 identical data, a row-keeping pipeline costs 7 248 kB per viewer and an aggregating one 145 kB,
 50× apart. The sources really are shared — that is what the 145 kB proves — but a hundred
 viewers of a row-keeping app are a hundred materialised frames, and `--budget-mb` counts
-neither. So the apps-per-core figure is a figure about *apps*, and a plan that multiplies it by
-viewers without reading §"What one more viewer costs" will be wrong in the direction that
-costs money.
+neither. `dagpane host` now reports what they hold, per app and checked against the kernel's
+figure, but a report is not a budget. So the apps-per-core figure is a figure about *apps*, and
+a plan that multiplies it by viewers without reading §"What one more viewer costs" will be wrong
+in the direction that costs money.
 
 ### Condition 2 — nobody writes Rust
 
@@ -187,9 +194,9 @@ changed 1 column of a 122-column frame; recomputed 0 of 11 cells
 ```
 
 — on `examples/apps/19-wide-telemetry.toml`, for a column the page does not read, with the
-whole table having genuinely changed. Moving a column three cells filter on recomputes three.
-That is the form the dossier asked for, on a real app, out of the tool rather than out of a
-benchmark harness.
+whole table having genuinely changed. Moving `cpu0_user`, which three cells filter on and a
+fourth ranks by, can recompute only those four and the cells below them. That is the form the
+dossier asked for, on a real app, out of the tool rather than out of a benchmark harness.
 
 The oracle that was described here as a foundation is now load-bearing: `crates/core/tests/oracle.rs`
 gained 120 random graphs over wide frames with one column rewritten per interaction, asserting

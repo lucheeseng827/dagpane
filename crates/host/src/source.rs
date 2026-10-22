@@ -5,14 +5,14 @@
 //! something else is a directory of manifests in the open-source case and a registry in a
 //! managed one, and neither of them is this crate's business.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use crate::error::HostError;
-use crate::key::{manifest_digest, AppId, AppKey};
+use crate::key::{manifest_digest, AppId, AppKey, Domain};
 
 /// A manifest as bytes, plus the directory its relative paths resolve against.
 ///
@@ -57,9 +57,19 @@ pub trait AppSource: Send + Sync + fmt::Debug {
     /// The header arrives already lowered and stripped of its port — see
     /// [`normalise_host`], which [`crate::Host`] applies before calling this.
     ///
+    /// **This is the boundary for which names are served at all, and an implementation must
+    /// answer only names its operator declared.** A `Host` header is chosen by whoever controls
+    /// DNS for the name: a page whose name was pointed at this machine sends that name as
+    /// both `Host` and `Origin`, so the socket's check that the two agree passes, and nothing
+    /// after this call can tell the request from a real one. An exact table of names, as
+    /// [`MemAppSource`] keeps, is bounded by construction; a pattern — a label, a suffix, a
+    /// fallback app — must be bounded to declared names, as [`DirAppSource`]'s
+    /// `<label>.<declared domain>` is, and must refuse before any I/O.
+    ///
     /// # Errors
     ///
-    /// [`HostError::UnknownHost`] when nothing is routed there.
+    /// [`HostError::OutsideDomains`] when the name is outside every name this source answers
+    /// for, and [`HostError::UnknownHost`] when it is inside them and nothing is routed there.
     fn resolve(&self, host: &str) -> Result<AppKey, HostError>;
 
     /// The manifest this key names.
@@ -68,6 +78,16 @@ pub trait AppSource: Send + Sync + fmt::Debug {
     ///
     /// [`HostError::NotFound`] when the key names nothing this source has.
     fn fetch(&self, key: &AppKey) -> Result<ManifestBytes, HostError>;
+
+    /// The domains this source answers one label under, if it answers by pattern at all.
+    ///
+    /// For saying why a name was refused — `x.sales.example.com` is one label too many under
+    /// a declared `example.com`, not a domain somebody forgot to declare — and never for
+    /// deciding whether to serve one, which is [`AppSource::resolve`]'s alone. The default,
+    /// right for a source that answers an exact table of names, is none.
+    fn domains(&self) -> Vec<Domain> {
+        Vec::new()
+    }
 }
 
 /// Strip a host header down to the name a route is keyed by: lowercased, port removed.
@@ -176,10 +196,23 @@ impl AppSource for MemAppSource {
 /// An [`AppSource`] over a directory of manifests: `sales.toml` is the app `sales`.
 ///
 /// The open-source way to run more than one app without a control plane. Every `*.toml` in
-/// the directory is an app named by its file stem, and a request routes to it by the **first
-/// label of its host header** — `sales.example.com`, `sales.localhost:8787` and a bare
-/// `sales` all reach `sales.toml`. One label rather than the whole name, because the person
-/// running this owns a domain and does not want to restate it in every filename.
+/// the directory is an app named by its file stem, and a request reaches it as **exactly one
+/// label in front of a domain this source answers under**: `sales.localhost` always, and
+/// `sales.example.com` once [`DirAppSource::with_domains`] declares `example.com`. One label
+/// rather than the whole name, because the person running this owns a domain and does not
+/// want to restate it in every filename. A trailing dot (`sales.localhost.`) is the same name
+/// and is answered.
+///
+/// **Every other name is refused before anything is read**: another domain, a bare `sales`,
+/// `x.sales.localhost`, an address. Routing on the first label of *any* name was the original
+/// rule, and it served `sales.attacker.example` — a name whose owner can point its DNS at this
+/// machine, so that a page served from it sends that name as `Host` and `Origin` and passes
+/// the socket's check that the two agree. See [`AppSource::resolve`].
+///
+/// `localhost` is always answered, and it is safe for a reason that lives in the client:
+/// Chrome and Firefox resolve `*.localhost` to loopback themselves (RFC 6761 §6.3), so no DNS
+/// answer can point one at anything. A client that sends `.localhost` names to network DNS
+/// loses that, and a front door (`--auth-jwks`) is what removes the dependence on it.
 ///
 /// **Nothing is cached here and that is on purpose.** [`AppSource::resolve`] reads the file
 /// to digest it, so editing a manifest on disk changes its key and the host recompiles it on
@@ -194,12 +227,33 @@ impl AppSource for MemAppSource {
 #[derive(Debug)]
 pub struct DirAppSource {
     dir: PathBuf,
+    /// What an app's label may stand in front of. Always holds `localhost`.
+    domains: BTreeSet<Domain>,
 }
 
 impl DirAppSource {
-    /// Serve every well-named `*.toml` in this directory.
+    /// Serve every well-named `*.toml` in this directory, at `<app>.localhost`.
     pub fn new(dir: impl Into<PathBuf>) -> DirAppSource {
-        DirAppSource { dir: dir.into() }
+        DirAppSource {
+            dir: dir.into(),
+            domains: BTreeSet::from([Domain::localhost()]),
+        }
+    }
+
+    /// Also answer at `<app>.<domain>` for each of these.
+    ///
+    /// Adds to the set and never removes `localhost`: a process published under a domain is
+    /// still one an operator reaches on the machine itself. Declaring a domain trusts every
+    /// name directly under it — see [`Domain`].
+    #[must_use]
+    pub fn with_domains(mut self, domains: impl IntoIterator<Item = Domain>) -> DirAppSource {
+        self.domains.extend(domains);
+        self
+    }
+
+    /// Every domain this source answers under, sorted, `localhost` included.
+    pub fn domains(&self) -> Vec<Domain> {
+        self.domains.iter().cloned().collect()
     }
 
     /// The apps this directory currently offers, sorted.
@@ -261,7 +315,16 @@ impl DirAppSource {
 
 impl AppSource for DirAppSource {
     fn resolve(&self, host: &str) -> Result<AppKey, HostError> {
-        let label = host.split('.').next().unwrap_or(host);
+        // FIRST, before any I/O: is this one label in front of a declared domain? Membership
+        // is exact string equality on everything after the first dot — never `ends_with`,
+        // which would let `salesexample.com` stand in for `sales` under `example.com`.
+        let outside = || HostError::OutsideDomains(host.to_string());
+        let name = host.strip_suffix('.').unwrap_or(host);
+        let (label, domain) = name.split_once('.').ok_or_else(outside)?;
+        if !self.domains.iter().any(|d| d.as_str() == domain) {
+            return Err(outside());
+        }
+
         let app = AppId::parse(label).map_err(|_| HostError::UnknownHost(host.to_string()))?;
         let bytes = self
             .read(&app)
@@ -276,6 +339,10 @@ impl AppSource for DirAppSource {
         // saved mid-request is served under the previous version's key.
         self.read(&key.app_id)
             .ok_or_else(|| HostError::NotFound(key.clone()))
+    }
+
+    fn domains(&self) -> Vec<Domain> {
+        DirAppSource::domains(self)
     }
 }
 
@@ -299,36 +366,104 @@ mod tests {
         assert_eq!(normalise_host("[::1"), "[::1");
     }
 
+    fn example_com() -> Domain {
+        Domain::parse("example.com").unwrap()
+    }
+
     #[test]
-    fn a_directory_routes_by_the_first_label_and_skips_what_is_not_a_label() {
+    fn a_directory_answers_one_label_under_a_declared_domain_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("sales.toml"), "[app]\ntitle = \"S\"\n").unwrap();
         std::fs::write(dir.path().join("ops.toml"), "[app]\ntitle = \"O\"\n").unwrap();
         std::fs::write(dir.path().join("My App.toml"), "[app]\ntitle = \"X\"\n").unwrap();
         std::fs::write(dir.path().join("notes.md"), "not an app").unwrap();
 
-        let src = DirAppSource::new(dir.path());
+        let src = DirAppSource::new(dir.path()).with_domains([example_com()]);
         assert_eq!(
             src.apps().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
             vec!["ops", "sales"]
         );
         assert_eq!(src.skipped(), vec!["My App".to_string()]);
 
-        for header in ["sales", "sales.example.com", "sales.localhost"] {
+        for header in [
+            "sales.localhost",
+            "sales.localhost.",
+            "sales.example.com",
+            "sales.example.com.",
+        ] {
             assert_eq!(
                 src.resolve(header).unwrap().app_id.as_str(),
                 "sales",
                 "{header}"
             );
         }
+
+        // Each of these would have reached sales.toml (or another app) under first-label
+        // routing, and each is a name somebody other than the operator can own, or no name
+        // at all. Exact membership is what refuses the near misses: `ends_with` would admit
+        // `salesexample.com` and `sales.evillocalhost` is not `localhost`.
+        for header in [
+            "sales",
+            "localhost",
+            "example.com",
+            "saleslocalhost",
+            "sales.notlocalhost",
+            "sales.evillocalhost",
+            "x.sales.localhost",
+            "x.sales.example.com",
+            "sales.localhost.attacker.example",
+            "sales.example.com.attacker.example",
+            "salesexample.com",
+            "sales-example.com",
+            "sales.com",
+            "sales.attacker.example",
+            "127.0.0.1",
+            "[::1]",
+            "",
+            "sales.localhost..",
+        ] {
+            assert!(
+                matches!(src.resolve(header), Err(HostError::OutsideDomains(_))),
+                "{header:?} must be outside every declared domain, got {:?}",
+                src.resolve(header)
+            );
+        }
+
+        // Inside a declared domain, and no app by that label: the ordinary miss.
+        for header in [
+            "nobody.localhost",
+            "nobody.example.com",
+            "my_app.localhost",
+            ".localhost",
+        ] {
+            assert!(
+                matches!(src.resolve(header), Err(HostError::UnknownHost(_))),
+                "{header:?} is inside a declared domain and names no app, got {:?}",
+                src.resolve(header)
+            );
+        }
+    }
+
+    #[test]
+    fn with_domains_adds_to_localhost_and_never_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sales.toml"), "[app]\ntitle = \"S\"\n").unwrap();
+
+        let bare = DirAppSource::new(dir.path());
+        assert_eq!(bare.domains(), vec![Domain::localhost()]);
         assert!(matches!(
-            src.resolve("nobody.example.com"),
-            Err(HostError::UnknownHost(_))
+            bare.resolve("sales.example.com"),
+            Err(HostError::OutsideDomains(_))
         ));
-        assert!(
-            matches!(src.resolve("My App"), Err(HostError::UnknownHost(_))),
-            "a name that is not a label must not resolve"
-        );
+
+        let src = DirAppSource::new(dir.path()).with_domains([
+            example_com(),
+            Domain::localhost(),
+            example_com(),
+        ]);
+        assert_eq!(src.domains(), vec![example_com(), Domain::localhost()]);
+        assert!(src.resolve("sales.localhost").is_ok());
+        assert!(src.resolve("sales.example.com").is_ok());
     }
 
     #[test]
@@ -338,9 +473,9 @@ mod tests {
         std::fs::write(&path, "[app]\ntitle = \"before\"\n").unwrap();
 
         let src = DirAppSource::new(dir.path());
-        let before = src.resolve("sales").unwrap();
+        let before = src.resolve("sales.localhost").unwrap();
         std::fs::write(&path, "[app]\ntitle = \"after\"\n").unwrap();
-        let after = src.resolve("sales").unwrap();
+        let after = src.resolve("sales.localhost").unwrap();
 
         assert_eq!(before.app_id, after.app_id);
         assert_ne!(

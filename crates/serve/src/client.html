@@ -4,8 +4,9 @@
   resource at run time — the binary already contains this page.
 
   Not "fetches nothing", which is what this said before renderers existed. Four requests are
-  allowed and all are same-origin: `GET /auth`, a configured provider's token endpoint, a
-  renderer script an app declared, and `./dagpane.js` in an exported bundle.
+  allowed, and all but the token endpoint are same-origin: `GET /auth`, a configured
+  provider's token endpoint, a renderer script an app declared, and `./dagpane.js` in an
+  exported bundle.
   `the_client_is_one_self_contained_file` enumerates them and fails on a fifth.
 
   The stats bar at the top is not decoration. It is the product claim, live: for every
@@ -368,15 +369,28 @@ function connect(token) {
   // failed connection through the same path — so without this both fire and two reconnects
   // get scheduled, double-counting the backoff and racing each other.
   let settled = false;
-  const gone = () => {
+  const gone = (goingAway) => {
     if (settled) return;
     settled = true;
-    dropped(opened, token);
+    dropped(opened, token, goingAway === true);
   };
 
   socket.onmessage = (e) => handle(JSON.parse(e.data));
-  socket.onclose = gone;
-  socket.onerror = gone;
+  socket.onclose = (e) => {
+    // 4401 is the server saying why: the token this socket was admitted on has expired, and
+    // new rows arrived that it no longer covers (`TOKEN_EXPIRED` in `lib.rs`). Not a server
+    // going away, so not retried — the same token would be refused, six times, before the
+    // page said what the server has just said.
+    if (e.code === 4401 && !settled) {
+      settled = true;
+      expired();
+      return;
+    }
+    // 1001 is the server stopping on purpose — a rolling update, a scale-in — and closing
+    // this socket after the drain rather than dropping it (`GOING_AWAY` in `lib.rs`).
+    gone(e.code === 1001);
+  };
+  socket.onerror = () => gone(false);
   socket.onopen = () => {
     opened = true;
     // This PAGE has been through the door at least once. See `dropped`.
@@ -416,8 +430,13 @@ const RETRY_CAP_MS = 30000;
 // short enough that somebody whose session ended is told so rather than left watching a
 // banner that will never change.
 const REFUSE_AFTER = 6;
+// How widely the viewers of a replica that closed with 1001 spread their first reconnect. They
+// are all told in the same instant, so without a spread they all arrive at the next replica in
+// the same instant too. Half a second, from zero: sooner on average than the backoff's first
+// step (a quarter to half a second), and the step after it is still the backoff's first.
+const GOING_AWAY_SPREAD_MS = 500;
 
-function dropped(everOpened, token) {
+function dropped(everOpened, token, goingAway) {
   // A page holding a token that has **never** been through the door is a refusal, and it is
   // the only one that can be told apart immediately: nothing about it has ever worked.
   // Retrying that on a timer hammers a door that is not going to open and buries the one
@@ -437,11 +456,19 @@ function dropped(everOpened, token) {
   // mechanism exists to remove, reproduced on the far side of the fix.
   inFlight = false;
 
-  const wait = backoff(attempt++);
+  // A server that said it was going away is not a failure to back off from: the next replica
+  // is already serving, so the page goes back inside the spread, without advancing the backoff.
+  // If that attempt fails — nothing else is serving — the ordinary backoff takes over from its
+  // first step.
+  const wait = goingAway && everOpened
+    ? Math.random() * GOING_AWAY_SPREAD_MS
+    : backoff(attempt++);
   const banner = document.getElementById("offline");
-  banner.textContent =
-    "Disconnected. Reconnecting in " + Math.round(wait / 1000) + "s — the page below is the " +
-    "last state the server sent.";
+  banner.textContent = goingAway && everOpened
+    ? "Reconnecting — the server this page was on is stopping. The page below is the last " +
+      "state it sent."
+    : "Disconnected. Reconnecting in " + Math.round(wait / 1000) + "s — the page below is the " +
+      "last state the server sent.";
   banner.style.display = "block";
 
   clearTimeout(retryTimer);
@@ -465,15 +492,35 @@ function backoff(n) {
 // app". That is a browser rule and not something to work around; what it means is that the
 // honest message names both and offers the one action that helps with either.
 //
-// This is the one close that does **not** retry. Everything else goes to `dropped`, because
-// everything else is a transport event that will clear on its own.
+// This and `expired` below are the two closes that do **not** retry. Everything else goes to
+// `dropped`, because everything else is a transport event that will clear on its own.
 function refused(token) {
-  const banner = document.getElementById("offline");
-  banner.textContent = "";
-  banner.appendChild(document.createTextNode(
+  signInAgain(
     "The server refused this connection. Your session may have expired, or you may not " +
     "have access to this app. "
-  ));
+  );
+}
+
+// A socket the server closed because its token expired before new data arrived for it.
+//
+// Unlike a refusal, this one the page can tell apart — a close sent over an open socket
+// carries its code — so it says exactly what happened. What is on screen stays: it is the
+// last state this viewer was allowed to see. Nothing reconnects, for the reason `refused`
+// gives, and nothing is left in flight to wait on an answer that will never come.
+function expired() {
+  transport = null;
+  inFlight = false;
+  signInAgain(
+    "Your session has expired, and new data has arrived since. The page below is the last " +
+    "state you were sent. "
+  );
+}
+
+// The banner both of those end in: what happened, and the one action that helps.
+function signInAgain(message) {
+  const banner = document.getElementById("offline");
+  banner.textContent = "";
+  banner.appendChild(document.createTextNode(message));
   const again = document.createElement("a");
   again.textContent = "Sign in again";
   again.href = "#";
@@ -571,6 +618,12 @@ function handle(msg) {
     showStats(msg.stats, msg.panes.length, "refresh");
     inFlight = false;
     flush();
+  } else if (msg.type === "reloaded") {
+    // Sent unasked: a scheduled refresh read new rows and this viewer's panes moved. It answers
+    // no `set`, so `inFlight` is left exactly as it is — a pass the viewer asked for is still
+    // owed its own `patch`, and clearing the flag here would send the next value before it.
+    for (const u of msg.panes) paint(u, true);
+    showStats(msg.stats, msg.panes.length, "reload", msg.sources);
   } else if (msg.type === "rejected") {
     const el = document.getElementById("stats");
     el.textContent = "";
@@ -602,7 +655,7 @@ function flush() {
   transport.send({ type: "set", seq, values });
 }
 
-function showStats(s, sent, kind) {
+function showStats(s, sent, kind, sources) {
   const el = document.getElementById("stats");
   el.textContent = "";
   if (!s) return;
@@ -626,8 +679,12 @@ function showStats(s, sent, kind) {
     return;
   }
 
-  put((kind === "first" ? "first render" : "interaction") + " · " + s.total_cells +
-      " cells · looked at ");
+  // A reload names what moved, because the viewer did not: the line would otherwise read as
+  // an interaction they never made.
+  const what = kind === "first" ? "first render"
+    : kind === "reload" ? "new data in " + (sources || []).join(", ")
+    : "interaction";
+  put(what + " · " + s.total_cells + " cells · looked at ");
   strong(s.visited);
   put(" · ran ");
   strong(s.evaluated);

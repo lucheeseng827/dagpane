@@ -1,8 +1,11 @@
 # dagpane — roadmap
 
-v0.1.0 ships one thing: an engine that recomputes the cells an interaction reaches and
-prints which ones. Everything below is something that engine does not do, ordered by what
-forces the work rather than by effort or by appeal.
+0.2.0 ships an engine that recomputes the cells an interaction reaches and prints which ones,
+and the ways to put it in front of people: `run`, `serve` and `host` serve it, each with an
+optional front door, and `export` writes it out as static files that run it as WebAssembly.
+Each numbered item below began as something that engine did not do, ordered by what forces
+the work rather than by effort or by appeal. A ticked box in one is done, and an unticked one
+is not.
 
 **No item here has a date, and that is the rule of this file.** A date on an unstarted item
 is a guess wearing a plan's clothes. Every item instead carries **the trigger** — the
@@ -18,15 +21,51 @@ same habit.)*
 
 ---
 
+## 0.2.0 — shipped
+
+`CHANGELOG.md` has every entry, and under *Upgrading from 0.1.1* each change that can stop
+something that worked on 0.1.1. In outline:
+
+- [x] `dagpane serve`: one replica of many. It binds every interface, answers `/healthz` and
+      `/readyz` on a probe port of its own, drains before it stops, and takes `--origin` for
+      the address a browser opens. ADR-0009.
+- [x] `dagpane host` and `crates/host`: every manifest in a directory from one process,
+      routed by the `Host` header — a name is answered only if it is exactly one label in
+      front of a declared domain (ADR-0012) — with a byte budget over the source data it
+      loads and an idle sweep.
+- [x] `crates/auth`: an optional OIDC front door for `run`, `serve` and `host`.
+      `--auth-jwks` verifies id tokens against a JWKS file, so the process makes no outbound
+      request, and the bundled page can sign in with PKCE. Item 1.
+- [x] `crates/connect`: a source is a file, a URL or a Postgres query, the last two behind
+      the `http` and `sql` features, both off by default. `refresh_secs` is acted on while
+      anybody is viewing, and `dagpane refresh` re-reads the sources and prints what that
+      cost. ADR-0011.
+- [x] `crates/wasm` and `dagpane export`: a folder of static files whose page runs the whole
+      graph as WebAssembly, with no server behind it. Item 4, ADR-0007.
+- [x] The manifest: `derive` and `join`, the eighth and ninth verbs; SQL cells lowered to
+      those same steps (ADR-0005); `custom` panes drawn by a JavaScript function; and
+      `place = "client"`, checked and reported and not yet served (ADR-0008). Item 6.
+- [x] Per-column invalidation: a cell sleeps through a change to a column it did not read,
+      and — where a `filter` or `sort` on an input's own column is the first step to change
+      its rows — through a change that leaves the rows it kept, or their order, as they were.
+      `dagpane explain --change-column` prints what a change to one column costs. Item 3,
+      ADR-0006.
+- [x] A connection kept alive and let go on purpose: a quiet one is pinged every 25 s, a
+      client that stops reading is dropped, `run`, `serve` and `host` stop on `SIGTERM`, and
+      a stop closes each socket with `1001`. A viewer's control values ride in the page's URL
+      fragment, so a reload comes back to the same view with no session store. Item 1.
+- [x] Eight more ADRs, 0005 to 0012.
+
+---
+
 ## v0.1.0 — shipped
 
 - [x] `dagpane-core`: declared edges, Kahn's algorithm for order and cycle detection,
       per-cell `height`, height-ordered evaluation, digest short-circuit, errors as values.
       One dependency (serde), `#![forbid(unsafe_code)]`, no I/O, no clock, no async runtime.
-- [x] `dagpane-app`: panes, five widget kinds, nine pipeline verbs (`filter`, `derive`,
-      `join`, `select`, `sort`, `limit`, `group_by`, `scalar`, `count`), an in-tree
-      RFC-4180-subset CSV reader with per-column type inference, a TOML manifest compiler,
-      patch generation.
+- [x] `dagpane-app`: panes, five widget kinds, seven pipeline verbs (`filter`, `select`,
+      `sort`, `limit`, `group_by`, `scalar`, `count`), an in-tree RFC-4180-subset CSV reader
+      with per-column type inference, a TOML manifest compiler, patch generation.
 - [x] `dagpane-serve`: axum 0.8, one `AppSession` per WebSocket connection over one
       `Arc<App>`, and a single-file client with nothing fetched at run time.
 - [x] `dagpane` CLI: `check`, `graph --format text|mermaid|json`, `explain --set NAME=VALUE`,
@@ -80,12 +119,13 @@ long as nothing needs durability the viewer cannot supply.
       would actually need one: a session that must survive the viewer losing the URL, or be
       readable by something other than the browser holding it.
 - [x] **Eviction and a TTL.** `crates/host` had the app-level half — a byte budget and an
-      `idle_after` — and **nothing in the shipped binary called `Host::sweep_idle`**, so
+      `idle_after` — and **nothing in the binary on `main` called `Host::sweep_idle`**, so
       `dagpane host --idle-minutes` configured a sweep that never ran and an app left only on a
-      redeploy or under budget pressure. `dagpane_serve::sweep_idle` is the caller, running at
-      half the idle window and printing every eviction; `--idle-minutes 0` keeps the old
-      behaviour. What remains open is the *sizing*: item 7's memory number still does not
-      exist, so `--idle-minutes 60` is a default rather than a derived one.
+      redeploy or under budget pressure. No release had `host` before 0.2.0, which ships with
+      the sweep. `dagpane_serve::sweep_idle` is the caller, running at half the idle window
+      and printing every eviction; `--idle-minutes 0` turns it off. What remains open is the
+      *sizing*: item 7's memory number still does not exist, so `--idle-minutes 60` is a
+      default rather than a derived one.
 
 **The trigger fired**, and the front door is what it produced. The honest position is narrower
 now rather than gone: a token gets a viewer through the door, and everything behind it is per
@@ -410,9 +450,10 @@ This section used to open with four warnings. Three of them survive and one is n
 
 * **"Rust/WASM means a smaller payload" is false for anything that ships a SQL engine** —
   still true, and now the argument *for* the thin evaluator rather than a caution against the
-  whole idea. DuckDB-Wasm is 34.25 MB and DataFusion 27 MiB; `dagpane-wasm` is **1.10 MiB raw,
-  318 KiB gzipped**, with the reactive engine, the nine verbs, the expression language, the
-  manifest compiler and the CSV reader in it. `BENCHMARKS.md` has the table and the method.
+  whole idea. DuckDB-Wasm is 34.25 MB and DataFusion 27 MiB; `dagpane-wasm` is **1.32 MiB raw,
+  365 KiB gzipped** as 0.2.0 builds it, with the reactive engine, the nine verbs, the
+  expression language, the manifest compiler and the CSV reader in it. `BENCHMARKS.md` has the
+  table and the method, and its 1.10 MiB and 318 KiB for this crate are from 2026-09-18.
   The claim was only ever available to a client that stays a thin evaluator, and this is one.
 * **wasm32 caps at 4 GB**, and a browser may cap lower. Unchanged, and it is the reason
   `dagpane export` inlines its rows rather than pretending it can stream: an exported app is
@@ -516,7 +557,7 @@ network, at a price that is written down"**.
 
         * **A server that serves a split has to hand the browser an engine** — new, and the
           next thing to decide. `dagpane-serve` compiles `client.html` into the binary and
-          deliberately does **not** embed the 1.1 MiB wasm module: `crates/cli/src/export.rs`
+          deliberately does **not** embed the 1.3 MiB wasm module: `crates/cli/src/export.rs`
           argues that embedding would make every `dagpane` a megabyte larger for a command
           most runs never call, and put the build of one crate inside the build of another.
           So the module has to reach the page some other way, and the obvious candidate is
@@ -653,10 +694,12 @@ It first said *"there is no benchmark in this repository and no number in any do
 measured in seconds"*, which stopped being true when `BENCHMARKS.md` gained the row sweep and
 the round trip. It then said **"nothing here measures what it costs to host many apps or serve
 many viewers"**, and kept saying it after `benches/fleet/` measured the memory, `benches/loadgen/`
-measured apps-per-core on a pinned core, and both measured p99 under load. All five boxes below
-are now ticked; the per-session figure closed the fourth, and what a session costs **while it is
-being used** — memory that never comes back, and the wait it imposes on viewers doing nothing —
-closed the fifth.
+measured apps-per-core on a pinned core, and both measured p99 under load. Six boxes below are
+now ticked; the per-session figure closed the fourth, what a session costs **while it is being
+used** — memory that never comes back, and the wait it imposes on viewers doing nothing — closed
+the fifth, and the sixth was closed by a decision as much as by a number: the process now prices
+what its viewers hold, checked against the kernel's figure, and reports it beside the budget
+rather than in it.
 
 The lesson is cheap to state and was not free to learn: **a roadmap item is not done when the
 work lands, it is done when the file that claims it is undone is edited.** Two rounds of work
@@ -751,15 +794,37 @@ below.
       wait is pass × viewers ÷ workers, so a slower app or a smaller host walks toward that
       interval with nothing else changing.
 
+- [x] **`--budget-mb` against the term that turned out to matter — decided: reported, not
+      enforced.** The box called this a design question rather than a measurement, and the
+      design could not be answered until the term was a number the process knew. It is now.
+      `dagpane host` prices every viewer itself — each session's frames walked allocation by
+      allocation, each address counted once, the app's own sources excluded, so a projection of
+      a source costs nothing, a filtered dictionary column is billed for its keys and not its
+      dictionary, and two slices of one buffer are one buffer — and `/healthz` reports it per app
+      beside `resident_bytes`. `benches/sessions/ledger.sh` holds that figure against the
+      kernel's over the same three apps: what it leaves out is **145–162 kB a viewer whichever app
+      it is**, while the figure itself runs from **1.3 kB to 7 034 kB**. Everything that varies
+      with the pipeline is on its side of the line, and what is left is the per-connection floor
+      the first box found from outside.
+
+      **Why it is not in the budget**, which is the decision: the budget evicts *apps*, and
+      evicting an app frees nothing its viewers hold — their graph keeps its sources alive until
+      they leave. A budget that charged viewers and evicted apps to get under it would evict,
+      free nothing, and compile a second copy for the next viewer who asked. Pricing viewers
+      surfaced one more thing the budget could not see: exactly those copies. An app evicted —
+      redeployed, idle, over budget — while somebody is still looking at it leaves
+      `resident_bytes` at once and memory only when they do, and `/healthz` now lists it as
+      `held_after_eviction`. Matched by admission and not by key, because a rollback is the
+      original key again and would otherwise hide the copy the old viewer is holding.
+      `docs/adr/0010-viewers-are-reported-not-budgeted.md` records the decision.
+
 **What is still not measured**, since the point of this section is to say so:
 
-- [ ] **`--budget-mb` against the term that turned out to matter.** It counts **source bytes**,
-      and the per-session figure above is not in it. A fleet of row-keeping apps with many
-      viewers is sized against the smaller of its two costs, and nothing in the process notices.
-      Making the budget see materialised frames is a design question, not a measurement: a
-      frame's size is knowable, but charging it to a session makes eviction a decision about
-      viewers rather than about apps, and that is a different policy from the one `crates/host`
-      implements.
+- [ ] **A limit on what viewers hold.** The figure exists and nothing acts on it. Acting on it
+      means refusing a viewer, or shedding one, at the moment the process is busiest — a policy
+      about people rather than about apps, with a failure mode an operator should choose on
+      purpose rather than inherit. Until somebody does, the number to watch is
+      `session_bytes` beside `resident_bytes`, and the budget still counts only the second.
 - [ ] **A host whose neighbours are known.** Every figure above is from a shared cloud
       container. The ratios survive that; the absolutes are for ordering decisions and not for a
       cost model, and `BENCHMARKS.md` repeats that beside each table rather than once.
@@ -807,7 +872,7 @@ not on review.
 
 * **A notebook mode.** An editing surface is a different product with a different failure
   mode, and marimo already ships the good version of it.
-* **A plugin system.** Eight crates and one dependency direction that CI greps for is the
+* **A plugin system.** Nine crates and one dependency direction that CI greps for is the
   asset here; an extension point is a second public API to keep stable before the first one
   has a second user.
 * **A hosted cloud.** The two things that made this impossible have both shipped — a front

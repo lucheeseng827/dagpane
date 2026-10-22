@@ -92,7 +92,7 @@ worth knowing before they surprise you:
 
 ## Where this fits
 
-* `../README.md` — fifteen worked apps by role, and when *not* to reach for this.
+* `../README.md` — nineteen worked apps by role, and when *not* to reach for this.
 * `../bucket/README.md` — the same handoff, with the data arriving from object storage on a
   refresh loop instead of from a kernel.
 * `../apps/` — the manifests to read once the builder stops being the interesting part.

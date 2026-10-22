@@ -40,17 +40,22 @@ What a viewer still **cannot** do:
 
 ## The author
 
-The author edits the manifest and restarts. `dagpane run` reads sources once at start-up and
-shares them immutably across every session, which is what makes a hundred viewers a hundred
-vectors of values over one allocation per source — the *source*, measured; the frames a cell
-computes are per viewer and are not free. There is no hot reload.
+The author edits the manifest and restarts. `dagpane run` reads sources at start-up — and again
+every `refresh_secs`, for a source that names one — and shares them across every session,
+which is what makes a hundred viewers a hundred vectors of values over one allocation per
+source — the *source*, measured; the frames a cell computes are per viewer and are not free.
+There is no hot reload of the manifest.
 
 ```console
+$ cd examples
 $ dagpane check apps/13-weekly-review.toml     # compile it; errors name the cell and the step
 $ dagpane graph apps/13-weekly-review.toml     # the shape, before anything runs
 $ dagpane explain apps/13-weekly-review.toml --set region=north   # what one change costs
 $ dagpane run   apps/13-weekly-review.toml     # serve it
-$ dagpane export apps/13-weekly-review.toml --out dist   # …or ship it with no server at all
+$ rustup target add wasm32-unknown-unknown                               # once
+$ cargo build -p dagpane-wasm --target wasm32-unknown-unknown --release   # …or build the engine
+$ dagpane export apps/13-weekly-review.toml --out dist \
+    --wasm ../target/wasm32-unknown-unknown/release/dagpane_wasm.wasm   # and ship it with no server
 ```
 
 Unknown keys are rejected rather than ignored, so a misspelt option is an error at `check`
@@ -66,6 +71,13 @@ a folder for any static host, with the same controls and the same counts. It has
 `file://` origin, and the page tells you so if you try. `python3 -m http.server` in the folder
 is enough. What it does not have is what a server was doing — no sign-in, no scheduled
 refresh, no HTTP or SQL sources — and it is as big as its data, which the command prints.
+
+The engine is not inside the `dagpane` binary, which is why the `cargo build` comes first —
+from the same source as the binary, because the page's glue comes from the binary and the
+module from that build, and the two have to agree. `export` looks for the module at
+`target/wasm32-unknown-unknown/release/dagpane_wasm.wasm` relative to the directory it runs
+in, which finds one only at the workspace root; from `examples/`, as above, or from an
+installed `dagpane` anywhere else, pass `--wasm`.
 
 ---
 
@@ -117,7 +129,7 @@ process from, so an app behaves the same wherever it is launched. Four forms:
 | `csv = "…"` or `file = { path, format }` | nothing; `format` defaults to the extension |
 | `http = { url = "…" }` | a binary built with the `http` feature |
 | `sql = { dsn, query, watch }` | a binary built with the `sql` feature |
-| `refresh_secs = N` on any source | something that owns a clock; `dagpane refresh` re-reads regardless |
+| `refresh_secs = N` on any source | nothing: a running `run`, `serve` or `host` re-reads it every N seconds while anybody is viewing the app, and refuses rows whose columns changed. `dagpane refresh` re-reads regardless |
 
 The published container image is built without those two features, and says so rather than
 failing at run time:

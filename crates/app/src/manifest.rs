@@ -48,7 +48,8 @@ use crate::{App, BoundSource};
 pub struct Manifest {
     /// The `[app]` table. The only required section.
     pub app: AppMeta,
-    /// `[[source]]` entries: data loaded once and shared by every session.
+    /// `[[source]]` entries: data loaded when the app compiles — and again on a schedule, for a
+    /// source that names `refresh_secs` — and shared by every session.
     #[serde(default)]
     pub source: Vec<SourceSpec>,
     /// `[[input]]` entries: the controls, and the source cells they set.
@@ -89,7 +90,8 @@ pub struct AppMeta {
     pub renderers: Vec<PathBuf>,
 }
 
-/// Data loaded once at start-up and shared by every session.
+/// Data loaded when the app compiles, re-read on `refresh_secs` if it names one, and shared by
+/// every session.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceSpec {
@@ -116,9 +118,11 @@ pub struct SourceSpec {
     pub sql: Option<SqlSpec>,
     /// How often a scheduled refresh should re-read this source, in seconds.
     ///
-    /// Carried here and acted on by whatever owns a clock — nothing in this crate does.
-    /// `dagpane refresh` ignores it and re-reads everything, which is what a person running
-    /// a command by hand means.
+    /// Acted on by `dagpane-serve`, which owns the process's clock: while anybody is viewing the
+    /// app, the source's version is checked this often and its rows re-read when it moved.
+    /// Nothing in this crate has a clock. `0` is taken as one second, the finest a schedule
+    /// runs. `dagpane refresh` ignores it and re-reads everything, which is what a person
+    /// running a command by hand means.
     #[serde(default)]
     pub refresh_secs: Option<u64>,
 }
@@ -897,13 +901,20 @@ enum StepOp {
 /// same cells recompute and the same panes go on the wire. What differs is resident memory:
 /// the Arrow arm stores columns contiguously and dictionary-encodes the low-cardinality text
 /// ones. `crates/frame-arrow/tests/oracle.rs` is what holds the two arms to being identical.
+///
+/// Public because a refresh has to load **through this one**: [`crate::refresh::read`] takes a
+/// builder, and new rows in a different representation from the ones the app compiled with
+/// would digest the same and weigh differently — the budget would move on a refresh that
+/// changed nothing. Asking this function, rather than re-deciding from a feature of one's own,
+/// is the only way a caller cannot disagree with the compile.
 #[cfg(feature = "arrow-sources")]
-fn source_builder() -> Box<dyn dagpane_core::frame::FrameBuilder> {
+pub fn source_builder() -> Box<dyn dagpane_core::frame::FrameBuilder> {
     Box::new(dagpane_frame_arrow::ArrowFrameBuilder::new())
 }
 
+/// See the `arrow-sources` arm above, which is the same function for the other representation.
 #[cfg(not(feature = "arrow-sources"))]
-fn source_builder() -> Box<dyn dagpane_core::frame::FrameBuilder> {
+pub fn source_builder() -> Box<dyn dagpane_core::frame::FrameBuilder> {
     Box::new(dagpane_core::frame::TableBuilder::new())
 }
 

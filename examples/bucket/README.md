@@ -7,11 +7,12 @@ serve.sh    sync -> compile -> if it changed AND it compiles, swap the snapshot 
 
 ## The constraint this is built around
 
-dagpane loads its sources **once, at start-up**, and shares them immutably across every
-session. There is no file watcher and no hot reload. That is not an oversight — it is what
-makes a hundred viewers a hundred vectors of values over one allocation per source — the
-source; a session's own computed frames are not shared and `BENCHMARKS.md` prices them — and what
-makes a pass a pure function of the inputs.
+dagpane can follow new rows on its own: a source that names `refresh_secs` is re-read by the
+running server while anybody is viewing the app, and every viewer moves onto the one new copy.
+A bucket snapshot is more than new rows. It carries the manifest beside the data, its columns
+can change, and a refresh is refused anything but new rows in the shape the app was checked
+against — so a snapshot is a **deploy**, and there is no hot reload of an app. That is not an
+oversight: it is what keeps `check` the gate in front of everything a viewer can be shown.
 
 So "the dashboard follows the bucket" means exactly one thing:
 
@@ -169,10 +170,16 @@ Kubernetes is what a `CronJob` that syncs and then rolls the Deployment does:
 # the sidecar / init container, on any image that has your cloud CLI
 aws s3 sync s3://my-bucket/panels/sales /shared --delete
 
-# the dagpane container — no shell needed, and no auth, so keep it off the public network
+# the dagpane container — no shell needed, and no auth, so keep it off the public network;
+# --origin is what the viewer's browser sends: https://<the name they type>, behind a proxy
 docker run --rm -p 8787:8787 -v /shared:/app:ro \
-  mancube/dagpane:0.1.1 run /app/app.toml --host 0.0.0.0
+  mancube/dagpane:0.2.0 serve /app/app.toml --origin http://localhost:8787
 ```
+
+That is 0.2.0, the first published image with `serve`. Do not use `mancube/dagpane:0.1.1`
+here: it has no `serve`, and its `run --host 0.0.0.0` allows only the origin
+`http(s)://0.0.0.0:8787`, so a browser at `localhost` or at a real hostname gets the page
+with dead controls.
 
 Run `dagpane check /app/app.toml` as the init container's last step to keep the gate: a
 non-zero exit there stops the rollout, and the previously running pods carry on serving.
@@ -180,9 +187,15 @@ non-zero exit there stops the rollout, and the previously running pods carry on 
 ## Authentication, which is off unless you turn it on
 
 `HOST` defaults to loopback, and binding anything else prints a warning that says so.
-`--host 0.0.0.0` in a container makes the page — and therefore the bucket's contents —
-readable by anyone who can route to the port. Either pass `--auth-jwks` with a mounted JWKS
-file, or put something that authenticates in front. `SECURITY.md` covers both in full.
+`--host 0.0.0.0`, or `serve` in a container, which binds every interface by default, makes
+the page — and therefore the bucket's contents — readable by anyone who can route to the
+port. Either pass `--auth-jwks` with a mounted JWKS file, or put something that
+authenticates in front. `SECURITY.md` covers both in full. `HOST=0.0.0.0` has a second cost:
+`serve.sh` runs `dagpane run`, whose socket accepts a browser only from the address it bound,
+and `http(s)://0.0.0.0:<port>` is an origin no browser sends — so the page loads with dead
+controls unless a proxy in front allowlists `Origin` and then rewrites it to
+`http://0.0.0.0:<port>`. `OPERATIONS.md` has the config, written for the default loopback
+`HOST`, where the rewrite target is `http://127.0.0.1:<port>` instead.
 
 Two things that follow and are easy to miss. A restart drops every open page, because a
 session *is* a connection — viewers reconnect, and the client replays the control values held

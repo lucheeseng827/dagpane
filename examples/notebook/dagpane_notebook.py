@@ -504,9 +504,12 @@ class Panel:
         the interrupt button. `background=True` returns the `Popen` so a later cell can
         `.terminate()` it; remember that a kernel restart orphans it.
 
-        There is NO AUTHENTICATION in this version. The default bind is loopback. Anything
-        else is reachable by anyone who can route to it, so put an authenticating proxy in
-        front before you widen it.
+        Authentication is off: this runs `dagpane run` without `--auth-jwks`. The default bind
+        is loopback. Anything else is reachable by anyone who can route to it, so put an
+        authenticating proxy in front before you widen it — one that also allowlists the
+        browser's `Origin` and rewrites it to `http://<host>:<port>`, because `run` accepts the
+        page's socket only from the address it bound, and with `host="0.0.0.0"` that is an
+        origin no browser sends. OPERATIONS.md has that proxy; SECURITY.md has the rest.
         """
         args = [find_dagpane(), "run", self._require_written(), "--port", str(port), "--host", host]
         if background:

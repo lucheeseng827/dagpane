@@ -40,6 +40,7 @@ const APP_PORT = 8791;
 const CDP_PORT = 9334;
 const AUTH_PORT = 8792;
 const AUTH_OK_PORT = 8793;
+const EXPIRY_PORT = 8794;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
@@ -93,6 +94,22 @@ async function stopServer() {
   }
 }
 
+// A stop that is graceful: what a rolling update sends. The server closes its sockets with
+// 1001 on the way out, and is given the time that takes.
+async function stopServerGracefully() {
+  if (!server) return;
+  const dead = new Promise((r) => server.once("exit", r));
+  server.kill("SIGTERM");
+  const exited = await Promise.race([dead.then(() => true), sleep(10000).then(() => false)]);
+  if (!exited) {
+    server.kill("SIGKILL");
+    await dead;
+    server = null;
+    throw new Error("the server was still running 10s after SIGTERM");
+  }
+  server = null;
+}
+
 // ── the browser ──────────────────────────────────────────────────────────────────────────
 
 const browser = spawn(CHROME, [
@@ -125,13 +142,26 @@ async function evaluate(expression) {
 }
 
 /// Poll a boolean expression in the page until it holds, or give up.
+///
+/// An expression that throws counts as not yet. Right after a reload it is evaluated against a
+/// document still being parsed — `#offline` is not there, and `BANNER` reads `null.style` —
+/// or against no execution context at all, and how often that happens depends on how busy the
+/// machine is, not on the page. One still throwing at the deadline is the failure, and says so.
 async function until(expression, ms, what) {
   const deadline = Date.now() + ms;
+  let threw = null;
   while (Date.now() < deadline) {
-    if (await evaluate(expression)) return true;
+    try {
+      if (await evaluate(expression)) return true;
+      threw = null;
+    } catch (e) {
+      threw = e;
+    }
     await sleep(100);
   }
-  bad(what, `never became true within ${ms}ms: ${expression}`);
+  bad(what, threw
+    ? `still throwing after ${ms}ms: ${threw.message}`
+    : `never became true within ${ms}ms: ${expression}`);
   return false;
 }
 
@@ -151,6 +181,34 @@ async function main() {
   });
   const { targetId } = await call("Target.createTarget", { url: "about:blank" });
   ({ sessionId } = await call("Target.attachToTarget", { targetId, flatten: true }));
+  // Every close code the page's sockets see, recorded beside the page rather than in it: the
+  // code is the one thing a browser reports about a close, and the page keeps its socket to
+  // itself.
+  await call("Page.enable");
+  await call("Page.addScriptToEvaluateOnNewDocument", {
+    source: `
+      window.__closes = [];
+      window.__goingAwayBanner = null;
+      window.__attemptAfterGoingAway = null;
+      const Native = window.WebSocket;
+      window.WebSocket = class extends Native {
+        constructor(...args) {
+          super(...args);
+          this.addEventListener("close", (e) => {
+            window.__closes.push(e.code);
+            // What the page decided, read once its own onclose has run: this listener was
+            // added first, so it runs first, and the next task is after the page's.
+            // \`attempt\` is the page's backoff step, a top-level \`let\` of its classic script:
+            // a 1001 must leave it where the open reset it.
+            if (e.code === 1001) setTimeout(() => {
+              window.__goingAwayBanner = document.getElementById("offline").textContent;
+              window.__attemptAfterGoingAway = attempt;
+            }, 0);
+          });
+        }
+      };
+    `,
+  });
 
   console.log("\na page whose server goes away and comes back");
 
@@ -215,6 +273,36 @@ async function main() {
     return;
   if (!(await until("inFlight === false", 10000, "and the server answered it"))) return;
   ok("a control still works after reconnecting, and the server answered it");
+
+  // ── and a stop that says so ───────────────────────────────────────────────────────────
+  //
+  // The stop above was a SIGKILL, which is a reclaimed instance. A rolling update is a
+  // SIGTERM, and the server answers that one by closing every socket with 1001 — going away —
+  // rather than letting the process take them down unannounced, which a browser reports as
+  // 1006. The page's answer to 1001 is to come straight back rather than back off.
+  console.log("\na page whose server stops on purpose");
+  await stopServerGracefully();
+  if (!(await until("window.__closes.includes(1001)", 10000,
+      "the page is told the server is going away")))
+    return;
+  ok("the page is told the server is going away (1001), not cut off");
+  // And it acts on it: not the backoff's "Disconnected", but the server stopping on purpose.
+  if (!(await until("(window.__goingAwayBanner || '').includes('is stopping')", 5000,
+      "the page says the server is stopping, rather than that it was disconnected")))
+    return;
+  ok("the page says the server is stopping, rather than that it was disconnected");
+  // The banner and the wait are chosen apart, so the banner alone would pass a page that
+  // said "is stopping" and then backed off anyway. The backoff step is what decides the wait.
+  const step = await evaluate("window.__attemptAfterGoingAway");
+  if (step !== 0) {
+    bad("a 1001 does not advance the backoff", `the backoff step was ${step} after the 1001`);
+    return;
+  }
+  ok("and goes back without advancing the backoff");
+  await startServer();
+  if (!(await until(`${BANNER} === ''`, 20000, "the page comes back after a graceful stop")))
+    return;
+  ok("and comes back on its own");
 }
 
 // ── the one close that must not retry ───────────────────────────────────────────────────
@@ -234,13 +322,13 @@ import { tmpdir } from "node:os";
 ///
 /// Minted here rather than mocked because the case below needs the door to OPEN — a page that
 /// gets in, loses its server, and has to get back in. A bogus token only exercises the refusal.
-function mintToken(privateKey, { iss, aud }) {
+function mintToken(privateKey, { iss, aud, exp }) {
   const b64 = (o) =>
     Buffer.from(typeof o === "string" ? o : JSON.stringify(o))
       .toString("base64url");
   const now = Math.floor(Date.now() / 1000);
   const head = b64({ alg: "ES256", kid: "test", typ: "JWT" });
-  const body = b64({ iss, aud, sub: "viewer@example", iat: now - 5, exp: now + 3600 });
+  const body = b64({ iss, aud, sub: "viewer@example", iat: now - 5, exp: exp ?? now + 3600 });
   // ES256 wants the raw r||s pair; Node's default for EC is DER, so this is not optional.
   const sig = createSign("sha256")
     .update(`${head}.${body}`)
@@ -385,10 +473,106 @@ async function refusalDoesNotRetry() {
   }
 }
 
+// ── a token that runs out while the page is open ────────────────────────────────────────
+//
+// A token is checked when the socket opens, and new data used to mean a restart — so a page
+// whose token had expired could only go on showing what it had. A scheduled refresh brings new
+// data to an open socket, and the server closes one whose token has run out instead of sending
+// it the new rows (4401, `TOKEN_EXPIRED`). This is the page's half: it says so, keeps what it
+// was last sent, and does not retry a door its token can no longer open.
+
+const LIVE = `
+[app]
+title = "Expiry"
+
+[[source]]
+name = "sales"
+csv = "sales.csv"
+refresh_secs = 1
+
+[[cell]]
+name = "total"
+from = "sales"
+[[cell.step]]
+group_by = { agg = [{ column = "amount", agg = "sum", as = "t" }] }
+[[cell.step]]
+scalar = { column = "t" }
+
+[[pane]]
+id = "total"
+cell = "total"
+metric = { label = "Total" }
+`;
+const rows = (n) =>
+  "region,amount\n" +
+  Array.from({ length: n }, (_, i) => `r${i % 4},${i * 10}.0\n`).join("");
+
+async function anExpiredSessionIsAskedToSignIn() {
+  console.log("\na page whose token expires before new data arrives");
+
+  const dir = mkdtempSync(join(tmpdir(), "dagpane-expiry-"));
+  const jwksPath = join(dir, "jwks.json");
+  const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  writeFileSync(jwksPath, JSON.stringify({
+    keys: [{ ...publicKey.export({ format: "jwk" }), kid: "test", alg: "ES256", use: "sig" }],
+  }));
+  writeFileSync(join(dir, "live.toml"), LIVE);
+  writeFileSync(join(dir, "sales.csv"), rows(10));
+  const ISS = "https://issuer.example";
+  const AUD = "dagpane";
+  // Long enough to open the page; gone well before the data moves. No leeway at the door, so
+  // the server's idea of "expired" is the token's own.
+  const exp = Math.floor(Date.now() / 1000) + 4;
+  const token = mintToken(privateKey, { iss: ISS, aud: AUD, exp });
+
+  const guarded = spawn(DAGPANE, [
+    "run", join(dir, "live.toml"), "--port", String(EXPIRY_PORT),
+    "--auth-jwks", jwksPath, "--auth-issuer", ISS, "--auth-audience", AUD, "--auth-any-app",
+    "--auth-leeway-secs", "0",
+  ], { stdio: "ignore" });
+
+  try {
+    let up = false;
+    for (let i = 0; i < 200 && !up; i++) {
+      try { up = (await fetch(`http://127.0.0.1:${EXPIRY_PORT}/`)).ok; } catch { await sleep(50); }
+    }
+    if (!up) { bad("the guarded server starts", "it never began serving"); return; }
+
+    await call("Page.navigate", { url: `http://127.0.0.1:${EXPIRY_PORT}/` });
+    await until("document.readyState === 'complete'", 10000, "the guarded page loads");
+    await evaluate(`sessionStorage.setItem('dagpane.token', ${JSON.stringify(token)}); true`);
+    await call("Page.reload");
+    if (!(await until(`${PANE_COUNT} >= 1`, 10000, "the page renders before its token expires")))
+      return;
+    ok("a token about to expire opens the door and the app renders");
+
+    // Past `exp` by more than a whole second, and only then does the data move.
+    await sleep(Math.max(0, (exp + 2) * 1000 - Date.now()));
+    writeFileSync(join(dir, "sales.csv"), rows(40));
+
+    if (!(await until(`${BANNER}.includes('new data has arrived')`, 10000,
+      "the page says its session expired when new data arrives"))) return;
+    ok("the page says its session expired, and offers a sign-in");
+    if ((await evaluate(PANE_COUNT)) >= 1) ok("what it was last sent stays on screen");
+    else bad("what it was last sent stays on screen", "the panes disappeared");
+
+    // And it does not retry: a retry would replace the banner with "Reconnecting in Ns" within
+    // the first backoff, and every attempt with this token would be refused.
+    await sleep(3000);
+    const banner = await evaluate(BANNER);
+    if (banner.includes("new data has arrived")) ok("an expired session is not retried on a timer");
+    else bad("an expired session is not retried", `the banner became: ${banner}`);
+  } finally {
+    guarded.kill("SIGKILL");
+    await new Promise((r) => guarded.once("exit", r));
+  }
+}
+
 try {
   await main();
   await authenticatedPageReconnects();
   await refusalDoesNotRetry();
+  await anExpiredSessionIsAskedToSignIn();
 } catch (e) {
   bad("the test itself", e.message);
 } finally {

@@ -477,11 +477,43 @@ decisions. Two pipeline shapes, chosen as the extremes; a real app sits between 
 sessions only** — an interaction's transient allocation is excluded, and it is not zero: the
 next section is what it costs.
 
+### The same viewers, priced from inside the process
+
+`dagpane host` now prices its viewers itself: every frame a session holds, walked allocation by
+allocation and each address counted once, with the app's own sources excluded. `/healthz`
+reports it per app. A figure a process computes about itself is a claim, so it gets the
+instrument everything above it got:
+
+```sh
+./benches/sessions/ledger.sh
+```
+
+The same three apps, one `dagpane host` process each, the held rig's ramp and estimator, and the
+process's own figure read from `/healthz` at every rung beside the kernel's.
+
+| app | kernel (RSS slope) | ledger | not in the ledger |
+|---|---:|---:|---:|
+| 600 rows, keeps rows | 175 kB | 24 kB | **151 kB** |
+| 200 000 rows, keeps rows | 7 197 kB | 7 034 kB | **162 kB** |
+| 200 000 rows, aggregates only | 146 kB | 1.3 kB | **145 kB** |
+
+**They are not meant to agree, and the way they disagree is the result.** The ledger counts
+frames; a connection also costs a socket's buffers, a task, a slot vector and the panes a frame
+is rendered into, and none of those is a frame. What the ledger leaves out is **145–162 kB
+whichever app it is**, while the ledger itself spans more than three orders of magnitude — so
+everything that varies with the pipeline is on its side of the line, and what is left is the
+per-connection floor the experiment above found from outside. The kernel's column is that
+experiment again, under `host` rather than `run` — 175, 7 197 and 146 kB against 179, 7 248
+and 145 — and at every rung the ledger was exactly its per-viewer figure times the viewers: a
+lease that leaked, or a viewer counted twice, would have bent that line.
+
 ### The consequence an operator meets
 
-**`dagpane host --budget-mb` counts source bytes, and none of the above is in it.** A fleet
-sized on source footprint is sized against the term this shows can be the smaller one. See
-`OPERATIONS.md`.
+**`dagpane host --budget-mb` counts source bytes, and none of the above is in it** — it is
+reported beside it instead. `/healthz` gives each app's viewers and what they hold; nothing is
+evicted or refused on that figure, because evicting an app frees nothing its viewers are holding.
+A fleet sized on source footprint is still sized against the term this shows can be the smaller
+one, and now the larger one is a number to read rather than to work out. See `OPERATIONS.md`.
 
 ---
 

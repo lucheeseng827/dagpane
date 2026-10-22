@@ -1,7 +1,7 @@
 # Explicit fields, no `workspace = true` inheritance — same reason as the other crates.
 [package]
 name = "dagpane-cli"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/dagpane"
@@ -18,25 +18,22 @@ path = "src/main.rs"
 # actually reaches the source representation rather than stopping here.
 [features]
 default = ["arrow-sources"]
-arrow-sources = ["dagpane-app/arrow-sources", "dagpane-serve/arrow-sources", "dagpane-host/arrow-sources", "dep:dagpane-frame-arrow"]
+arrow-sources = ["dagpane-app/arrow-sources", "dagpane-serve/arrow-sources", "dagpane-host/arrow-sources"]
 # Both OFF by default, and passed straight through: a released `dagpane` binary links an
 # HTTP client or a database driver only when somebody built it asking for one.
 http = ["dagpane-app/http"]
 sql = ["dagpane-app/sql"]
 
 [dependencies]
-dagpane-core = { path = "../core", version = "0.1.1" }
-# `refresh` picks the same source representation the manifest compiler does, so the
-# command measures the app a person will actually serve.
-dagpane-frame-arrow = { path = "../frame-arrow", version = "0.1.1", optional = true }
-dagpane-app = { path = "../app", version = "0.1.1", default-features = false }
-dagpane-host = { path = "../host", version = "0.1.1", default-features = false }
-dagpane-auth = { path = "../auth", version = "0.1.1" }
-dagpane-serve = { path = "../serve", version = "0.1.1", default-features = false }
+dagpane-core = { path = "../core", version = "0.2.0" }
+dagpane-app = { path = "../app", version = "0.2.0", default-features = false }
+dagpane-host = { path = "../host", version = "0.2.0", default-features = false }
+dagpane-auth = { path = "../auth", version = "0.2.0" }
+dagpane-serve = { path = "../serve", version = "0.2.0", default-features = false }
 # `export` writes the JavaScript that drives the wasm module, which that crate carries. It
 # does NOT bring the module itself: see `export.rs` on why the `.wasm` is a path and not an
 # `include_bytes!`.
-dagpane-wasm = { path = "../wasm", version = "0.1.1" }
+dagpane-wasm = { path = "../wasm", version = "0.2.0" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -45,3 +42,11 @@ serde_json = "1"
 # but that is a property of the dependency graph, not of this crate, and it would stop being
 # true the moment `run` stopped being a subcommand.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+
+# `tests/liveness.rs` runs the real binary and talks to it over real sockets, which takes a
+# WebSocket client and a directory of manifests per test. All three are already in the tree
+# under `dagpane-serve`'s tests, so none of them costs a crate.
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = "0.28"
+futures-util = "0.3"

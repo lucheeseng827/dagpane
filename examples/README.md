@@ -5,9 +5,9 @@ below was printed by `dagpane explain` on the manifest beside it — none of the
 and you can reprint all of them in about a second.
 
 ```
-apps/        nineteen manifests, grouped by who asks the question
+apps/        nineteen manifests, grouped by who asks the question, and 20-placed
 data/        the CSVs they read, regenerated from one seeded script
-tools/       the generator, and the gate that keeps all nineteen honest
+tools/       the generator, and the gate that keeps all of them honest
 notebook/    Jupyter -> a panel other people can open
 bucket/      object storage -> a panel that follows it
 ```
@@ -36,6 +36,10 @@ $ dagpane explain apps/06-data-quality.toml --set sla_only=true
   patch: 1 of 6 panes — late_load_count
 
 $ dagpane run apps/13-weekly-review.toml
+dagpane: Weekly business review — 14 cells, 9 panes
+dagpane: heartbeat 25s — keep the idle timeout in front of this above that
+dagpane: writes    30s per frame beyond what a 128 kbit/s link needs — a client that stops reading, or falls that far behind, is dropped
+dagpane: answers   30s per ping beyond what a 128 kbit/s link needs — a client that stops reading, or goes, is dropped
 dagpane: http://127.0.0.1:8787
 ```
 
@@ -51,7 +55,7 @@ $ python3 tools/verify.py
   app                          cells  ran  skipped  panes  sent
   01-funnel.toml                  11    6        3      7     5
   ...
-  ok — 20 apps compile, and every one of them skipped work.
+ok — 21 apps compile, and every one of them skipped work.
 ```
 
 ---
@@ -389,8 +393,10 @@ assert 'lifetime_revenue' in cost['untouched']
 assert len(cost['panes_sent']) < cost['panes_total']
 ```
 
-**From a bucket** — `bucket/`. Sources load once at start-up and there is no hot reload, so
-following a bucket means `sync → compile → swap → restart`, and `serve.sh` is that loop with
+**From a bucket** — `bucket/`. A bucket snapshot is a manifest and its data together, which is
+a deploy rather than a refresh — `refresh_secs` follows new rows in a source an app already
+reads, not a new app — so following a bucket means `sync → compile → swap → restart`, and
+`serve.sh` is that loop with
 the gate in the right place: a snapshot that will not compile never reaches a viewer, and an
 unchanged bucket costs nothing.
 

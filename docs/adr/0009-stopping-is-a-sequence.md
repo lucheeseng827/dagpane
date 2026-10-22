@@ -4,7 +4,7 @@
 
 ## Context
 
-`OPERATIONS.md` has said this for three releases:
+`OPERATIONS.md` has said this since it was written:
 
 > The process is therefore horizontally scalable by accident — any number of replicas behind a
 > load balancer are correct, because there is nothing to share and nothing to stick.
@@ -162,6 +162,28 @@ That property was already true and had nothing to make use of it.
 > property that needs both ends was checked at one end, and the test that would have caught it
 > could not exist because nothing in the repository ran the client.
 
+> **Correction, 2026-10-22: step 3 was true of requests and not of sockets**, and the note
+> above calls the close clean when it was not. `axum`'s graceful shutdown stops tracking a
+> connection the moment it upgrades, so `axum::serve` returned with every viewer still
+> connected and the runtime they ran on was dropped under them: a pass in flight still finished
+> and its answer went out, but the socket was then dropped with no close frame, and the browser
+> was told `1006` and backed off as from a failure. Measured before and after against a real
+> `SIGTERM` with `--drain-seconds 3`: `close=1006` at 3.005 s, then `close=1001` at 3.005 s.
+>
+> Step 3 now closes each socket itself — with `1001`, *going away*, between passes, after the
+> drain and never during it — and waits for them. Everything after the listener closes, the
+> requests `axum` is finishing and then the sockets, is held to `CLOSE_GRACE` (2 s): a client
+> that sent half a request, or one that has stopped reading and so can hold a close as long as
+> the write deadline allows, would otherwise hand the stop to the supervisor's `SIGKILL`, every
+> other close with it. The page answers `1001` by going back inside half a second, without
+> advancing its backoff. So the grace-period consequence below is the drain, **plus at most
+> the rest of one pass, plus 2 s**: a pass already running when the stop is signalled holds
+> its thread, and while it does the runtime may not see the signal or a timer; a pass still
+> running when the 2 s are up is abandoned, and its viewer reconnects. `tests/replica.rs`,
+> `tests/fleet.rs` and `tests/deadline.rs` hold it in the library; `crates/cli/tests/
+> liveness.rs` holds it through a real `SIGTERM` under `run`, `serve` and `host`; and
+> `tests/reconnect.mjs` holds it in a browser.
+
 **`terminationGracePeriodSeconds` now has to exceed `--drain-seconds`**, or the supervisor
 kills the process in the window it was told to wait. That is a new way to misconfigure a
 deployment, and it is the same shape as every other timeout pair: the outer one is longer.
@@ -188,10 +210,14 @@ connection, and the viewer holds what makes it theirs.** A reconnect is the same
 as the first one, it carries the control values off the page's URL fragment, and the server
 stages them before the first render. One pass, same view, possibly a different replica.
 
-Two closes are not the same, and the difference is the only branch in it. A socket that **never
-spoke**, on a page holding a token, is a refusal: retrying that on a timer hammers a door that
-is not going to open and buries the one message that tells the viewer what to do. Everything
-else is a transport event that will clear on its own.
+Not every close is the same, and the page's answer branches on three. A page holding a token
+that has **never once** been through the door is refused at its first close; one that has
+connected before is refused only after six attempts in a row that open nothing, because until
+then it is far likelier a server restarting. Retrying a refusal on a timer hammers a door that
+is not going to open and buries the one message that tells the viewer what to do. `4401` is a
+token that expired before new data, answered with a sign-in rather than a retry. `1001` is a
+server going away, answered by going back within half a second, without advancing the
+backoff. Everything else is a transport event that will clear on its own.
 
 The quieter half is a **WebSocket Ping every 25 s**, and it needs no client code at all: a
 browser cannot send a Ping from script, and answers one in the transport with no JavaScript

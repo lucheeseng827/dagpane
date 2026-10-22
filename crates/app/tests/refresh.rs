@@ -295,3 +295,231 @@ metric = { label = "A" }
         Some(30)
     );
 }
+
+// ── many viewers: read once, and every live session moves onto the new app ──────────────
+//
+// The tests above are the one-session form `dagpane refresh` uses. A server has many
+// sessions and one set of sources, so it reads once — `refresh::read` — builds the new app
+// once — `App::with_sources` — and moves every live viewer onto it with `AppSession::rebase`.
+// What follows is the scheduled-refresh exit criterion from that side: with two viewers open,
+// a change repaints both, and no change touches either.
+
+use std::sync::Arc;
+
+use dagpane_app::refresh::read;
+use dagpane_app::AppSession;
+use dagpane_core::Value;
+
+fn versions_of(app: &App) -> BTreeMap<String, Version> {
+    app.sources
+        .iter()
+        .map(|b| (b.cell.clone(), b.loaded_version))
+        .collect()
+}
+
+fn total(session: &AppSession) -> f64 {
+    session
+        .session()
+        .get("total")
+        .unwrap()
+        .value()
+        .and_then(Value::as_float)
+        .expect("a total")
+}
+
+fn viewer(app: &Arc<App>, min_amount: f64) -> AppSession {
+    let (mut s, _) = AppSession::open(Arc::clone(app));
+    s.full_views();
+    s.set(&BTreeMap::from([(
+        "min_amount".to_string(),
+        Value::float(min_amount),
+    )]))
+    .unwrap();
+    s.commit();
+    s
+}
+
+#[test]
+fn two_viewers_move_onto_one_refreshed_app_and_each_keeps_their_own_filter() {
+    let (dir, app) = fixture(200);
+    let app = Arc::new(app);
+    let mut all = viewer(&app, 0.0);
+    let mut big = viewer(&app, 200.0);
+    let (all_before, big_before) = (total(&all), total(&big));
+
+    std::fs::write(dir.path().join("sales.csv"), csv(150)).unwrap();
+    let reading = read(
+        &app,
+        &versions_of(&app),
+        RefreshOutcome::IfChanged,
+        |_| true,
+        builder,
+    );
+    assert_eq!(reading.values.len(), 1, "{:?}", reading.sources);
+    let next = Arc::new(
+        app.with_sources(&reading)
+            .unwrap()
+            .expect("new rows are a new app"),
+    );
+
+    for (session, before) in [(&mut all, all_before), (&mut big, big_before)] {
+        let (trace, panes) = session.rebase(Arc::clone(&next)).unwrap();
+        // The source and what reads it, never the control or the label that reads only it.
+        let ran: Vec<&str> = trace.steps.iter().map(|s| s.cell.as_str()).collect();
+        assert_eq!(ran, ["sales", "filtered", "total"], "{}", trace.summary());
+        assert_eq!(panes.len(), 1, "the total pane moved and was sent");
+        assert_ne!(total(session), before, "the viewer still sees the old rows");
+    }
+    // Each at their own filter: a viewer arriving now with the same control agrees.
+    let fresh = viewer(&next, 200.0);
+    assert_eq!(total(&big), total(&fresh));
+    assert!(total(&all) > total(&big));
+}
+
+#[test]
+fn an_unchanged_read_builds_no_app_and_touches_no_viewer() {
+    let (dir, app) = fixture(200);
+    let app = Arc::new(app);
+
+    let untouched = read(
+        &app,
+        &versions_of(&app),
+        RefreshOutcome::IfChanged,
+        |_| true,
+        builder,
+    );
+    assert!(untouched.values.is_empty(), "an untouched file was read");
+    assert!(app.with_sources(&untouched).unwrap().is_none());
+
+    // The same bytes again: read, because the version moved, and still nothing to build.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(dir.path().join("sales.csv"), csv(200)).unwrap();
+    let same = read(
+        &app,
+        &versions_of(&app),
+        RefreshOutcome::IfChanged,
+        |_| true,
+        builder,
+    );
+    assert_eq!(same.values.len(), 1, "a rewritten file was not read");
+    assert!(
+        app.with_sources(&same).unwrap().is_none(),
+        "identical rows built a new app, and every viewer would have run a pass for it"
+    );
+}
+
+#[test]
+fn only_the_sources_that_are_due_are_read() {
+    let (dir, app) = fixture(200);
+    std::fs::write(dir.path().join("sales.csv"), csv(150)).unwrap();
+    let reading = read(
+        &app,
+        &versions_of(&app),
+        RefreshOutcome::Force,
+        |bound| bound.cell != "sales",
+        builder,
+    );
+    assert!(reading.sources.is_empty() && reading.values.is_empty());
+    assert!(reading.versions.is_empty());
+}
+
+#[test]
+fn rows_with_different_columns_are_refused_and_the_old_rows_stay() {
+    let (dir, app) = fixture(200);
+    let app = Arc::new(app);
+    let mut s = viewer(&app, 0.0);
+    let before = total(&s);
+
+    // `amount` renamed: every cell that reads it was checked against the old name.
+    std::fs::write(
+        dir.path().join("sales.csv"),
+        csv(150).replacen("region,amount", "region,value", 1),
+    )
+    .unwrap();
+    let reading = read(
+        &app,
+        &versions_of(&app),
+        RefreshOutcome::IfChanged,
+        |_| true,
+        builder,
+    );
+    let (name, error) = reading.failed().next().expect("a refusal");
+    assert_eq!(name, "sales");
+    let said = error.to_string();
+    assert!(
+        said.contains("amount") && said.contains("value") && said.contains("redeploy"),
+        "the refusal does not say what changed or what to do: {said}"
+    );
+    assert!(
+        reading.values.is_empty(),
+        "refused rows were offered anyway"
+    );
+    assert_eq!(
+        reading.versions.get("sales"),
+        versions_of(&app).get("sales"),
+        "a refused read recorded a version"
+    );
+    assert!(app.with_sources(&reading).unwrap().is_none());
+    assert_eq!(total(&s), before);
+    let _ = s.commit();
+
+    // A type that changed is a different shape too: `amount` read as text.
+    std::fs::write(
+        dir.path().join("sales.csv"),
+        "region,amount\nr0,a lot\nr1,more\n",
+    )
+    .unwrap();
+    let reading = read(
+        &app,
+        &versions_of(&app),
+        RefreshOutcome::IfChanged,
+        |_| true,
+        builder,
+    );
+    assert!(reading.failed().next().is_some(), "{:?}", reading.sources);
+}
+
+#[test]
+fn the_old_rows_are_freed_once_every_viewer_has_moved() {
+    let (dir, app) = fixture(200);
+    let app = Arc::new(app);
+    let mut a = viewer(&app, 0.0);
+    let mut b = viewer(&app, 100.0);
+    let sales = app.graph.id("sales").unwrap();
+    let old_rows = Arc::downgrade(&a.session().share(sales));
+
+    std::fs::write(dir.path().join("sales.csv"), csv(120)).unwrap();
+    let reading = read(
+        &app,
+        &versions_of(&app),
+        RefreshOutcome::IfChanged,
+        |_| true,
+        builder,
+    );
+    let next = Arc::new(app.with_sources(&reading).unwrap().unwrap());
+    a.rebase(Arc::clone(&next)).unwrap();
+    b.rebase(Arc::clone(&next)).unwrap();
+    drop(app);
+
+    assert!(
+        old_rows.upgrade().is_none(),
+        "the rows from before the refresh are still held by somebody"
+    );
+    assert!(Arc::ptr_eq(a.app(), &next) && Arc::ptr_eq(b.app(), &next));
+    // One copy of the new rows, shared by both viewers and by the app itself.
+    assert!(Arc::ptr_eq(
+        &a.session().share(sales),
+        &b.session().share(sales)
+    ));
+}
+
+#[test]
+fn a_viewer_cannot_be_moved_onto_another_compile_of_the_same_manifest() {
+    let (dir, app) = fixture(200);
+    let app = Arc::new(app);
+    let mut s = viewer(&app, 0.0);
+    let again = Arc::new(dagpane_app::load(&dir.path().join("app.toml")).unwrap());
+
+    assert!(s.rebase(Arc::clone(&again)).is_err());
+    assert!(Arc::ptr_eq(s.app(), &app), "a refused move changed the app");
+}

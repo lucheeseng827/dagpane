@@ -81,11 +81,11 @@ async fn a_connection_that_says_nothing_is_pinged_anyway() {
 
 #[tokio::test]
 async fn the_first_ping_waits_a_whole_interval() {
-    // A connection that has just sent its opening frame is the least idle it will ever be,
-    // and `tokio::time::interval` fires its first tick immediately unless told otherwise. A
-    // ping riding out behind every `init` would be a ping per connection that proves nothing.
+    // A connection that has just sent its opening frame is the least idle it will ever be, so
+    // its first ping is a whole interval away rather than at once. A ping riding out behind
+    // every `init` would be a ping per connection that proves nothing.
     //
-    // Mutation check: `interval` in place of `interval_at` fails this.
+    // Mutation check: a first beat at once, rather than an interval on, fails this.
     let addr = start(Some(Duration::from_millis(400))).await;
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -186,5 +186,95 @@ async fn a_server_told_not_to_ping_does_not() {
     match tokio::time::timeout(Duration::from_millis(600), socket.next()).await {
         Err(_) => {}
         Ok(other) => panic!("expected silence, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_heartbeat_too_long_to_schedule_is_never_rather_than_a_crash() {
+    // `--heartbeat-seconds 18446744073709551615`, or `Duration::MAX` from a caller of this
+    // crate: a natural way to say never. Added to the clock it overflows, which used to panic
+    // every connection the moment its opening frame went out, so the page reconnected into
+    // the same panic for ever.
+    //
+    // Mutation check: removing the cap fails this where the answer should be.
+    use futures_util::SinkExt;
+    let addr = start(Some(Duration::MAX)).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("the upgrade succeeds");
+    socket
+        .send(Message::Text(r#"{"type":"refresh","seq":1}"#.into()))
+        .await
+        .unwrap();
+
+    // The opening frame, then the answer, on a connection that is still there.
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("the server answers")
+        {
+            Some(Ok(Message::Text(text))) if text.contains("\"refreshed\"") => return,
+            Some(Ok(_)) => continue,
+            other => panic!("the connection ended instead of answering: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_heartbeat_under_a_millisecond_is_a_millisecond_and_zero_is_none() {
+    // `Duration::ZERO` from a caller of this crate, or a nanosecond: a beat due again before its
+    // ping is even written. Taken at its word, a connection did nothing but ping, and never read
+    // a request again; on the timer before that, zero panicked every connection. Zero is no
+    // heartbeat, as `--heartbeat-seconds 0` is, and anything under a millisecond is one.
+    //
+    // Mutation check: without the floor, every answer to a ping is met with another ping, and
+    // this fails on how many; without the case for zero, on the pings zero sends.
+    use futures_util::SinkExt;
+    for every in [
+        Duration::ZERO,
+        Duration::from_nanos(1),
+        Duration::from_micros(1),
+    ] {
+        let addr = start(Some(every)).await;
+        let started = Instant::now();
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("the upgrade succeeds");
+        socket
+            .send(Message::Text(r#"{"type":"refresh","seq":1}"#.into()))
+            .await
+            .unwrap();
+
+        // To the answer and a fifth of a second past it, answering pings as a browser does.
+        // The clock is asked at every frame as well: a socket that always has a ping ready
+        // never lets a timeout fire.
+        let mut answered = None;
+        let mut pings = 0;
+        while started.elapsed() < Duration::from_secs(5)
+            && answered.is_none_or(|at: Instant| at.elapsed() < Duration::from_millis(200))
+        {
+            match tokio::time::timeout(Duration::from_millis(50), socket.next()).await {
+                Ok(Some(Ok(Message::Ping(_)))) => pings += 1,
+                Ok(Some(Ok(Message::Text(text)))) if text.contains("\"refreshed\"") => {
+                    answered = Some(Instant::now());
+                }
+                Ok(Some(Ok(_))) | Err(_) => {}
+                Ok(other) => panic!("a {every:?} heartbeat ended the connection: {other:?}"),
+            }
+        }
+        assert!(
+            answered.is_some(),
+            "a {every:?} heartbeat left a request unanswered for five seconds, and sent {pings} \
+             pings"
+        );
+        let millis = started.elapsed().as_millis() as usize;
+        if every.is_zero() {
+            assert_eq!(pings, 0, "a zero heartbeat sent pings");
+        } else {
+            assert!(
+                pings <= 2 * millis,
+                "a {every:?} heartbeat sent {pings} pings in {millis} ms"
+            );
+        }
     }
 }
